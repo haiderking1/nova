@@ -396,6 +396,14 @@ impl<T: DriverObject> driver::AllocImpl for Object<T> {
         gem_prime_import_sg_table: Some(bindings::drm_gem_shmem_prime_import_sg_table),
         dumb_create: Some(bindings::drm_gem_shmem_dumb_create),
         dumb_map_offset: None,
+        #[cfg(CONFIG_DRM_FBDEV_EMULATION = "y")]
+        fbdev_probe: if Device::<T::Driver>::has_kms() {
+            Some(bindings::drm_fbdev_shmem_driver_fbdev_probe)
+        } else {
+            None
+        },
+        #[cfg(CONFIG_DRM_FBDEV_EMULATION = "n")]
+        fbdev_probe: None,
     };
 }
 

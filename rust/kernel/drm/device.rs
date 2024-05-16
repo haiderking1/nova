@@ -11,14 +11,15 @@ use crate::{
     drm::{
         self,
         driver::AllocImpl,
+        kms::{
+            self,
+            private::KmsImpl as KmsImplPrivate, //
+        },
         private::Sealed, //
     },
     error::from_err_ptr,
     prelude::*,
-    sync::aref::{
-        ARef,
-        AlwaysRefCounted, //
-    },
+    sync::aref::ARef,
     types::{
         NotThreadSafe,
         Opaque, //
@@ -75,8 +76,10 @@ macro_rules! drm_legacy_fields {
 
 /// A trait implemented by all possible contexts a [`Device`] can be used in.
 ///
-/// A [`Device`] can be in one of the following contexts:
+/// A [`Device`] is typically in one of the following contexts:
 ///
+/// - [`Early`]: The general-purpose pre-[`Normal`] context. A [`Device`] in this context is still
+///   being initialized, and only a limited subset of functionality is available.
 /// - [`Normal`]: The general-purpose, reference-counted context. A [`Device`] in this context may
 ///   or may not be registered with userspace.
 /// - [`Ioctl`]: The device has been registered with userspace at some point; used in ioctl
@@ -85,8 +88,61 @@ macro_rules! drm_legacy_fields {
 ///   is bound.
 ///
 /// Both `Device<T, Ioctl>` and `Device<T, Registered>` dereference to `Device<T>` ([`Normal`]),
-/// so any method available on a [`Normal`] device is also available in the other contexts.
+/// so any method available on a [`Normal`] device is also available in these contexts.
+///
+/// A number of other contexts are also available. Note that these contexts are usually only exposed
+/// in early driver callbacks that take place before it is safe to consider a [`Device`] to be in
+/// the [`Normal`] context, and as such only a limited subset of functionality is available on the
+/// device.
+///
+/// - [`KmsProbe`]: The device is currently in the [`probe_kms`] callback.
+///
+/// [`KmsEarly`]: kms::KmsEarly
+/// [`KmsProbe`]: kms::KmsProbe
+/// [`probe_kms`]: kms::KmsDriver::probe
 pub trait DeviceContext: Sealed + Send + Sync + 'static {}
+
+/// The general-purpose pre-[`Normal`] context.
+///
+/// A [`Device`] in this context is still being initialized, and only a limited subset of
+/// functionality is available.
+///
+/// This context is typically only used in early-driver setup callbacks.
+pub struct Early;
+
+impl Sealed for Early {}
+impl DeviceContext for Early {}
+
+impl<T: drm::Driver> Deref for Device<T, Early> {
+    type Target = T::Data;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+
+/// [`Early`], but for usage internally by DRM.
+///
+/// A [`Device`] in this context is functionally equivalent to one in the [`Early`] context, except
+/// that references can be taken to it. This is just here to make error-cleanup easier within the
+/// Rust DRM bindings without needing to make [`ARef`] available to users outside of the bindings.
+#[doc(hidden)]
+pub struct EarlyInternal;
+
+impl Sealed for EarlyInternal {}
+impl DeviceContext for EarlyInternal {}
+
+impl<T: drm::Driver> Deref for Device<T, EarlyInternal> {
+    type Target = Device<T, Early>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: `EarlyInternal` is the same as `Early` but with an `AlwaysRefCounted`
+        // implementation.
+        unsafe { self.assume_ctx() }
+    }
+}
 
 /// The general-purpose, reference-counted [`DeviceContext`].
 ///
@@ -139,15 +195,19 @@ impl DeviceContext for Ioctl {}
 ///
 /// # Invariants
 ///
-/// The device in `self.0` is guaranteed to be a newly created [`Device`] that has not yet been
+/// The device in `self.drm` is guaranteed to be a newly created [`Device`] that has not yet been
 /// registered with userspace until this type is dropped.
-pub struct UnregisteredDevice<T: drm::Driver>(ARef<Device<T, Normal>>, NotThreadSafe);
+pub struct UnregisteredDevice<T: drm::Driver> {
+    drm: ARef<Device<T>>,
+    pub(super) kms: Option<(kms::KmsResources<T>, kms::ModeConfigInfo)>,
+    _p: NotThreadSafe,
+}
 
 impl<T: drm::Driver> Deref for UnregisteredDevice<T> {
     type Target = Device<T, Normal>;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.drm
     }
 }
 
@@ -157,6 +217,9 @@ impl<T: drm::Driver> UnregisteredDevice<T> {
 
         if T::FEAT_RENDER {
             features |= drm::driver::FEAT_RENDER;
+        }
+        if Device::<T>::has_kms() {
+            features |= drm::driver::FEAT_MODESET | drm::driver::FEAT_ATOMIC;
         }
 
         features
@@ -181,7 +244,7 @@ impl<T: drm::Driver> UnregisteredDevice<T> {
         dumb_map_offset: T::Object::ALLOC_OPS.dumb_map_offset,
 
         show_fdinfo: None,
-        fbdev_probe: None,
+        fbdev_probe: T::Object::ALLOC_OPS.fbdev_probe,
 
         major: T::INFO.major,
         minor: T::INFO.minor,
@@ -207,7 +270,7 @@ impl<T: drm::Driver> UnregisteredDevice<T> {
     ) -> Result<Self> {
         // `__drm_dev_alloc` uses `kmalloc()` to allocate memory, hence ensure a `kmalloc()`
         // compatible `Layout`.
-        let layout = Kmalloc::aligned_layout(Layout::new::<Device<T, Normal>>());
+        let layout = Kmalloc::aligned_layout(Layout::new::<Device<T, EarlyInternal>>());
 
         // Use a temporary vtable without a `release` callback until `data` is initialized, so
         // init failure can release the DRM device without dropping uninitialized fields.
@@ -219,12 +282,12 @@ impl<T: drm::Driver> UnregisteredDevice<T> {
         // SAFETY:
         // - `alloc_vtable` reference remains valid until no longer used,
         // - `dev` is valid by its type invarants,
-        let raw_drm: *mut Device<T, Normal> = unsafe {
+        let raw_drm: *mut Device<T, EarlyInternal> = unsafe {
             bindings::__drm_dev_alloc(
                 dev.as_ref().as_raw(),
                 &alloc_vtable,
                 layout.size(),
-                mem::offset_of!(Device<T, Normal>, dev),
+                mem::offset_of!(Device<T, EarlyInternal>, dev),
             )
         }
         .cast();
@@ -254,10 +317,29 @@ impl<T: drm::Driver> UnregisteredDevice<T> {
 
         // SAFETY: The reference count is one, and now we take ownership of that reference as a
         // `drm::Device`.
+        let drm_dev = unsafe { ARef::from_raw(raw_drm) };
+
+        let kms = if Device::<T>::has_kms() {
+            // SAFETY:
+            // - This is the only place that we call probe_kms
+            // - `Normal` fulfills all invariants of `Early`.
+            Some(unsafe { T::Kms::setup_kms(&drm_dev)? })
+        } else {
+            None
+        };
+
+        // SAFETY: We have performed all initialization steps, making it safe to enter the `Normal`
+        // `DeviceContext`.
+        let drm_dev: ARef<Device<_>> = unsafe { mem::transmute(drm_dev) };
+
         // INVARIANT: We just created the device above, but have yet to call `drm_dev_register`.
         // `Self` cannot be copied or sent to another thread - ensuring that `drm_dev_register`
         // won't be called during its lifetime and that the device is unregistered.
-        Ok(Self(unsafe { ARef::from_raw(raw_drm) }, NotThreadSafe))
+        Ok(Self {
+            kms,
+            drm: drm_dev,
+            _p: NotThreadSafe,
+        })
     }
 }
 
@@ -341,6 +423,10 @@ impl<T: drm::Driver, C: DeviceContext> Device<T, C> {
     pub(crate) unsafe fn assume_ctx<NewCtx: DeviceContext>(&self) -> &Device<T, NewCtx> {
         // SAFETY: The data layout is identical via our type invariants.
         unsafe { mem::transmute(self) }
+    }
+
+    pub(crate) const fn has_kms() -> bool {
+        <T::Kms as KmsImplPrivate>::MODE_CONFIG_OPS.is_some()
     }
 }
 
@@ -478,22 +564,29 @@ impl<T: drm::Driver> Deref for Device<T, Ioctl> {
     }
 }
 
-// SAFETY: DRM device objects are always reference counted and the get/put functions
-// satisfy the requirements.
-unsafe impl<T: drm::Driver> AlwaysRefCounted for Device<T> {
-    fn inc_ref(&self) {
-        // SAFETY: The existence of a shared reference guarantees that the refcount is non-zero.
-        unsafe { bindings::drm_dev_get(self.as_raw()) };
-    }
+macro_rules! impl_aref_for_dev_ctx {
+    ($context:ty) => {
+        // SAFETY: All Device objects are refcounted.
+        unsafe impl<T: drm::Driver> $crate::sync::aref::AlwaysRefCounted for Device<T, $context> {
+            fn inc_ref(&self) {
+                // SAFETY: The existence of a shared reference guarantees that the refcount is
+                // non-zero.
+                unsafe { bindings::drm_dev_get(self.as_raw()) };
+            }
 
-    unsafe fn dec_ref(obj: NonNull<Self>) {
-        // SAFETY: `obj` is a valid pointer to `Self`.
-        let drm_dev = unsafe { Self::into_drm_device(obj) };
+            unsafe fn dec_ref(obj: core::ptr::NonNull<Self>) {
+                // SAFETY: `obj` is a valid pointer to `Self`.
+                let drm_dev = unsafe { Self::into_drm_device(obj) };
 
-        // SAFETY: The safety requirements guarantee that the refcount is non-zero.
-        unsafe { bindings::drm_dev_put(drm_dev) };
-    }
+                // SAFETY: The safety requirements guarantee that the refcount is non-zero.
+                unsafe { bindings::drm_dev_put(drm_dev) };
+            }
+        }
+    };
 }
+
+impl_aref_for_dev_ctx!(Normal);
+impl_aref_for_dev_ctx!(EarlyInternal);
 
 impl<T: drm::Driver> AsRef<T::ParentDevice<device::Normal>> for Device<T> {
     fn as_ref(&self) -> &T::ParentDevice<device::Normal> {

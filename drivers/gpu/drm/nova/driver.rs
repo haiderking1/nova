@@ -90,6 +90,7 @@ impl drm::Driver for NovaDriver {
     type File = File;
     type Object = gem::Object<NovaObject>;
     type ParentDevice<Ctx: DeviceContext> = auxiliary::Device<Ctx>;
+    type Kms = drm::kms::NoKms<Self>;
 
     const INFO: drm::DriverInfo = INFO;
     const FEAT_RENDER: bool = true;

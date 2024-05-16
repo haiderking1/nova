@@ -8,16 +8,26 @@ use crate::{
     bindings,
     device,
     drm,
-    error::to_result,
+    error::to_result, //
     prelude::*,
     sync::aref::ARef, //
 };
-use core::ptr::NonNull;
+use core::ptr::{
+    self,
+    NonNull, //
+};
+use macros::vtable;
 
 /// Driver use the GEM memory manager. This should be set for all modern drivers.
 pub(crate) const FEAT_GEM: u32 = bindings::drm_driver_feature_DRIVER_GEM;
 /// Driver supports render nodes, i.e.: /dev/dri/renderDXX devices.
 pub(crate) const FEAT_RENDER: u32 = bindings::drm_driver_feature_DRIVER_RENDER;
+
+/// The driver supports modesetting.
+pub(crate) const FEAT_MODESET: u32 = bindings::drm_driver_feature_DRIVER_MODESET;
+
+/// The driver supports atomic modesetting.
+pub(crate) const FEAT_ATOMIC: u32 = bindings::drm_driver_feature_DRIVER_ATOMIC;
 
 /// Information data for a DRM Driver.
 pub struct DriverInfo {
@@ -86,6 +96,12 @@ pub struct AllocOps {
             offset: *mut u64,
         ) -> core::ffi::c_int,
     >,
+    pub(crate) fbdev_probe: Option<
+        unsafe extern "C" fn(
+            fbdev_helper: *mut bindings::drm_fb_helper,
+            sizes: *mut bindings::drm_fb_helper_surface_size,
+        ) -> core::ffi::c_int,
+    >,
 }
 
 /// Trait for memory manager implementations. Implemented internally.
@@ -123,6 +139,14 @@ pub trait Driver {
     /// The bus device type of the parent device that the DRM device is associated with.
     type ParentDevice<Ctx: device::DeviceContext>: device::AsBusDevice<Ctx>;
 
+    /// The KMS implementation for this driver.
+    ///
+    /// Drivers that wish to support KMS should pass their implementation of `drm::kms::KmsDriver`
+    /// here. Drivers which do not have KMS support can simply pass `drm::kms::NoKms` here.
+    type Kms: drm::kms::KmsImpl<Driver = Self>
+    where
+        Self: Sized;
+
     /// Driver metadata
     const INFO: DriverInfo;
 
@@ -144,6 +168,7 @@ pub trait Driver {
 ///
 /// Once the `Registration` structure is dropped, the device is unregistered.
 pub struct Registration<'a, T: Driver> {
+    _kms_res: Option<drm::kms::KmsResources<T>>,
     drm: ARef<drm::Device<T>>,
     _reg_data: Pin<KBox<T::RegistrationData<'a>>>,
 }
@@ -158,7 +183,7 @@ impl<'a, T: Driver> Registration<'a, T> {
     /// references that become invalid after `'a` ends.
     pub unsafe fn new<E>(
         dev: &'a device::Device<device::Bound>,
-        drm: drm::UnregisteredDevice<T>,
+        mut drm: drm::UnregisteredDevice<T>,
         reg_data: impl PinInit<T::RegistrationData<'a>, E>,
         flags: usize,
     ) -> Result<Self>
@@ -189,7 +214,21 @@ impl<'a, T: Driver> Registration<'a, T> {
             return Err(e);
         }
 
+        #[cfg(CONFIG_DRM_CLIENT = "y")]
+        let kms_res = drm.kms.take().map(|(kms_res, mode_config_info)| {
+            if let Some(fourcc) = mode_config_info.preferred_fourcc {
+                // SAFETY: We just registered `drm` above, fulfilling the C API requirements
+                unsafe { bindings::drm_client_setup_with_fourcc(drm.as_raw(), fourcc) };
+            } else {
+                // SAFETY: We just registered `drm` above, fulfilling the C API requirements
+                unsafe { bindings::drm_client_setup(drm.as_raw(), ptr::null()) };
+            }
+
+            kms_res
+        });
+
         Ok(Self {
+            _kms_res: kms_res,
             drm: (&*drm).into(),
             _reg_data: reg_data,
         })

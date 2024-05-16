@@ -9,9 +9,11 @@ pub mod fourcc;
 pub mod gem;
 pub mod gpuvm;
 pub mod ioctl;
+pub mod kms;
 
 pub use self::device::Device;
 pub use self::device::DeviceContext;
+pub use self::device::Early;
 pub use self::device::Ioctl;
 pub use self::device::Normal;
 pub use self::device::Registered;

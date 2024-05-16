@@ -209,6 +209,7 @@ impl drm::Driver for TyrDrmDriver {
     type File = TyrDrmFileData;
     type Object = Bo;
     type ParentDevice<Ctx: DeviceContext> = platform::Device<Ctx>;
+    type Kms = drm::kms::NoKms<Self>;
 
     const INFO: drm::DriverInfo = INFO;
     const FEAT_RENDER: bool = true;
