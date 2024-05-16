@@ -214,8 +214,8 @@ impl<'a, T: Driver> Registration<'a, T> {
             return Err(e);
         }
 
-        #[cfg(CONFIG_DRM_CLIENT = "y")]
         let kms_res = drm.kms.take().map(|(kms_res, mode_config_info)| {
+            #[cfg(CONFIG_DRM_CLIENT = "y")]
             if let Some(fourcc) = mode_config_info.preferred_fourcc {
                 // SAFETY: We just registered `drm` above, fulfilling the C API requirements
                 unsafe { bindings::drm_client_setup_with_fourcc(drm.as_raw(), fourcc) };

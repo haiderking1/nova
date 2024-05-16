@@ -4,21 +4,33 @@
 
 use crate::{
     drm::{
-        Device,
         DeviceContext,
         Early,
+        Normal,
         device::EarlyInternal,
+        device::Device,
         driver::Driver,
         private::Sealed, //
     }, //
     error::to_result,
     prelude::*,
-    sync::aref::ARef, //
+    sync::{
+        aref::{
+            AlwaysRefCounted,
+            ARef, //
+        },
+        Mutex,
+        MutexGuard, //
+    },
 };
 use bindings;
 use core::{
-    ops::Deref,
     marker::PhantomData,
+    ptr::{
+        self,
+        NonNull, //
+    }, //
+    ops::Deref, //
 };
 
 /// The C vtable for a [`Device`].
@@ -242,3 +254,139 @@ impl<T: Driver> private::KmsImpl for NoKms<T> {
 }
 
 impl<T: Driver> KmsImpl for NoKms<T> {}
+
+/// A modesetting object in DRM.
+///
+/// This is any type of object where the underlying C object contains a [`struct drm_mode_object`].
+///
+/// This type is only implemented by the DRM crate itself.
+///
+/// # Safety
+///
+/// [`raw_mode_obj()`] must always return a valid pointer to an initialized
+/// [`struct drm_mode_object`].
+///
+/// [`struct drm_mode_object`]: srctree/include/drm/drm_mode_object.h
+/// [`raw_mode_obj()`]: ModeObject::raw_mode_obj()
+pub unsafe trait ModeObject<C: DeviceContext = Normal>: Sealed {
+    /// The parent driver for this [`ModeObject`].
+    type Driver: KmsDriver;
+
+    /// Return the [`Device`] for this [`ModeObject`].
+    fn drm_dev(&self) -> &Device<Self::Driver, C>;
+
+    /// Return a pointer to the [`struct drm_mode_object`] for this [`ModeObject`].
+    ///
+    /// [`struct drm_mode_object`]: (srctree/include/drm/drm_mode_object.h)
+    fn raw_mode_obj(&self) -> *mut bindings::drm_mode_object;
+}
+
+/// A trait for modesetting objects which don't come with their own reference-counting.
+///
+/// Some [`ModeObject`] types in DRM do not have a reference count. These types are considered
+/// "static" and share the lifetime of their parent [`Device`]. To retrieve an owned reference to
+/// such types, see [`KmsRef`].
+///
+/// # Safety
+///
+/// This trait must only be implemented for modesetting objects which do not have a refcount within
+/// their [`struct drm_mode_object`], otherwise [`KmsRef`] can't guarantee the object will stay
+/// alive.
+///
+/// [`struct drm_mode_object`]: (srctree/include/drm/drm_mode_object.h)
+pub unsafe trait StaticModeObject<C: DeviceContext = Normal>: ModeObject<C> {}
+
+/// An owned reference to a [`StaticModeObject`].
+///
+/// Note that since [`StaticModeObject`] types share the lifetime of their parent [`Device`], the
+/// parent [`Device`] will stay alive as long as this type exists. Thus, users should be aware that
+/// storing a [`KmsRef`] within a [`ModeObject`] is a circular reference.
+///
+/// # Invariants
+///
+/// `self.0` points to a valid instance of `T` throughout the lifetime of this type.
+pub struct KmsRef<T: StaticModeObject + Send + Sync, C: DeviceContext = Normal>
+(
+    NonNull<T>,
+    PhantomData<C>,
+);
+
+// SAFETY: Owned references to DRM device are thread-safe as long as the device is initialized.
+unsafe impl<T: StaticModeObject + Send + Sync, C: DeviceContext> Send for KmsRef<T, C> {}
+
+// SAFETY: Owned references to DRM device are thread-safe as long as the device is initialized.
+unsafe impl<T: StaticModeObject + Send + Sync, C: DeviceContext> Sync for KmsRef<T, C> {}
+
+impl<T: StaticModeObject + Send + Sync, C: DeviceContext> From<&T> for KmsRef<T, C> {
+    fn from(value: &T) -> Self {
+        // We will drop the reference we leak here in Drop
+        value.drm_dev().inc_ref();
+
+        Self(value.into(), PhantomData)
+    }
+}
+
+impl<T: StaticModeObject + Send + Sync, C: DeviceContext> Drop for KmsRef<T, C> {
+    fn drop(&mut self) {
+        // SAFETY: We're reclaiming the reference we leaked in From<&T>
+        drop(unsafe { ARef::from_raw(self.drm_dev().into()) })
+    }
+}
+
+impl<T: StaticModeObject + Send + Sync, C: DeviceContext> Deref for KmsRef<T, C> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: We're guaranteed object will point to a valid object as long as we hold dev
+        unsafe { self.0.as_ref() }
+    }
+}
+
+impl<T: StaticModeObject + Send + Sync, C: DeviceContext> Clone for KmsRef<T, C> {
+    fn clone(&self) -> Self {
+        self.drm_dev().inc_ref();
+
+        Self(self.0, PhantomData)
+    }
+}
+
+impl<T: StaticModeObject + Send + Sync, C: DeviceContext> KmsRef<T, C> {
+    /// Cast a reference to a static modeset object into an owned [`KmsRef`].
+    ///
+    /// # Safety
+    ///
+    /// - The caller guarantees that at least one owned reference is taken out for the respective
+    ///   [`Device`] this modesetting object is from.
+    /// - The caller guarantees that `ptr` points to a valid instance of `T`.
+    #[expect(unused)]
+    pub(super) unsafe fn from_raw(ptr: *mut T) -> Self {
+        // SAFETY: The caller guarantees that `ptr` points to a valid instance of `T`.
+        KmsRef(unsafe { NonNull::new_unchecked(ptr) }, PhantomData)
+    }
+}
+
+#[expect(unused)]
+macro_rules! impl_aref_for_mode_object {
+    (impl $( < $( $param:ident: $bound:ident ),+ > )? for $type:ty) => {
+        // SAFETY: drm_mode_object_get()/put() ensure the type is ref-counted according to the
+        // safety contract
+        unsafe impl $( < $( $param: $bound ),+ > )? kernel::types::AlwaysRefCounted for $type {
+            #[inline]
+            fn inc_ref(&self) {
+                // SAFETY: We're guaranteed by the safety contract of `ModeObject` that
+                // `raw_mode_obj()` always returns a pointer to an initialized `drm_mode_object`.
+                unsafe { kernel::bindings::drm_mode_object_get(self.raw_mode_obj()) }
+            }
+
+            #[inline]
+            unsafe fn dec_ref(obj: core::ptr::NonNull<Self>) {
+                // SAFETY: We're guaranteed by the safety contract of `ModeObject` that
+                // `raw_mode_obj()` always returns a pointer to an initialized `drm_mode_object`.
+                unsafe { kernel::bindings::drm_mode_object_put(obj.as_ref().raw_mode_obj()) }
+            }
+        }
+    };
+}
+
+#[expect(unused)]
+pub(super) use impl_aref_for_mode_object;
