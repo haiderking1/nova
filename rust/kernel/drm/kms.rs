@@ -8,6 +8,7 @@ pub mod encoder;
 pub mod plane;
 
 use crate::{
+    container_of,
     drm::{
         DeviceContext,
         Early,
@@ -291,6 +292,23 @@ impl<T: Driver> private::KmsImpl for NoKms<T> {
 
 impl<T: Driver> KmsImpl for NoKms<T> {}
 
+impl<T: KmsDriver> Device<T> {
+    /// Retrieve a pointer to the mode_config mutex
+    #[inline]
+    pub(crate) fn mode_config_mutex(&self) -> &Mutex<()> {
+        // SAFETY: This lock is initialized for as long as `Device<T>` is exposed to users
+        unsafe { Mutex::from_raw(&raw mut (*self.as_raw()).mode_config.mutex) }
+    }
+
+    /// Acquire the [`mode_config.mutex`] for this [`Device`].
+    #[inline]
+    pub fn mode_config_lock(&self) -> ModeConfigGuard<'_, T> {
+        // INVARIANT: We're locking mode_config.mutex, fulfilling our invariant that this lock is
+        // held throughout ModeConfigGuard's lifetime.
+        ModeConfigGuard(self.mode_config_mutex().lock(), PhantomData)
+    }
+}
+
 /// A modesetting object in DRM.
 ///
 /// This is any type of object where the underlying C object contains a [`struct drm_mode_object`].
@@ -424,3 +442,73 @@ macro_rules! impl_aref_for_mode_object {
 }
 
 pub(super) use impl_aref_for_mode_object;
+
+/// A mode config guard.
+///
+/// This is an exclusive primitive that represents when [`drm_device.mode_config.mutex`] is held - as
+/// some modesetting operations (particularly ones related to [`connectors`](connector)) are still
+/// protected under this single lock. The lock will be dropped once this object is dropped.
+///
+/// # Invariants
+///
+/// - `self.0` is contained within a [`struct drm_mode_config`], which is contained within a
+///   [`struct drm_device`].
+/// - The [`KmsDriver`] implementation of that [`struct drm_device`] is always `T`.
+/// - This type proves that [`drm_device.mode_config.mutex`] is acquired.
+///
+/// [`struct drm_mode_config`]: (srctree/include/drm/drm_device.h)
+/// [`drm_device.mode_config.mutex`]: (srctree/include/drm/drm_device.h)
+/// [`struct drm_device`]: (srctree/include/drm/drm_device.h)
+pub struct ModeConfigGuard<'a, T: KmsDriver>(MutexGuard<'a, ()>, PhantomData<T>);
+
+impl<'a, T: KmsDriver> ModeConfigGuard<'a, T> {
+    /// Construct a new [`ModeConfigGuard`].
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that [`drm_device.mode_config.mutex`] is acquired.
+    ///
+    /// [`drm_device.mode_config.mutex`]: (srctree/include/drm/drm_device.h)
+    pub(crate) unsafe fn new(drm: &'a Device<T>) -> Self {
+        // SAFETY: Our safety contract fulfills the requirements of `MutexGuard::new()`
+        // INVARIANT: And our safety contract ensures that this type proves that
+        // `drm_device.mode_config.mutex` is acquired.
+        Self(
+            unsafe { MutexGuard::new(drm.mode_config_mutex(), ()) },
+            PhantomData,
+        )
+    }
+
+    /// Return the [`Device`] that this [`ModeConfigGuard`] belongs to.
+    pub fn drm_dev(&self) -> &'a Device<T> {
+        // TODO: We should probably consider just adding some sort of as_raw() function to locks for
+        // situations like this. For now, just do this by hand.
+        // LYUDE SHOULD HAVE DONE THIS BEFORE PATCH SUBMISSION
+        // IF SHE DIDN'T, BUG HER.
+        let lock: *mut bindings::mutex = ptr::from_ref(self.0.lock_ref()).cast_mut().cast();
+
+        // SAFETY:
+        // - `self` is embedded within a `drm_mode_config` via our type invariants
+        // - `self.0.lock` has an equivalent data type to `mutex` via its type invariants.
+        let mode_config = unsafe { container_of!(lock, bindings::drm_mode_config, mutex) };
+
+        // SAFETY: And that `drm_mode_config` lives in a `drm_device` via type invariants.
+        unsafe {
+            Device::from_raw(container_of!(
+                mode_config,
+                bindings::drm_device,
+                mode_config
+            ))
+        }
+    }
+
+    /// Assert that the given device is the owner of this mode config guard.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `dev` is different from the owning device for this mode config guard.
+    #[inline]
+    pub(crate) fn assert_owner(&self, dev: &Device<T>) {
+        assert!(ptr::eq(self.drm_dev(), dev));
+    }
+}

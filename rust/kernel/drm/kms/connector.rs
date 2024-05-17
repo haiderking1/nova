@@ -13,6 +13,7 @@ use crate::{
             KmsDriver,
             KmsProbe,
             ModeObject,
+            ModeConfigGuard,
             Sealed, //
         }, //
         Device,
@@ -26,6 +27,7 @@ use crate::{
 };
 use core::{
     marker::*,
+    mem::ManuallyDrop,
     ops::*,
     ptr::null_mut,
     stringify,
@@ -113,7 +115,7 @@ pub trait DriverConnector: Send + Sync + Sized {
             destroy: Some(connector_destroy_callback::<Self>),
             force: None,
             detect: None,
-            fill_modes: None,
+            fill_modes: Some(bindings::drm_helper_probe_single_connector_modes),
             debugfs_init: None,
             oob_hotplug_event: None,
             atomic_duplicate_state: Some(atomic_duplicate_state_callback::<Self::State>),
@@ -121,7 +123,7 @@ pub trait DriverConnector: Send + Sync + Sized {
         helper_funcs: bindings::drm_connector_helper_funcs {
             mode_valid: None,
             atomic_check: None,
-            get_modes: None,
+            get_modes: Some(get_modes_callback::<Self>),
             detect_ctx: None,
             enable_hpd: None,
             disable_hpd: None,
@@ -155,6 +157,12 @@ pub trait DriverConnector: Send + Sync + Sized {
         device: &Device<Self::Driver, C>,
         args: Self::Args,
     ) -> impl PinInit<Self, Error>;
+
+    /// Retrieve a list of available display modes for this [`Connector`].
+    fn get_modes<'a>(
+        connector: ConnectorGuard<'a, Self>,
+        guard: &ModeConfigGuard<'a, Self::Driver>,
+    ) -> i32;
 }
 
 /// The generated C vtable for a [`DriverConnector`].
@@ -260,6 +268,21 @@ impl<T: DriverConnector> Connector<T, KmsProbe> {
     }
 }
 
+impl<T: DriverConnector> Connector<T> {
+    /// Acquire a [`ConnectorGuard`] for this connector from a [`ModeConfigGuard`].
+    ///
+    /// This verifies using the provided reference that the given guard is actually for the same
+    /// device as this connector's parent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `guard` is not a [`ModeConfigGuard`] for this connector's parent [`Device`].
+    pub fn guard<'a>(&'a self, guard: &ModeConfigGuard<'a, T::Driver>) -> ConnectorGuard<'a, T> {
+        guard.assert_owner(self.drm_dev());
+        ConnectorGuard(self)
+    }
+}
+
 /// A trait implemented by any type that acts as a [`struct drm_connector`] interface.
 ///
 /// This is implemented internally by DRM.
@@ -348,6 +371,40 @@ unsafe extern "C" fn connector_destroy_callback<T: DriverConnector>(
             container_of!(Opaque::cast_from(connector), Connector<T>, connector).cast_mut()
         )
     });
+}
+
+#[allow(clippy::missing_safety_doc)]
+unsafe extern "C" fn get_modes_callback<T: DriverConnector>(
+    connector: *mut bindings::drm_connector,
+) -> core::ffi::c_int {
+    // SAFETY: This is safe via `DriverConnector`s type invariants.
+    let connector = unsafe { Connector::<T>::from_raw(connector) };
+
+    // SAFETY: This FFI callback is only called while `mode_config.lock` is held
+    // We use ManuallyDrop here to prevent the lock from being released after the callback
+    // completes, as that should be handled by DRM.
+    let guard = ManuallyDrop::new(unsafe { ModeConfigGuard::new(connector.drm_dev()) });
+
+    T::get_modes(connector.guard(&guard), &guard)
+}
+
+/// A privileged [`Connector`] obtained while holding a [`ModeConfigGuard`].
+///
+/// This provides access to various methods for [`Connector`] that must happen under lock, such as
+/// setting resolution preferences and adding display modes.
+///
+/// # Invariants
+///
+/// Shares the invariants of [`ModeConfigGuard`].
+#[derive(Copy, Clone)]
+pub struct ConnectorGuard<'a, T: DriverConnector>(&'a Connector<T>);
+
+impl<T: DriverConnector> Deref for ConnectorGuard<'_, T> {
+    type Target = Connector<T>;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+    }
 }
 
 /// A trait implemented by any type which can produce a reference to a
