@@ -16,6 +16,7 @@ use crate::{
             KmsProbe,
             ModeObject,
             StaticModeObject,
+            ModeObjectVtable,
             Sealed, //
         }
     },
@@ -222,6 +223,25 @@ unsafe impl<T: DriverEncoder, C: DeviceContext> AsRawEncoder<C> for Encoder<T, C
     }
 }
 
+// SAFETY: `funcs` is initialized when the encoder is allocated
+unsafe impl<T: DriverEncoder> ModeObjectVtable for Encoder<T> {
+    type Vtable = bindings::drm_encoder_funcs;
+
+    fn vtable(&self) -> *const Self::Vtable {
+        // SAFETY: `as_raw()` always returns a valid pointer to an encoder
+        unsafe { *self.as_raw() }.funcs
+    }
+}
+
+impl<T: DriverEncoder, C: DeviceContext> Encoder<T, C> {
+    super::impl_from_opaque_mode_obj! {
+        fn <'a, D>(&'a OpaqueEncoder<D, C>) -> &'a Self;
+        use
+            T as DriverEncoder,
+            D as KmsDriver<Encoder = ...>
+    }
+}
+
 impl<T: DriverEncoder> Encoder<T, KmsProbe> {
     /// Construct a new [`Encoder`].
     ///
@@ -278,6 +298,76 @@ impl<T: DriverEncoder> Encoder<T, KmsProbe> {
 
         // SAFETY: We just allocated the encoder above, so this pointer must be valid
         Ok(unsafe { &*this })
+    }
+}
+
+/// A [`struct drm_encoder`] without a known [`DriverEncoder`] implementation.
+///
+/// This is mainly for situations where our bindings can't infer the [`DriverEncoder`] implementation
+/// for a [`struct drm_encoder`] automatically. It is identical to [`Encoder`], except that it does not
+/// provide access to the driver's private data.
+///
+/// # Invariants
+///
+/// Same as [`Encoder`].
+#[repr(transparent)]
+pub struct OpaqueEncoder<T: KmsDriver, C: DeviceContext = Normal> {
+    encoder: Opaque<bindings::drm_encoder>,
+    _p: PhantomData<(T, C)>,
+}
+
+impl<T: KmsDriver, C: DeviceContext> Sealed for OpaqueEncoder<T, C> {}
+
+// SAFETY: All of our encoder interfaces are thread-safe once initialized.
+unsafe impl<T: KmsDriver> Send for OpaqueEncoder<T> {}
+
+// SAFETY: All of our encoder interfaces are thread-safe once initialized.
+unsafe impl<T: KmsDriver> Sync for OpaqueEncoder<T> {}
+
+// SAFETY: We don't expose OpaqueEncoder<T> to users before `base` is initialized in
+// OpaqueEncoder::new(), so `raw_mode_obj` always returns a valid poiner to a
+// bindings::drm_mode_object.
+unsafe impl<T: KmsDriver, C: DeviceContext> ModeObject<C> for OpaqueEncoder<T, C> {
+    type Driver = T;
+
+    fn drm_dev(&self) -> &Device<Self::Driver, C> {
+        // SAFETY: DRM encoders exist for as long as the device does, so this pointer is always
+        // valid
+        unsafe { Device::from_raw((*self.encoder.get()).dev) }
+    }
+
+    fn raw_mode_obj(&self) -> *mut bindings::drm_mode_object {
+        // SAFETY: We don't expose Encoder<T> to users before it's initialized, so `base` is always
+        // initialized
+        unsafe { &raw mut (*self.encoder.get()).base }
+    }
+}
+
+// SAFETY: `OpaqueEncoder`s do not have a reference count of their own.
+unsafe impl<T: KmsDriver, C: DeviceContext> StaticModeObject<C> for OpaqueEncoder<T, C> {}
+
+// SAFETY:
+// - Via our type variants our data layout is identical to  with `drm_encoder`
+// - Since we don't expose `Encoder` to users before it has been initialized, this and our data
+//   layout ensure that `as_raw()` always returns a valid pointer to a `drm_encoder`.
+unsafe impl<T: KmsDriver, C: DeviceContext> AsRawEncoder<C> for OpaqueEncoder<T, C> {
+    fn as_raw(&self) -> *mut bindings::drm_encoder {
+        self.encoder.get()
+    }
+
+    unsafe fn from_raw<'a>(ptr: *mut bindings::drm_encoder) -> &'a Self {
+        // SAFETY: Our data layout is identical to `bindings::drm_encoder`
+        unsafe { &*ptr.cast() }
+    }
+}
+
+// SAFETY: `funcs` is initialized when the encoder is allocated
+unsafe impl<T: KmsDriver, C: DeviceContext> ModeObjectVtable for OpaqueEncoder<T, C> {
+    type Vtable = bindings::drm_encoder_funcs;
+
+    fn vtable(&self) -> *const Self::Vtable {
+        // SAFETY: `as_raw()` always returns a valid pointer to an encoder
+        unsafe { *self.as_raw() }.funcs
     }
 }
 
