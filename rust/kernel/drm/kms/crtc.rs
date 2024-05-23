@@ -13,6 +13,7 @@ use crate::{
         DeviceContext,
         Normal,
         kms::{
+            atomic::*,
             KmsDriver,
             KmsProbe,
             ModeObject,
@@ -27,7 +28,7 @@ use crate::{
     types::Opaque,
 };
 use core::{
-    cell::UnsafeCell,
+    cell::{Cell, UnsafeCell},
     marker::*,
     ops::{
         Deref,
@@ -35,7 +36,8 @@ use core::{
     },
     ptr::{
         null,
-        null_mut, //
+        null_mut,
+        NonNull, //
     },
 };
 use macros::vtable;
@@ -288,6 +290,9 @@ impl<T: DriverCrtc> Crtc<T, KmsProbe> {
 /// [`struct drm_crtc`]: srctree/include/drm/drm_crtc.h
 /// [`as_raw()`]: AsRawCrtc::as_raw()
 pub unsafe trait AsRawCrtc<C: DeviceContext = Normal> {
+    /// The type used to represent an atomic state for this [`Crtc`].
+    type State: AsRawCrtcState + FromRawCrtcState;
+
     /// Return a raw pointer to the `bindings::drm_crtc` for this object
     fn as_raw(&self) -> *mut bindings::drm_crtc;
 
@@ -306,6 +311,8 @@ pub unsafe trait AsRawCrtc<C: DeviceContext = Normal> {
 // - Since we don't expose `crtc` to users before it has been initialized, this and our data
 //   layout ensure that `as_raw()` always returns a valid pointer to a `drm_crtc`.
 unsafe impl<T: DriverCrtc, C: DeviceContext> AsRawCrtc<C> for Crtc<T, C> {
+    type State = CrtcState<T::State>;
+
     fn as_raw(&self) -> *mut bindings::drm_crtc {
         self.crtc.get()
     }
@@ -366,6 +373,8 @@ impl<T: KmsDriver, C: DeviceContext> Sealed for OpaqueCrtc<T, C> {}
 // - Since we don't expose `OpaqueCrtc` to users before it has been initialized, this and our data
 //   layout ensure that `as_raw()` always returns a valid pointer to a `drm_crtc`.
 unsafe impl<T: KmsDriver, C: DeviceContext> AsRawCrtc<C> for OpaqueCrtc<T, C> {
+    type State = OpaqueCrtcState<T>;
+
     fn as_raw(&self) -> *mut bindings::drm_crtc {
         self.crtc.get()
     }
@@ -609,6 +618,102 @@ impl<T: KmsDriver> FromRawCrtcState for OpaqueCrtcState<T> {
 // SAFETY: Shares the safety guarantees of OpaqueCrtc<T>'s ModeObjectVtable impl
 unsafe impl<T: KmsDriver> ModeObjectVtable for OpaqueCrtcState<T> {
     type Vtable = bindings::drm_crtc_funcs;
+
+    fn vtable(&self) -> *const Self::Vtable {
+        self.crtc().vtable()
+    }
+}
+
+/// An interface for mutating a [`Crtc`]s atomic state.
+///
+/// This type is typically returned by an [`AtomicStateMutator`] within contexts where it is
+/// possible to safely mutate a plane's state. In order to uphold rust's data-aliasing rules, only
+/// [`CrtcStateMutator`] may exist at a time.
+///
+/// # Invariants
+///
+/// `self.state` always points to a valid instance of a [`FromRawCrtcState`] object.
+pub struct CrtcStateMutator<'a, T: FromRawCrtcState> {
+    state: NonNull<T>,
+    mask: &'a Cell<u32>,
+}
+
+impl<'a, T: FromRawCrtcState> CrtcStateMutator<'a, T> {
+    pub(super) fn new<D: KmsDriver>(
+        mutator: &'a AtomicStateMutator<D>,
+        state: NonNull<bindings::drm_crtc_state>,
+    ) -> Option<Self> {
+        // SAFETY: `crtc` is invariant throughout the lifetime of the atomic state, and always
+        // points to a valid `Crtc<T::Crtc>`
+        let crtc = unsafe { T::Crtc::from_raw((*state.as_ptr()).crtc) };
+        let crtc_mask = crtc.mask();
+        let borrowed_mask = mutator.borrowed_crtcs.get();
+
+        if borrowed_mask & crtc_mask == 0 {
+            mutator.borrowed_crtcs.set(borrowed_mask | crtc_mask);
+            Some(Self {
+                mask: &mutator.borrowed_crtcs,
+                state: state.cast(),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl<'a, T: DriverCrtcState> CrtcStateMutator<'a, CrtcState<T>> {
+    super::impl_from_opaque_mode_obj! {
+        fn <D, C>(CrtcStateMutator<'a, OpaqueCrtcState<D>>) -> Self
+        where
+            T: DriverCrtcState<Crtc = C>;
+        use
+            T as DriverCrtc,
+            D as KmsDriver<Crtc = ...>
+    }
+}
+
+impl<'a, T: FromRawCrtcState> Drop for CrtcStateMutator<'a, T> {
+    fn drop(&mut self) {
+        // SAFETY: Our interface is proof that we are the only ones with a reference to this data
+        let mask = unsafe { self.state.as_ref() }.crtc().mask();
+        self.mask.set(self.mask.get() & !mask);
+    }
+}
+
+impl<'a, T: DriverCrtcState> Deref for CrtcStateMutator<'a, CrtcState<T>> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: Our interface ensures that `self.state.inner` follows rust's data-aliasing rules,
+        // so this is safe
+        unsafe { &*(*self.state.as_ptr()).inner.get() }
+    }
+}
+
+impl<'a, T: DriverCrtcState> DerefMut for CrtcStateMutator<'a, CrtcState<T>> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: Our interface ensures that `self.state.inner` follows rust's data-aliasing rules,
+        // so this is safe
+        unsafe { (*self.state.as_ptr()).inner.get_mut() }
+    }
+}
+
+impl<'a, T: FromRawCrtcState> AsRawCrtcState for CrtcStateMutator<'a, T> {
+    type Crtc = T::Crtc;
+}
+
+impl<'a, T: FromRawCrtcState> private::AsRawCrtcState for CrtcStateMutator<'a, T> {
+    fn as_raw(&self) -> *mut bindings::drm_crtc_state {
+        self.state.as_ptr().cast()
+    }
+}
+
+// SAFETY: Shares the safety guarantees of T::Crtc's ModeObjectVtable impl
+unsafe impl<'a, T: FromRawCrtcState> ModeObjectVtable for CrtcStateMutator<'a, T>
+where
+    T::Crtc: ModeObjectVtable,
+{
+    type Vtable = <T::Crtc as ModeObjectVtable>::Vtable;
 
     fn vtable(&self) -> *const Self::Vtable {
         self.crtc().vtable()

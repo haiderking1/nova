@@ -9,6 +9,7 @@ use crate::{
     bindings,
     drm::{
         kms::{
+            atomic::*,
             encoder::*,
             KmsDriver,
             KmsProbe,
@@ -27,10 +28,11 @@ use crate::{
     container_of,
 };
 use core::{
+    cell::Cell,
     marker::*,
     mem::ManuallyDrop,
     ops::*,
-    ptr::null_mut,
+    ptr::{null_mut, NonNull},
     stringify,
 };
 use macros::paste;
@@ -302,6 +304,9 @@ impl<T: DriverConnector> Connector<T> {
 /// [`as_raw()`]: AsRawConnector::as_raw()
 /// [`struct drm_connector`]: srctree/include/drm/drm_connector.h
 pub unsafe trait AsRawConnector<C: DeviceContext = Normal> {
+    /// The type used to represent an atomic state for this [`Connector`].
+    type State: AsRawConnectorState + FromRawConnectorState;
+
     /// Return the raw [`struct drm_connector`] for this DRM connector.
     ///
     /// Drivers should never use this directly
@@ -360,6 +365,8 @@ unsafe impl<T: DriverConnector> ModeObjectVtable for Connector<T> {
 // * Since we don't expose `Connector` to users before it has been initialized, this and our data
 //   layout ensure that `as_raw()` always returns a valid pointer to a `drm_connector`.
 unsafe impl<T: DriverConnector, C: DeviceContext> AsRawConnector<C> for Connector<T, C> {
+    type State = ConnectorState<T::State>;
+
     fn as_raw(&self) -> *mut bindings::drm_connector {
         self.connector.get()
     }
@@ -452,6 +459,8 @@ impl<T: KmsDriver, C: DeviceContext> Sealed for OpaqueConnector<T, C> {}
 // - Since we don't expose `OpaqueConnector` to users before it has been initialized, this and our
 //   data layout ensure that `as_raw()` always returns a valid pointer to a `drm_connector`.
 unsafe impl<T: KmsDriver, C: DeviceContext> AsRawConnector<C> for OpaqueConnector<T, C> {
+    type State = OpaqueConnectorState<T>;
+
     fn as_raw(&self) -> *mut bindings::drm_connector {
         self.connector.get()
     }
@@ -777,6 +786,103 @@ unsafe impl<T: KmsDriver> ModeObjectVtable for OpaqueConnectorState<T> {
 
     fn vtable(&self) -> *const Self::Vtable {
         self.connector().vtable()
+    }
+}
+
+/// An interface for mutating a [`Connector`]s atomic state.
+///
+/// This type is typically returned by an [`AtomicStateMutator`] within contexts where it is
+/// possible to safely mutate a connector's state. In order to uphold rust's data-aliasing rules,
+/// only [`ConnectorStateMutator`] may exist at a time.
+pub struct ConnectorStateMutator<'a, T: FromRawConnectorState> {
+    state: &'a mut T,
+    mask: &'a Cell<u32>,
+}
+
+impl<'a, T: FromRawConnectorState> ConnectorStateMutator<'a, T> {
+    pub(super) fn new<D: KmsDriver>(
+        mutator: &'a AtomicStateMutator<D>,
+        state: NonNull<bindings::drm_connector_state>,
+    ) -> Option<Self> {
+        // SAFETY:
+        // - `connector` is invariant throughout the lifetime of the atomic state.
+        // - `state` is initialized by the time it is passed to this function.
+        // - We're guaranteed that `state` is compatible with `drm_connector` by type invariants.
+        let connector = unsafe { T::Connector::from_raw((*state.as_ptr()).connector) };
+        let conn_mask = connector.mask();
+        let borrowed_mask = mutator.borrowed_connectors.get();
+
+        if borrowed_mask & conn_mask == 0 {
+            mutator.borrowed_connectors.set(borrowed_mask | conn_mask);
+            Some(Self {
+                mask: &mutator.borrowed_connectors,
+                // SAFETY: We're guaranteed `state` is of `T` by type invariance, and we just
+                // confirmed by checking `borrowed_connectors` that no other mutable borrows have
+                // been taken out for `state`
+                state: unsafe { T::from_raw_mut(state.as_ptr()) },
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl<'a, T: DriverConnectorState> Deref for ConnectorStateMutator<'a, ConnectorState<T>> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state.inner
+    }
+}
+
+impl<'a, T: DriverConnectorState> DerefMut for ConnectorStateMutator<'a, ConnectorState<T>> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state.inner
+    }
+}
+
+impl<'a, T: FromRawConnectorState> Drop for ConnectorStateMutator<'a, T> {
+    fn drop(&mut self) {
+        let mask = self.state.connector().mask();
+        self.mask.set(self.mask.get() & !mask);
+    }
+}
+
+impl<'a, T: FromRawConnectorState> AsRawConnectorState for ConnectorStateMutator<'a, T> {
+    type Connector = T::Connector;
+}
+
+impl<'a, T: FromRawConnectorState> private::AsRawConnectorState for ConnectorStateMutator<'a, T> {
+    fn as_raw(&self) -> &bindings::drm_connector_state {
+        self.state.as_raw()
+    }
+
+    unsafe fn as_raw_mut(&mut self) -> &mut bindings::drm_connector_state {
+        // SAFETY: We're bound by the same safety contract as this function
+        unsafe { self.state.as_raw_mut() }
+    }
+}
+
+// SAFETY: we inherit the safety guarantees of `T`
+unsafe impl<'a, T> ModeObjectVtable for ConnectorStateMutator<'a, T>
+where
+    T: FromRawConnectorState + ModeObjectVtable,
+{
+    type Vtable = T::Vtable;
+
+    fn vtable(&self) -> *const Self::Vtable {
+        self.state.vtable()
+    }
+}
+
+impl<'a, T: DriverConnectorState> ConnectorStateMutator<'a, ConnectorState<T>> {
+    super::impl_from_opaque_mode_obj! {
+        fn <D, C>(ConnectorStateMutator<'a, OpaqueConnectorState<D>>) -> Self
+        where
+            T: DriverConnectorState<Connector = C>;
+        use
+            C as DriverConnector,
+            D as KmsDriver<Connector = ...>
     }
 }
 
