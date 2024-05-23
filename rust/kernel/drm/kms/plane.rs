@@ -589,7 +589,7 @@ pub trait RawPlaneState: AsRawPlaneState {
     where
         D: KmsDriver,
         S: FromRawCrtcState,
-        S::Crtc: ModesettableCrtc + ModeObject<Driver = D>,
+        S::Crtc: AsRawCrtc + ModeObject<Driver = D>,
         Self::Plane: ModeObject<Driver = D>,
     {
         // SAFETY: We're passing the mutable reference from `self.as_raw_mut()` directly to DRM,
@@ -598,8 +598,8 @@ pub trait RawPlaneState: AsRawPlaneState {
             bindings::drm_atomic_helper_check_plane_state(
                 self.as_raw_mut(),
                 crtc_state.as_raw(),
-                bindings::DRM_PLANE_NO_SCALING as _, // TODO: add parameters for scaling
-                bindings::DRM_PLANE_NO_SCALING as _,
+                bindings::DRM_PLANE_NO_SCALING as c_int, // TODO: add parameters for scaling
+                bindings::DRM_PLANE_NO_SCALING as c_int,
                 can_position,
                 can_update_disabled,
             )
