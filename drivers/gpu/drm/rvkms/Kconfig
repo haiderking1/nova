@@ -1,0 +1,8 @@
+config DRM_RVKMS
+        tristate "Rust VKMS PoC driver (EXPERIMENTAL)"
+        depends on DRM
+        depends on 64BIT # i64 % i64 doesn't work on 32 bit for rust yet
+        select RUST
+        select DRM_CLIENT_SELECTION
+        select DRM_KMS_HELPER
+        select DRM_GEM_DMA_HELPER
