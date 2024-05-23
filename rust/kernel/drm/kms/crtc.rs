@@ -23,13 +23,17 @@ use crate::{
             plane::*,
         },
     },
-    error::to_result,
+    error::{
+        to_result,
+        from_result, //
+    },
     prelude::*,
     types::Opaque,
 };
 use core::{
     cell::{Cell, UnsafeCell},
     marker::*,
+    mem::ManuallyDrop,
     ops::{
         Deref,
         DerefMut, //
@@ -92,7 +96,11 @@ pub trait DriverCrtc: Send + Sync + Sized {
         helper_funcs: bindings::drm_crtc_helper_funcs {
             atomic_disable: None,
             atomic_enable: None,
-            atomic_check: None,
+            atomic_check: if Self::HAS_ATOMIC_CHECK {
+                Some(atomic_check_callback::<Self>)
+            } else {
+                None
+            },
             dpms: None,
             commit: None,
             prepare: None,
@@ -127,6 +135,16 @@ pub trait DriverCrtc: Send + Sync + Sized {
     ///
     /// Drivers may use this to instantiate their [`DriverCrtc`] object.
     fn new(device: &Device<Self::Driver, KmsProbe>, args: &Self::Args) -> impl PinInit<Self, Error>;
+
+    /// The optional [`drm_crtc_helper_funcs.atomic_check`] hook for this crtc.
+    ///
+    /// Drivers may use this to customize the atomic check phase of their [`Crtc`] objects. The
+    /// result of this function determines whether the atomic check passed or failed.
+    ///
+    /// [`drm_crtc_helper_funcs.atomic_check`]: srctree/include/drm/drm_modeset_helper_vtables.h
+    fn atomic_check(_check: CrtcAtomicCheck<'_, Self>) -> Result {
+        build_error::build_error("This should not be reachable")
+    }
 }
 
 /// The generated C vtable for a [`DriverCrtc`].
@@ -720,6 +738,29 @@ where
     }
 }
 
+/// A token provided during [`atomic_check`] callbacks for accessing the crtc, atomic state, and new
+/// and old states of the crtc.
+///
+/// # Invariants
+///
+/// This token is proof that the old and new atomic state of `crtc` are present in `state` and do
+/// not have any mutators taken out.
+///
+/// [`atomic_check`]: DriverCrtc::atomic_check
+pub struct CrtcAtomicCheck<'a, T: DriverCrtc> {
+    state: &'a AtomicStateComposer<T::Driver>,
+    crtc: &'a Crtc<T>,
+}
+
+impl<'a, T: DriverCrtc> CrtcAtomicCheck<'a, T> {
+    impl_atomic_state_token_ops!(
+        CrtcAtomicCheck,
+        AtomicStateComposer,
+        Crtc,
+        use <'a, T>
+    );
+}
+
 #[allow(clippy::missing_safety_doc)]
 unsafe extern "C" fn crtc_destroy_callback<T: DriverCrtc>(crtc: *mut bindings::drm_crtc) {
     // SAFETY: DRM guarantees that `crtc` points to a valid initialized `drm_crtc`.
@@ -826,4 +867,33 @@ unsafe extern "C" fn crtc_reset_callback<T: DriverCrtcState>(crtc: *mut bindings
 
     // SAFETY: DRM takes ownership of the state from here, and will never move it
     unsafe { bindings::__drm_atomic_helper_crtc_reset(crtc.as_raw(), KBox::into_raw(new).cast()) };
+}
+
+#[allow(clippy::missing_safety_doc)]
+unsafe extern "C" fn atomic_check_callback<T: DriverCrtc>(
+    crtc: *mut bindings::drm_crtc,
+    commit: *mut bindings::drm_atomic_commit,
+) -> i32 {
+    // SAFETY:
+    // - We're guaranteed `crtc` is of type `Crtc<T>` via type invariants.
+    // - We're guaranteed by DRM that `crtc` is pointing to a valid initialized state.
+    let crtc = unsafe { Crtc::from_raw(crtc) };
+
+    // SAFETY: DRM guarantees `state` points to a valid `drm_atomic_state`
+    // We use a ManuallyDrop here to avoid AtomicStateComposer dropping an owned reference we never
+    // acquired.
+    let commit =
+        unsafe { ManuallyDrop::new(AtomicStateComposer::new(NonNull::new_unchecked(commit))) };
+
+    // SAFETY:
+    // - Since we're in the atomic check callback, we're guaranteed by DRM that both the old and
+    //   new crtc state are present in this atomic state
+    // - We just created the state composer above, so other composers cannot be taken out on the
+    //   crtc state yet.
+    let check = unsafe { CrtcAtomicCheck::new(crtc, &commit) };
+
+    from_result(|| {
+        T::atomic_check(check)?;
+        Ok(0)
+    })
 }
