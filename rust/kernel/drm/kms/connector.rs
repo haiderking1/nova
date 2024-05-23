@@ -13,6 +13,7 @@ use crate::{
             KmsDriver,
             KmsProbe,
             ModeObject,
+            ModeObjectVtable,
             ModeConfigGuard,
             Sealed, //
         }, //
@@ -269,6 +270,13 @@ impl<T: DriverConnector> Connector<T, KmsProbe> {
 }
 
 impl<T: DriverConnector> Connector<T> {
+    super::impl_from_opaque_mode_obj! {
+        fn <'a, D>(&'a OpaqueConnector<D>) -> &'a Self;
+        use
+            T as DriverConnector,
+            D as KmsDriver<Connector = ...>
+    }
+
     /// Acquire a [`ConnectorGuard`] for this connector from a [`ModeConfigGuard`].
     ///
     /// This verifies using the provided reference that the given guard is actually for the same
@@ -335,6 +343,16 @@ unsafe impl<T: DriverConnector, C: DeviceContext> ModeObject<C> for Connector<T,
 // Connectors are refcounted objects.
 super::impl_aref_for_mode_object! {
     impl<T: DriverConnector> for Connector<T, Normal>
+}
+
+// SAFETY: `funcs` is initialized by DRM when the connector is allocated
+unsafe impl<T: DriverConnector> ModeObjectVtable for Connector<T> {
+    type Vtable = bindings::drm_connector_funcs;
+
+    fn vtable(&self) -> *const Self::Vtable {
+        // SAFETY: `funcs` is initialized by DRM when the connector is allocated
+        unsafe { *self.as_raw() }.funcs
+    }
 }
 
 // SAFETY:
@@ -408,6 +426,77 @@ unsafe extern "C" fn get_modes_callback<T: DriverConnector>(
 
     T::get_modes(connector.guard(&guard), &guard)
 }
+
+/// A [`struct drm_connector`] without a known [`DriverConnector`] implementation.
+///
+/// This is mainly for situations where our bindings can't infer the [`DriverConnector`]
+/// implementation for a [`struct drm_connector`] automatically. It is identical to [`Connector`],
+/// except that it does not provide access to the driver's private data.
+///
+/// # Invariants
+///
+/// - `connector` is initialized for as long as this object is exposed to users.
+/// - The data layout of this type is equivalent to [`struct drm_connector`].
+///
+/// [`struct drm_connector`]: srctree/include/drm/drm_connector.h
+#[repr(transparent)]
+pub struct OpaqueConnector<T: KmsDriver, C: DeviceContext = Normal> {
+    connector: Opaque<bindings::drm_connector>,
+    _p: PhantomData<(T, C)>,
+}
+
+impl<T: KmsDriver, C: DeviceContext> Sealed for OpaqueConnector<T, C> {}
+
+// SAFETY:
+// - Via our type variants our data layout starts is identical to `drm_connector`
+// - Since we don't expose `OpaqueConnector` to users before it has been initialized, this and our
+//   data layout ensure that `as_raw()` always returns a valid pointer to a `drm_connector`.
+unsafe impl<T: KmsDriver, C: DeviceContext> AsRawConnector<C> for OpaqueConnector<T, C> {
+    fn as_raw(&self) -> *mut bindings::drm_connector {
+        self.connector.get()
+    }
+
+    unsafe fn from_raw<'a>(ptr: *mut bindings::drm_connector) -> &'a Self {
+        // SAFETY: Our data layout is identical to `bindings::drm_connector`
+        unsafe { &*ptr.cast() }
+    }
+}
+
+// SAFETY: We don't expose OpaqueConnector<T> to users before `base` is initialized in
+// Connector::new(), so `raw_mode_obj` always returns a valid pointer to a bindings::drm_mode_object.
+unsafe impl<T: KmsDriver, C: DeviceContext> ModeObject<C> for OpaqueConnector<T, C> {
+    type Driver = T;
+
+    fn drm_dev(&self) -> &Device<Self::Driver, C> {
+        // SAFETY: The parent device for a DRM connector will never outlive the connector, and this
+        // pointer is invariant through the lifetime of the connector
+        unsafe { Device::from_raw((*self.as_raw()).dev) }
+    }
+
+    fn raw_mode_obj(&self) -> *mut bindings::drm_mode_object {
+        // SAFETY: We don't expose DRM connectors to users before `base` is initialized
+        unsafe { &mut (*self.as_raw()).base }
+    }
+}
+
+super::impl_aref_for_mode_object! {
+    impl<T: KmsDriver> for OpaqueConnector<T>
+}
+
+// SAFETY: `funcs` is initialized by DRM when the connector is allocated
+unsafe impl<T: KmsDriver> ModeObjectVtable for OpaqueConnector<T> {
+    type Vtable = bindings::drm_connector_funcs;
+
+    fn vtable(&self) -> *const Self::Vtable {
+        // SAFETY: `funcs` is initialized by DRM when the connector is allocated
+        unsafe { *self.as_raw() }.funcs
+    }
+}
+
+// SAFETY: Our connector interfaces are guaranteed to be thread-safe once fully initialized.
+unsafe impl<T: KmsDriver> Send for OpaqueConnector<T> {}
+// SAFETY: Our connector interfaces are guaranteed to be thread-safe once fully initialized.
+unsafe impl<T: KmsDriver> Sync for OpaqueConnector<T> {}
 
 /// A privileged [`Connector`] obtained while holding a [`ModeConfigGuard`].
 ///
@@ -611,6 +700,83 @@ impl<T: DriverConnectorState> FromRawConnectorState for ConnectorState<T> {
         // - Our safety contract requires the caller ensure it is safe for us to take a mutable
         //   reference.
         unsafe { &mut *ptr }
+    }
+}
+
+// SAFETY: `funcs` is initialized by DRM when the connector is allocated
+unsafe impl<T: DriverConnectorState> ModeObjectVtable for ConnectorState<T> {
+    type Vtable = bindings::drm_connector_funcs;
+
+    fn vtable(&self) -> *const Self::Vtable {
+        self.connector().vtable()
+    }
+}
+
+impl<T: DriverConnectorState> ConnectorState<T> {
+    super::impl_from_opaque_mode_obj! {
+        fn <'a, D, C>(&'a OpaqueConnectorState<D>) -> &'a Self
+        where
+            T: DriverConnectorState<Connector = C>;
+        use
+            C as DriverConnector,
+            D as KmsDriver<Connector = ...>
+    }
+}
+
+/// A [`struct drm_connector_state`] without a known [`DriverConnectorState`] implementation.
+///
+/// This is mainly for situations where our bindings can't infer the [`DriverConnectorState`]
+/// implementation for a [`struct drm_connector_state`] automatically. It is identical to
+/// [`Connector`], except that it does not provide access to the driver's private data.
+///
+/// # Invariants
+///
+/// - `state` is initialized for as long as this object is exposed to users.
+/// - The data layout of this type is identical to [`struct drm_connector_state`].
+/// - The DRM C API and our interface guarantees that only the user has mutable access to `state`,
+///   up until [`drm_atomic_helper_commit_hw_done`] is called. Therefore, `connector` follows rust's
+///   data aliasing rules and does not need to be behind an [`Opaque`] type.
+///
+/// [`struct drm_connector_state`]: srctree/include/drm/drm_connector.h
+/// [`drm_atomic_helper_commit_hw_done`]: srctree/include/drm/drm_atomic_helper.h
+#[repr(transparent)]
+pub struct OpaqueConnectorState<T: KmsDriver> {
+    state: bindings::drm_connector_state,
+    _p: PhantomData<T>,
+}
+
+impl<T: KmsDriver> AsRawConnectorState for OpaqueConnectorState<T> {
+    type Connector = OpaqueConnector<T>;
+}
+
+impl<T: KmsDriver> private::AsRawConnectorState for OpaqueConnectorState<T> {
+    fn as_raw(&self) -> &bindings::drm_connector_state {
+        &self.state
+    }
+
+    unsafe fn as_raw_mut(&mut self) -> &mut bindings::drm_connector_state {
+        &mut self.state
+    }
+}
+
+impl<T: KmsDriver> FromRawConnectorState for OpaqueConnectorState<T> {
+    unsafe fn from_raw<'a>(ptr: *const bindings::drm_connector_state) -> &'a Self {
+        // SAFETY: Our data layout is identical to `bindings::drm_connector_state`
+        unsafe { &*ptr.cast() }
+    }
+
+    unsafe fn from_raw_mut<'a>(ptr: *mut bindings::drm_connector_state) -> &'a mut Self {
+        // SAFETY: Our data layout is identical to `bindings::drm_connector_state`
+        unsafe { &mut *ptr.cast() }
+    }
+}
+
+// SAFETY: See OpaqueConnector's ModeObjectVtable implementation
+unsafe impl<T: KmsDriver> ModeObjectVtable for OpaqueConnectorState<T> {
+    type Vtable = bindings::drm_connector_funcs;
+
+    fn vtable(&self) -> *const Self::Vtable {
+        self.connector().vtable()
     }
 }
 
