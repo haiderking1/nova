@@ -19,7 +19,10 @@ use crate::{
         fourcc::*,
         Normal,
         DeviceContext,
-        kms::KmsProbe, //
+        kms::{
+            KmsProbe,
+            ModeObjectVtable, //
+        },
     },
     error::{
         to_result,
@@ -178,6 +181,25 @@ impl<T: DriverPlane, C: DeviceContext> Deref for Plane<T, C> {
     #[inline]
     fn deref(&self) -> &Self::Target {
         &self.inner
+    }
+}
+
+// SAFETY: `funcs` is initialized when the plane is allocated
+unsafe impl<T: DriverPlane, C: DeviceContext> ModeObjectVtable for Plane<T, C> {
+    type Vtable = bindings::drm_plane_funcs;
+
+    fn vtable(&self) -> *const Self::Vtable {
+        // SAFETY: `as_raw()` always returns a valid plane pointer
+        unsafe { *self.as_raw() }.funcs
+    }
+}
+
+impl<T: DriverPlane, C: DeviceContext> Plane<T, C> {
+    super::impl_from_opaque_mode_obj! {
+        fn <'a, D>(&'a OpaquePlane<D, C>) -> &'a Self;
+        use
+            T as DriverPlane,
+            D as KmsDriver<Plane = ...>
     }
 }
 
@@ -358,6 +380,79 @@ pub trait RawPlane<C: DeviceContext = Normal>: AsRawPlane<C> {
 }
 impl<T: AsRawPlane<C>, C: DeviceContext> RawPlane<C> for T {}
 
+/// A [`struct drm_plane`] without a known [`DriverPlane`] implementation.
+///
+/// This is mainly for situations where our bindings can't infer the [`DriverPlane`] implementation
+/// for a [`struct drm_plane`] automatically. It is identical to [`Plane`], except that it does not
+/// provide access to the driver's private data.
+///
+/// It may be upcasted to a full [`Plane`] using [`Plane::from_opaque`] or
+/// [`Plane::try_from_opaque`].
+///
+/// # Invariants
+///
+/// - `plane` is initialized for as long as this object is made available to users.
+/// - The data layout of this structure is equivalent to [`struct drm_plane`].
+///
+/// [`struct drm_plane`]: srctree/include/drm/drm_plane.h
+#[repr(transparent)]
+pub struct OpaquePlane<T: KmsDriver, C: DeviceContext = Normal> {
+    plane: Opaque<bindings::drm_plane>,
+    _p: PhantomData<(T, C)>,
+}
+
+impl<T: KmsDriver, C: DeviceContext> Sealed for OpaquePlane<T, C> {}
+
+// SAFETY:
+// * Via our type variants our data layout is identical to `drm_plane`
+// * Since we don't expose `plane` to users before it has been initialized, this and our data
+//   layout ensure that `as_raw()` always returns a valid pointer to a `drm_plane`.
+unsafe impl<T: KmsDriver, C: DeviceContext> AsRawPlane<C> for OpaquePlane<T, C> {
+    fn as_raw(&self) -> *mut bindings::drm_plane {
+        self.plane.get()
+    }
+
+    unsafe fn from_raw<'a>(ptr: *mut bindings::drm_plane) -> &'a Self {
+        // SAFETY: Our data layout is identical to `bindings::drm_plane`
+        unsafe { &*ptr.cast() }
+    }
+}
+
+// SAFETY: We don't expose OpaquePlane<T> to users before `base` is initialized in
+// Plane::<T>::new(), so `raw_mode_obj` always returns a valid pointer to a
+// bindings::drm_mode_object.
+unsafe impl<T: KmsDriver, C: DeviceContext> ModeObject<C> for OpaquePlane<T, C> {
+    type Driver = T;
+
+    fn drm_dev(&self) -> &Device<Self::Driver, C> {
+        // SAFETY: DRM planes exist for as long as the device does, so this pointer is always valid
+        unsafe { Device::from_raw((*self.as_raw()).dev) }
+    }
+
+    fn raw_mode_obj(&self) -> *mut bindings::drm_mode_object {
+        // SAFETY: We don't expose DRM planes to users before `base` is initialized
+        unsafe { &raw mut (*self.as_raw()).base }
+    }
+}
+
+// SAFETY: `OpaquePlane`s do not have a reference count of their own.
+unsafe impl<T: KmsDriver, C: DeviceContext> StaticModeObject<C> for OpaquePlane<T, C> {}
+
+// SAFETY: `funcs` is initialized when the plane is allocated
+unsafe impl<T: KmsDriver, C: DeviceContext> ModeObjectVtable for OpaquePlane<T, C> {
+    type Vtable = bindings::drm_plane_funcs;
+
+    fn vtable(&self) -> *const Self::Vtable {
+        // SAFETY: `as_raw()` always returns a valid pointer to a plane
+        unsafe { *self.as_raw() }.funcs
+    }
+}
+
+// SAFETY: Our plane interfaces are guaranteed to be thread-safe once fully initialized.
+unsafe impl<T: KmsDriver> Send for OpaquePlane<T> {}
+// SAFETY: Our plane interfaces are guaranteed to be thread-safe once fully initialized.
+unsafe impl<T: KmsDriver> Sync for OpaquePlane<T> {}
+
 /// A trait implemented by any type which can produce a reference to a [`struct drm_plane_state`].
 ///
 /// This is implemented internally by DRM.
@@ -535,6 +630,83 @@ impl<T: DriverPlaneState> DerefMut for PlaneState<T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
+    }
+}
+
+// SAFETY: Shares the safety guarantee of Plane<T>'s vtable impl
+unsafe impl<T: DriverPlaneState> ModeObjectVtable for PlaneState<T> {
+    type Vtable = bindings::drm_plane_funcs;
+
+    fn vtable(&self) -> *const Self::Vtable {
+        self.plane().vtable()
+    }
+}
+
+impl<T: DriverPlaneState> PlaneState<T> {
+    super::impl_from_opaque_mode_obj! {
+        fn <'a, D, P>(&'a OpaquePlaneState<D>) -> &'a Self
+        where
+            T: DriverPlaneState<Plane = P>;
+        use
+            P as DriverPlane,
+            D as KmsDriver<Plane = ...>
+    }
+}
+
+/// A [`struct drm_plane_state`] without a known [`DriverPlaneState`] implementation.
+///
+/// This is mainly for situations where our bindings can't infer the [`DriverPlaneState`]
+/// implementation for a [`struct drm_plane_state`] automatically. It is identical to [`Plane`],
+/// except that it does not provide access to the driver's private data.
+///
+/// # Invariants
+///
+/// - The DRM C API and our interface guarantees that only the user has mutable access to `state`,
+///   up until [`drm_atomic_helper_commit_hw_done`] is called. Therefore, `plane` follows rust's
+///   data aliasing rules and does not need to be behind an [`Opaque`] type.
+/// - `state` is initialized for as long as this object is exposed to users.
+/// - The data layout of this structure is identical to [`struct drm_plane_state`].
+///
+/// [`struct drm_plane_state`]: srctree/include/drm/drm_plane.h
+/// [`drm_atomic_helper_commit_hw_done`]: srctree/include/drm/drm_atomic_helper.h
+#[repr(transparent)]
+pub struct OpaquePlaneState<T: KmsDriver> {
+    state: bindings::drm_plane_state,
+    _p: PhantomData<T>,
+}
+
+impl<T: KmsDriver> AsRawPlaneState for OpaquePlaneState<T> {
+    type Plane = OpaquePlane<T>;
+}
+
+impl<T: KmsDriver> private::AsRawPlaneState for OpaquePlaneState<T> {
+    fn as_raw(&self) -> &bindings::drm_plane_state {
+        &self.state
+    }
+
+    unsafe fn as_raw_mut(&mut self) -> &mut bindings::drm_plane_state {
+        &mut self.state
+    }
+}
+
+impl<T: KmsDriver> FromRawPlaneState for OpaquePlaneState<T> {
+    unsafe fn from_raw<'a>(ptr: *const bindings::drm_plane_state) -> &'a Self {
+        // SAFETY: Our data layout is identical to `ptr`
+        unsafe { &*ptr.cast() }
+    }
+
+    unsafe fn from_raw_mut<'a>(ptr: *mut bindings::drm_plane_state) -> &'a mut Self {
+        // SAFETY: Our data layout is identical to `ptr`
+        unsafe { &mut *ptr.cast() }
+    }
+}
+
+// SAFETY: Shares the safety guarantee of OpaquePlane<T>'s vtable impl
+unsafe impl<T: KmsDriver> ModeObjectVtable for OpaquePlaneState<T> {
+    type Vtable = bindings::drm_plane_funcs;
+
+    fn vtable(&self) -> *const Self::Vtable {
+        self.plane().vtable()
     }
 }
 
