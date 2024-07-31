@@ -1030,9 +1030,10 @@ unsafe extern "C" fn atomic_flush_callback<T: DriverCrtc>(
     T::atomic_flush(commit);
 }
 
+#[allow(clippy::missing_safety_doc)]
 unsafe extern "C" fn atomic_enable_callback<T: DriverCrtc>(
     crtc: *mut bindings::drm_crtc,
-    state: *mut bindings::drm_atomic_state,
+    state: *mut bindings::drm_atomic_commit,
 ) {
     // SAFETY:
     // - We're guaranteed `crtc` is of type `Crtc<T>` via type invariants.
@@ -1052,9 +1053,10 @@ unsafe extern "C" fn atomic_enable_callback<T: DriverCrtc>(
     T::atomic_enable(commit);
 }
 
+#[allow(clippy::missing_safety_doc)]
 unsafe extern "C" fn atomic_disable_callback<T: DriverCrtc>(
     crtc: *mut bindings::drm_crtc,
-    state: *mut bindings::drm_atomic_state,
+    state: *mut bindings::drm_atomic_commit,
 ) {
     // SAFETY:
     // - We're guaranteed `crtc` points to a valid instance of `drm_crtc`

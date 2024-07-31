@@ -19,7 +19,10 @@ use crate::{
     },
     error::from_err_ptr,
     prelude::*,
-    sync::aref::ARef,
+    sync::{
+        aref::ARef,
+        SpinLockIrq, //
+    },
     types::{
         NotThreadSafe,
         Opaque, //
@@ -427,6 +430,13 @@ impl<T: drm::Driver, C: DeviceContext> Device<T, C> {
 
     pub(crate) const fn has_kms() -> bool {
         <T::Kms as KmsImplPrivate>::MODE_CONFIG_OPS.is_some()
+    }
+
+    /// Returns a reference to the `event` spinlock
+    #[allow(dead_code)]
+    pub(crate) fn event_lock(&self) -> &SpinLockIrq<()> {
+        // SAFETY: `event_lock` is initialized for as long as `self` is exposed to users
+        unsafe { SpinLockIrq::from_raw(&mut (*self.as_raw()).event_lock) }
     }
 }
 
