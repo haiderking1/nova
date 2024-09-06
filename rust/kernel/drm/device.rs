@@ -433,7 +433,6 @@ impl<T: drm::Driver, C: DeviceContext> Device<T, C> {
     }
 
     /// Returns a reference to the `event` spinlock
-    #[allow(dead_code)]
     pub(crate) fn event_lock(&self) -> &SpinLockIrq<()> {
         // SAFETY: `event_lock` is initialized for as long as `self` is exposed to users
         unsafe { SpinLockIrq::from_raw(&mut (*self.as_raw()).event_lock) }

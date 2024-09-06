@@ -57,9 +57,9 @@ impl<T: KmsDriver> AtomicCommit<T> {
     /// [`struct drm_atomic_commit`]: srctree/include/drm/drm_atomic.h
     #[allow(dead_code)]
     pub(super) unsafe fn from_raw<'a>(ptr: *const bindings::drm_atomic_commit) -> &'a Self {
-        // SAFETY: Our data layout is identical
         // INVARIANT: Our safety contract upholds the guarantee that `state` is initialized for as
         // long as this type is exposed to users.
+        // SAFETY: Our data layout is identical
         unsafe { &*ptr.cast() }
     }
 

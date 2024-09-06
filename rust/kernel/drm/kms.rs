@@ -8,6 +8,7 @@ pub mod crtc;
 pub mod encoder;
 pub mod framebuffer;
 pub mod plane;
+pub mod vblank;
 
 use crate::{
     container_of,
@@ -361,16 +362,25 @@ impl<T: KmsDriver> private::KmsImpl for T {
         // SAFETY: This cast is safe via our type invariants.
         T::probe(unsafe { drm.assume_ctx() })?;
 
-        // TODO: In the future, we should add a hook here for initializing the state of each
-        // modesetting object that was created in T::probe(). This must happen _after_ all objects
-        // are created, as it is normal for the atomic modesetting state of one object to reference
-        // another object.
+        // TODO: Honestly this is silly. I could _maybe_ see some CRTCs needing slightly different
+        // vblank handling (though I could never tell you why), but I cannot envision any reasonable
+        // scenario where we would have a GPU that only supports vblank on some CRTCs and not
+        // others. I haven't seen any evidence that the DRM core accounts for this either.
         //
-        // Until we add such a hook, just call drm_mode_config_reset(). This is required to ensure
-        // that all atomic states are initialized, otherwise attempting modesets is UB.
+        // For the time being in order to avoid the possibility of UB from this funky edgecase not
+        // being tested: we need to enforce that vblank support is "all or nothing". Either every
+        // CRTC supports it, or no CRTCs support it.
         //
-        // SAFETY: It is always safe to call this function on a device after drmm_mode_config_init()
-        // has been called
+        // In the future, I think this is likely a requirement we should be enforcing in DRM, so
+        // let's make it part of this patch series later on. But, leave this as a problem for after
+        // we get the thing rebased. For now, just assume it's implemented which is super broken.
+        //
+        // SAFETY: TODO
+        to_result(unsafe { bindings::drm_vblank_init(drm.as_raw(), drm.num_crtcs()) })?;
+
+        // TODO: Eventually add a hook to customize how state readback happens, for now just reset
+        // SAFETY: Since all static modesetting objects were created in `T::create_objects()`, and
+        // that is the only place they can be created, this fulfills the C API requirements.
         unsafe { bindings::drm_mode_config_reset(drm.as_raw()) };
 
         Ok((KmsResources(drm.into()), mode_config_info))
@@ -408,13 +418,16 @@ impl<T: KmsDriver> Device<T> {
         // held throughout ModeConfigGuard's lifetime.
         ModeConfigGuard(self.mode_config_mutex().lock(), PhantomData)
     }
+}
 
-    /// Return the number of registered CRTCs
+impl <T: KmsDriver, C: DeviceContext> Device<T, C> {
+    /// Return the number of [`Crtc`](crtc::Crtc) objects on this [`Device`].
     #[inline]
     pub fn num_crtcs(&self) -> u32 {
         // SAFETY:
-        // * This can only be modified during the single-threaded context before registration, so
-        //   this is safe
+        // * While this variable can be modified, it can only be modified within the single-threaded
+        //   context in which registration happens. Thus, we can assume it will never change under
+        //   us.
         // * num_crtc could be >= 0, but no less - so casting to u32 is fine (and better to prevent
         //   errors)
         unsafe { (*self.as_raw()).mode_config.num_crtc as u32 }
