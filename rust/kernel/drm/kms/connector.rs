@@ -9,6 +9,7 @@ use crate::{
     bindings,
     drm::{
         kms::{
+            encoder::*,
             KmsDriver,
             KmsProbe,
             ModeObject,
@@ -244,6 +245,18 @@ impl<T: DriverConnector> Connector<T, KmsProbe> {
 
         // SAFETY: We just allocated the connector above, so this pointer must be valid
         Ok(unsafe { &*this })
+    }
+
+    /// Attach an encoder to this [`Connector`].
+    #[inline]
+    pub fn attach_encoder(&self, encoder: &impl AsRawEncoder<KmsProbe>) -> Result {
+        // SAFETY:
+        // - Both as_raw() calls are guaranteed to return a valid pointer
+        // - We're guaranteed this connector is not registered via our type invariants, thus this
+        //   function is safe to call
+        to_result(unsafe {
+            bindings::drm_connector_attach_encoder(self.as_raw(), encoder.as_raw())
+        })
     }
 }
 
