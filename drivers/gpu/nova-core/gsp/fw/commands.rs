@@ -15,7 +15,14 @@ use kernel::{
 
 use crate::{
     gpu::Chipset,
-    gsp::GSP_PAGE_SIZE,
+    gsp::{
+        commands::{
+            Client,
+            Handle,
+            Subdevice, //
+        },
+        GSP_PAGE_SIZE, //
+    },
     num::IntoSafeCast, //
 };
 
@@ -134,6 +141,16 @@ impl GspStaticConfigInfo {
     /// Returns a bytes array containing the (hopefully) zero-terminated short name of this GPU.
     pub(crate) fn gpu_short_name_str(&self) -> [u8; 64] {
         self.0.gpuShortNameString
+    }
+
+    /// Returns the client handle allocated by GSP-RM.
+    pub(crate) fn client(&self) -> Handle<Client> {
+        Handle::new(self.0.hInternalClient)
+    }
+
+    /// Returns the subdevice handle allocated by GSP-RM.
+    pub(crate) fn subdevice(&self) -> Handle<Subdevice> {
+        Handle::new(self.0.hInternalSubdevice)
     }
 
     /// Returns the 16-byte SHA-1 GPU identifier supplied by GSP-RM.
