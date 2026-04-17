@@ -7,10 +7,14 @@ mod r570_144;
 // Alias to avoid repeating the version number with every use.
 use r570_144 as bindings;
 
-use core::ops::Range;
+use core::{
+    fmt,
+    ops::Range, //
+};
 
 use kernel::{
     bitfield,
+    device,
     dma::{
         Coherent,
         CoherentView, //
@@ -61,7 +65,6 @@ pub(crate) const GSP_MSG_QUEUE_ELEMENT_SIZE_MAX: usize =
 
 /// Status code returned by GSP-RM operations.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[expect(dead_code)]
 pub(crate) enum GspMsgRmStatus {
     /// The operation succeeded.
     Ok,
@@ -564,6 +567,31 @@ impl TryFrom<u32> for GspMsgRmStatus {
         }
 
         Ok(Self::Error(GspMsgRmError::try_from(value)?))
+    }
+}
+
+impl GspMsgRmStatus {
+    /// Converts [`GspMsgRmStatus`] to a [`Result`], logging if the status is a warning.
+    ///
+    /// `rpc_name` identifies the RPC for the log message.
+    pub(super) fn log_if_warning(
+        self,
+        dev: &device::Device,
+        rpc_name: impl fmt::Debug,
+    ) -> Result<(), GspMsgRmError> {
+        match self {
+            Self::Ok => Ok(()),
+            Self::Warning(warning) => {
+                dev_warn!(
+                    dev,
+                    "GSP RPC {:?} returned warning {:?}\n",
+                    rpc_name,
+                    warning
+                );
+                Ok(())
+            }
+            Self::Error(status) => Err(status),
+        }
     }
 }
 
@@ -1381,6 +1409,11 @@ impl GspMsgElement {
             .function
             .try_into()
             .map_err(|_| self.inner.rpc.function)
+    }
+
+    /// Returns the RPC status from the message header.
+    pub(super) fn status(&self) -> Result<GspMsgRmStatus> {
+        self.inner.rpc.rpc_result.try_into()
     }
 
     // Returns the number of elements (i.e. memory pages) used by this message.
