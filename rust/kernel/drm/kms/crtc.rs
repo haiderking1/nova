@@ -16,6 +16,7 @@ use crate::{
             atomic::*,
             KmsDriver,
             KmsProbe,
+            KmsRef,
             ModeObject,
             StaticModeObject,
             ModeObjectVtable,
@@ -28,6 +29,7 @@ use crate::{
         to_result,
         from_result, //
     },
+    time::hrtimer::*, //
     prelude::*,
     types::Opaque,
 };
@@ -40,6 +42,7 @@ use core::{
         DerefMut, //
     },
     ptr::{
+        self,
         null,
         null_mut,
         NonNull, //
@@ -284,6 +287,101 @@ unsafe impl<T: DriverCrtc, C: DeviceContext> ModeObjectVtable for Crtc<T, C> {
     fn vtable(&self) -> *const Self::Vtable {
         // SAFETY: `as_raw()` always returns a valid pointer to a CRTC
         unsafe { *self.as_raw() }.funcs
+    }
+}
+
+/// A handle for a `KmsRef<HasHrTimer<Crtc<T>>>` returned by a call to [`HrTimerPointer::start`].
+pub struct CrtcHrTimerHandle<T>
+where
+    T: DriverCrtc + HasHrTimer<T>,
+{
+    pub(crate) inner: KmsRef<Crtc<T>>
+}
+
+// SAFETY: uh TODO
+unsafe impl<T> HrTimerHandle for CrtcHrTimerHandle<T>
+where
+    T: HasHrTimer<T>,
+    T: DriverCrtc,
+{
+    fn cancel(&mut self) -> bool {
+        let crtc_data = ptr::from_ref(&**self.inner);
+
+        // SAFETY: As we obtained `crtc_data` from a valid reference above, it must point to a valid
+        // `Crtc<T>` which itself points to a valid `T`.
+        let timer_ptr = unsafe { <T as HasHrTimer<T>>::raw_get_timer(crtc_data) };
+
+        // SAFETY: As `timer_ptr` points into `T` and `T` is valid, `timer_ptr` must point to a
+        // valid `HrTimer` instance.
+        unsafe { HrTimer::<T>::raw_cancel(timer_ptr) }
+    }
+}
+
+impl<T> Drop for CrtcHrTimerHandle<T>
+where
+    T: HasHrTimer<T>,
+    T: DriverCrtc,
+{
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+impl<T> HrTimerPointer for KmsRef<Crtc<T>>
+where
+    T: 'static,
+    T: DriverCrtc,
+    T: Send + Sync,
+    T: HasHrTimer<T>,
+    T: for<'a> HrTimerCallback<Pointer<'a> = Self>,
+{
+    type TimerMode = <T as HasHrTimer<T>>::TimerMode;
+    type TimerHandle = CrtcHrTimerHandle<T>;
+
+    fn start(
+        self,
+        expires: <<T as HasHrTimer<T>>::TimerMode as HrTimerMode>::Expires
+    ) -> Self::TimerHandle {
+        // SAFETY:
+        // - We keep `self` alive by wrapping it in a handle below.
+        // - Since we generate the pointer passed to `start` from a valid reference, it is a valid
+        //   pointer.
+        unsafe { T::start(ptr::from_ref(&self.inner), expires) };
+        CrtcHrTimerHandle { inner: self }
+    }
+}
+
+impl<T> RawHrTimerCallback for KmsRef<Crtc<T>>
+where
+    T: 'static,
+    T: DriverCrtc,
+    T: HasHrTimer<T>,
+    T: for<'a> HrTimerCallback<Pointer<'a> = Self>,
+{
+    type CallbackTarget<'a> = Self;
+
+    unsafe extern "C" fn run(this: *mut bindings::hrtimer) -> bindings::hrtimer_restart {
+        // `HrTimer` is `repr(C)`
+        let timer_ptr = this.cast::<HrTimer<T>>();
+
+        // SAFETY: By C API contract `ptr` is the pointer we passed when queing the timer, so it is
+        // a `HrTimer<Crtc<T>>` embedded in a `T`
+        let data_ptr = unsafe { T::timer_container_of(timer_ptr) };
+
+        // SAFETY: `T` is embedded in `Crtc<T>`
+        let crtc_ptr = unsafe { container_of!(data_ptr, Crtc<T>, inner) };
+
+        // SAFETY:
+        // - A `KmsRef` is required to start the timer, we are simply recovering that
+        //   reference here.
+        let crtc = unsafe { KmsRef::from_raw(crtc_ptr) };
+
+        // SAFETY:
+        // - By C API contract `timer_ptr` is the pointer that we passed when queuing the timer, so
+        //   it is a valid pointer to a `HrTimer<T>` embedded in a `T`.
+        let context = unsafe { HrTimerCallbackContext::from_raw(timer_ptr) };
+
+        T::run(crtc, context).into_c()
     }
 }
 
