@@ -107,12 +107,13 @@ pub trait DriverConnector: Send + Sync + Sized {
     const OPS: &'static DriverConnectorOps = &DriverConnectorOps {
         funcs: bindings::drm_connector_funcs {
             dpms: None,
+            atomic_create_state: Some(atomic_create_state_callback::<Self::State>),
             atomic_get_property: None,
             atomic_set_property: None,
             early_unregister: None,
             late_register: None,
             set_property: None,
-            reset: Some(connector_reset_callback::<Self::State>),
+            reset: None,
             atomic_print_state: None,
             atomic_destroy_state: Some(atomic_destroy_state_callback::<Self::State>),
             destroy: Some(connector_destroy_callback::<Self>),
@@ -122,6 +123,7 @@ pub trait DriverConnector: Send + Sync + Sized {
             debugfs_init: None,
             oob_hotplug_event: None,
             atomic_duplicate_state: Some(atomic_duplicate_state_callback::<Self::State>),
+            color_format: None,
         },
         helper_funcs: bindings::drm_connector_helper_funcs {
             mode_valid: None,
@@ -136,6 +138,7 @@ pub trait DriverConnector: Send + Sync + Sized {
             atomic_best_encoder: None,
             prepare_writeback_job: None,
             cleanup_writeback_job: None,
+            force_ctx: None,
         },
     };
 
@@ -941,28 +944,30 @@ unsafe extern "C" fn atomic_destroy_state_callback<T: DriverConnectorState>(
 }
 
 #[allow(clippy::missing_safety_doc)]
-unsafe extern "C" fn connector_reset_callback<T: DriverConnectorState>(
-    connector: *mut bindings::drm_connector,
-) {
-    // SAFETY: DRM guarantees that `state` points to a valid instance of `drm_connector_state`
-    let state = unsafe { (*connector).state };
-    if !state.is_null() {
-        // SAFETY:
-        // - We're guaranteed `connector` is `Connector<T>` via type invariants
-        // - We're guaranteed `state` is `ConnectorState<T>` via type invariants.
-        unsafe { atomic_destroy_state_callback::<T>(connector, state) }
+unsafe extern "C" fn atomic_create_state_callback<T: DriverConnectorState>(
+    connector: *mut bindings::drm_connector
+) -> *mut bindings::drm_connector_state {
+    let new: Result<KBox<ConnectorState<T>>> = KBox::try_init(
+        try_init!(ConnectorState {
+            state: Default::default(),
+            inner: Default::default(),
+        }),
+        GFP_KERNEL,
+    );
 
-        // SAFETY: No special requirements here, DRM expects this to be NULL
-        unsafe { (*connector).state = null_mut() };
+    match new {
+        Ok(mut new) => {
+            // SAFETY: This initializes `new`.state, and is safe to call on an uninitialized state.
+            unsafe {
+                bindings::__drm_atomic_helper_connector_state_init(&mut new.state, connector)
+            };
+
+            // SAFETY: We will recover this `KBox` in atomic_destroy_state_callback
+            let raw = KBox::into_raw(new);
+
+            // SAFETY: We successfully allocated `new` above, so `raw` is safe to dereference.
+            unsafe { &mut (*raw).state }
+        },
+        Err(e) => e.to_ptr()
     }
-
-    // Unfortunately, this is the best we can do at the moment as this FFI callback was mistakenly
-    // presumed to be infallible :(
-    let new = KBox::new(ConnectorState::<T>::default(), GFP_KERNEL).expect("Blame the API, sorry!");
-
-    // DRM takes ownership of the state from here, resets it, and then assigns it to the connector
-    // SAFETY:
-    // - DRM guarantees that `connector` points to a valid instance of `drm_connector`.
-    // - The cast to `drm_connector_state` is safe via `ConnectorState`s type invariants.
-    unsafe { bindings::__drm_atomic_helper_connector_reset(connector, Box::into_raw(new).cast()) };
 }
