@@ -71,6 +71,7 @@ pub trait DriverCrtc: Send + Sync + Sized {
     /// The generated C vtable for this [`DriverCrtc`] implementation.
     const OPS: &'static DriverCrtcOps = &DriverCrtcOps {
         funcs: bindings::drm_crtc_funcs {
+            atomic_create_state: Some(atomic_create_state_callback::<Self::State>),
             atomic_destroy_state: Some(atomic_destroy_state_callback::<Self::State>),
             atomic_duplicate_state: Some(atomic_duplicate_state_callback::<Self::State>),
             atomic_get_property: None,
@@ -90,7 +91,6 @@ pub trait DriverCrtc: Send + Sync + Sized {
             late_register: None,
             page_flip: Some(bindings::drm_atomic_helper_page_flip),
             page_flip_target: None,
-            reset: Some(crtc_reset_callback::<Self::State>),
             set_config: Some(bindings::drm_atomic_helper_set_config),
             set_crc_source: None,
             set_property: None,
@@ -134,6 +134,7 @@ pub trait DriverCrtc: Send + Sync + Sized {
             mode_set_base: None,
             get_scanout_position: None,
             handle_vblank_timeout: None,
+            hw_reset: None,
         },
     };
 
@@ -1031,37 +1032,30 @@ unsafe extern "C" fn atomic_destroy_state_callback<T: DriverCrtcState>(
 }
 
 #[allow(clippy::missing_safety_doc)]
-unsafe extern "C" fn crtc_reset_callback<T: DriverCrtcState>(crtc: *mut bindings::drm_crtc) {
-    // SAFETY: DRM guarantees that `state` points to a valid instance of `drm_crtc_state`
-    let state = unsafe { (*crtc).state };
-    if !state.is_null() {
-        // SAFETY:
-        // - We're guaranteed `crtc` is `Crtc<T>` via type invariants
-        // - We're guaranteed `state` is `CrtcState<T>` via type invariants.
-        unsafe { atomic_destroy_state_callback::<T>(crtc, state) }
-
-        // SAFETY: No special requirements here, DRM expects this to be NULL
-        unsafe {
-            (*crtc).state = null_mut();
-        }
-    }
-
-    // SAFETY: `crtc` is guaranteed to be of type `Crtc<T::Crtc>` by type invariance
-    let crtc = unsafe { Crtc::<T::Crtc>::from_raw(crtc) };
-
-    // Unfortunately, this is the best we can do at the moment as this FFI callback was mistakenly
-    // presumed to be infallible :(
-    let new: KBox<CrtcState<T>> = KBox::try_init(
+unsafe extern "C" fn atomic_create_state_callback<T: DriverCrtcState>(
+    crtc: *mut bindings::drm_crtc
+) -> *mut bindings::drm_crtc_state {
+    let new: Result<KBox<CrtcState<T>>> = KBox::try_init(
         try_init!(CrtcState {
             state: Opaque::new(Default::default()),
             inner: UnsafeCell::new(Default::default()),
         }),
         GFP_KERNEL,
-    )
-    .expect("Unfortunately, this API was presumed infallible");
+    );
 
-    // SAFETY: DRM takes ownership of the state from here, and will never move it
-    unsafe { bindings::__drm_atomic_helper_crtc_reset(crtc.as_raw(), KBox::into_raw(new).cast()) };
+    match new {
+        Ok(new) => {
+            // SAFETY: This initializes `new`.state, and is safe to call on an uninitialized state.
+            unsafe { bindings::__drm_atomic_helper_crtc_state_init(new.state.get(), crtc) };
+
+            // SAFETY: We will recover this `KBox` in atomic_destroy_state_callback
+            let raw = KBox::into_raw(new);
+
+            // SAFETY: We successfully allocated `new` above, so `raw` is safe to dereference.
+            unsafe { (*raw).state.get() }
+        },
+        Err(e) => e.to_ptr()
+    }
 }
 
 #[allow(clippy::missing_safety_doc)]
