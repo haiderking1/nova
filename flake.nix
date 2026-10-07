@@ -21,7 +21,11 @@
       # mother-base boots it as the "nova" specialisation (second boot entry).
       packages.${system} = rec {
         kernel = pkgs.buildLinux {
-          src = self;
+          # Our nix files aren't kernel source; editing them shouldn't rebuild it
+          src = lib.fileset.toSource {
+            root = ./.;
+            fileset = lib.fileset.difference ./. (lib.fileset.unions [ ./flake.nix ./flake.lock ./nix ]);
+          };
           inherit version;
           modDirVersion = version;
           # rc kernels have options nixpkgs' common config doesn't know yet
@@ -44,6 +48,15 @@
             SYSFB_SIMPLEFB = yes;
           };
         };
+        # GSP firmware in the TLV layout nova-core loads, repackaged from
+        # linux-firmware. The version must match nova's GSP bindings
+        # (drivers/gpu/nova-core/gsp/fw/r570_144).
+        firmware = pkgs.runCommand "nova-firmware-570.144" {
+          nativeBuildInputs = [ pkgs.python3 ];
+        } ''
+          python3 -I ${./nix/mktlv.py} ${pkgs.linux-firmware}/lib/firmware $out/lib/firmware 570.144
+        '';
+
         default = kernel;
       };
 
