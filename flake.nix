@@ -30,9 +30,10 @@
           structuredExtraConfig = with lib.kernel; {
             RUST = yes;
             DRM = yes; # DRM_NOVA requires built-in DRM
-            NOVA_CORE = module;
+            # nixpkgs' common config forces these off (WIP), so override it
+            NOVA_CORE = lib.mkForce module;
             NOVA_CORE_SELFTESTS = yes;
-            DRM_NOVA = module;
+            DRM_NOVA = lib.mkForce module;
 
             # Keep nouveau off the card so nova gets it
             DRM_NOUVEAU = no;
