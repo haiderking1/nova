@@ -72,6 +72,7 @@
           python3
           openssl
           elfutils
+          zlib # resolve_btfids (BTF)
           ncurses # menuconfig
           pkg-config
           cpio
@@ -90,6 +91,7 @@
         LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
 
         shellHook = ''
+          export PATH="$(git rev-parse --show-toplevel)/nix:$PATH" # nova-dev
           echo "nova dev shell: kernel ${version}, rustc $(rustc --version | cut -d' ' -f2)"
         '';
       };

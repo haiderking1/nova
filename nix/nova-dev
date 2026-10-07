@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# Fast nova loop: rebuild only nova-core.ko and nova-drm.ko against the nova
+# kernel of the current system generation, no kernel rebuild or rebuild.sh.
+#
+#   nova-dev build    build both modules, put them in /var/lib/nova/dev
+#                     (works from the normal boot; then `nova-try --dev`)
+#   nova-dev reload   only inside the nova boot: swap in the fresh modules live
+#
+# Builds happen in a local kernel tree ($NOVA_KTREE, default
+# ~/.cache/nova-ktree) using the exact .config and Module.symvers of the
+# Nix-built nova kernel, so the modules match it. Run inside `nix develop`.
+set -euo pipefail
+
+src=$(git -C "$(dirname "$(readlink -f "$0")")" rev-parse --show-toplevel)
+ktree=${NOVA_KTREE:-$HOME/.cache/nova-ktree}
+out=/var/lib/nova/dev
+mods=(drivers/gpu/nova-core.ko drivers/gpu/nova-drm.ko)
+
+die() { echo "nova-dev: $*" >&2; exit 1; }
+
+# Build dir (lib/modules/<ver>/build) of the nova kernel in the newest generation
+nova_kbuild() {
+  local kernel drv dev
+  kernel=$(readlink -f /nix/var/nix/profiles/system/specialisation/nova/kernel 2>/dev/null) ||
+    die "no nova boot entry yet, run ./rebuild.sh in mother-base first"
+  drv=$(nix-store -q --deriver "$kernel")
+  dev=$(nix-store -q --outputs "$drv" | grep -- '-dev$') ||
+    die "can't find the dev output of $drv"
+  [ -d "$dev" ] || die "$dev is missing (garbage collected?), run ./rebuild.sh"
+  echo "$dev"/lib/modules/*/build
+}
+
+kmake() {
+  # LOCALVERSION= stops the git checkout from adding "+" to the version
+  make -C "$src" O="$ktree" LOCALVERSION= "$@"
+}
+
+build() {
+  command -v rustc >/dev/null || die "run this inside 'nix develop' in $src"
+  local kbuild release
+  kbuild=$(nova_kbuild)
+  release=$(cat "$kbuild/include/config/kernel.release")
+  mkdir -p "$ktree"
+
+  # (Re)prepare the local tree when the Nix kernel's config changed
+  if ! cmp -s "$kbuild/.config" "$ktree/.config.nix"; then
+    echo "nova-dev: kernel config changed, preparing $ktree (takes a few minutes)"
+    install -m644 "$kbuild/.config" "$ktree/.config.nix"
+    install -m644 "$kbuild/.config" "$ktree/.config"
+    "$src/scripts/config" --file "$ktree/.config" --disable LOCALVERSION_AUTO
+    kmake olddefconfig
+    kmake -j"$(nproc)" modules_prepare
+  fi
+  # vmlinux symbols, so modpost can check what the modules use
+  install -m644 "$kbuild/Module.symvers" "$ktree/Module.symvers"
+
+  kmake -j"$(nproc)" "${mods[@]}"
+
+  local m vermagic
+  for m in "${mods[@]}"; do
+    vermagic=$(modinfo -F vermagic "$ktree/$m")
+    [ "${vermagic%% *}" = "$release" ] ||
+      die "$m is for '${vermagic%% *}', but the nova kernel is '$release'"
+  done
+
+  install -m644 "${mods[@]/#/$ktree/}" "$out/"
+  echo "nova-dev: modules for $release ready in $out"
+  echo "nova-dev: boot them with 'nova-try --dev' (or 'nova-dev reload' inside nova)"
+}
+
+reload() {
+  local kbuild before
+  kbuild=$(nova_kbuild)
+  [ "$(uname -r)" = "$(cat "$kbuild/include/config/kernel.release")" ] ||
+    die "not running the nova kernel ($(uname -r)); use 'nova-try --dev' instead"
+  [ -e "$out/nova-core.ko" ] || die "nothing in $out, run 'nova-dev build' first"
+
+  # The modprobe hook in mother-base loads $out/*.ko while use-dev exists
+  touch /var/lib/nova/use-dev
+  before=$(sudo dmesg | wc -l)
+  sudo rmmod nova_drm nova_core 2>/dev/null || true
+  sudo modprobe nova_core
+  sleep 5
+  sudo dmesg | tail -n +"$((before + 1))"
+}
+
+case "${1:-}" in
+  build) build ;;
+  reload) reload ;;
+  *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac
