@@ -140,16 +140,32 @@ def main(src_root, out_root, version):
     nvidia = os.path.join(src_root, "nvidia")
     chips = sorted(c for c in os.listdir(nvidia) if c[:4] in SIG_SECTIONS and c != "ga100")
     done = []
+    gsp_bins = {}  # real path of the GSP-RM ELF -> gsp.bin already written for it
     for chip in chips:
         src = os.path.join(nvidia, chip, "gsp")
         if not os.path.exists(os.path.join(src, f"gsp-{version}.bin")):
             continue
         out = os.path.join(out_root, "nvidia", chip, "gsp")
-        os.makedirs(out, exist_ok=True)
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        # Chips sharing firmware are symlinks (ga104/gsp -> ../ga102/gsp); keep
+        # them that way instead of writing another 60 MB gsp.bin per chip.
+        if os.path.islink(src):
+            os.symlink(os.readlink(src), out)
+            done.append(chip)
+            continue
+        os.makedirs(out)
 
-        gsp_tlv, gsp_bin = gsp(read(os.path.join(src, f"gsp-{version}.bin")), chip, version)
+        rm = os.path.join(src, f"gsp-{version}.bin")
+        gsp_tlv, gsp_bin = gsp(read(rm), chip, version)
         write(os.path.join(out, "gsp.tlv"), gsp_tlv)
-        write(os.path.join(out, "gsp.bin"), gsp_bin)
+        # The image is shared by all chips (only signatures differ, and those are
+        # in gsp.tlv), so write the 60 MB gsp.bin once and symlink the rest.
+        out_bin = os.path.join(out, "gsp.bin")
+        if (first := gsp_bins.get(os.path.realpath(rm))) is not None:
+            os.symlink(os.path.relpath(first, out), out_bin)
+        else:
+            write(out_bin, gsp_bin)
+            gsp_bins[os.path.realpath(rm)] = out_bin
         write(os.path.join(out, "gsp_bootloader.tlv"),
               gsp_bootloader(read(os.path.join(src, f"bootloader-{version}.bin")), version))
         for kind in ("booter_load", "booter_unload"):
