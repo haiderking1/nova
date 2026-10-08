@@ -29,6 +29,7 @@
 #include <linux/hrtimer_types.h>
 
 #include <linux/acpi.h>
+#include <linux/aperture.h>
 #include <linux/gpu_buddy.h>
 #include <drm/clients/drm_client_setup.h>
 #include <drm/drm_atomic.h>

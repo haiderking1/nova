@@ -45,6 +45,8 @@ pub use ffi;
 
 pub mod acpi;
 pub mod alloc;
+#[cfg(CONFIG_APERTURE_HELPERS)]
+pub mod aperture;
 #[cfg(CONFIG_AUXILIARY_BUS)]
 pub mod auxiliary;
 pub mod bitfield;

@@ -345,7 +345,7 @@ pub struct Device<Ctx: device::DeviceContext = device::Normal>(
 
 impl<Ctx: device::DeviceContext> Device<Ctx> {
     #[inline]
-    fn as_raw(&self) -> *mut bindings::pci_dev {
+    pub(crate) fn as_raw(&self) -> *mut bindings::pci_dev {
         self.0.get()
     }
 }
