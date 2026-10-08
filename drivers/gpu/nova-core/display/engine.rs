@@ -35,19 +35,10 @@ use crate::{
             Handle,
             Subdevice, //
         },
-        disp::{
-            core_c67d,
-            notifier,
-            window_c67e, //
-        },
+        disp::notifier,
         rm::commands::{
-            AllocCoreChannelGa102,
-            AllocDisplayGa102,
-            AllocWindowChannelGa102,
-            DispChannelPushbuffer,
             DispGetStaticInfo,
             DispWriteInstMem,
-            RmAlloc,
             RmControl,
             RmFree, //
         },
@@ -63,6 +54,11 @@ use super::{
     channel::{
         DmaChannel,
         PushBuffer, //
+    },
+    hal::{
+        self,
+        DisplayHal,
+        WindowImage, //
     },
     instmem::InstMem,
     regs,
@@ -149,6 +145,7 @@ pub(crate) struct DisplayEngine<'a> {
 /// The display object and its channels.
 struct Channels<'a> {
     dev: &'a device::Device<device::Bound>,
+    hal: &'static dyn DisplayHal,
     root: Handle<DisplayRoot>,
     _core: Handle<DisplayCoreChannel>,
     core_push: PushBuffer<'a>,
@@ -164,7 +161,7 @@ impl<'a> DisplayEngine<'a> {
     /// Takes over the display engine, whose RM objects are allocated under `display`. `vram` is
     /// all of VRAM, which surfaces are taken from.
     ///
-    /// Only GA10x display engines are supported so far.
+    /// Fails with `ENOTSUPP` if Nova doesn't support the display engine of `chipset`.
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         dev: &'a device::Device<device::Bound>,
@@ -176,12 +173,7 @@ impl<'a> DisplayEngine<'a> {
         internal: &InternalHandles,
         vram: Range<VramAddress>,
     ) -> Result<Self> {
-        if !matches!(
-            chipset,
-            Chipset::GA102 | Chipset::GA103 | Chipset::GA104 | Chipset::GA106 | Chipset::GA107
-        ) {
-            return Err(ENOTSUPP);
-        }
+        let hal = hal::display_hal(chipset).ok_or(ENOTSUPP)?;
 
         let mut instmem = InstMem::new(mm)?;
         RmControl::new(
@@ -202,13 +194,23 @@ impl<'a> DisplayEngine<'a> {
             return Err(ENODEV);
         }
 
-        log_armed_state(dev, bar);
+        hal.log_armed_state(dev, bar, WINDOW);
 
         // From here on GSP-RM may use the instance memory, which must thus not be freed before the
         // GSP is unloaded, even if the channels can't be set up.
-        let channels = Channels::new(dev, bar, cmdq, mm, &mut instmem, display, internal, vram)
-            .inspect_err(|e| dev_err!(dev, "display: can't set up the channels: {:?}\n", e))
-            .ok();
+        let channels = Channels::new(
+            dev,
+            hal,
+            bar,
+            cmdq,
+            mm,
+            &mut instmem,
+            display,
+            internal,
+            vram,
+        )
+        .inspect_err(|e| dev_err!(dev, "display: can't set up the channels: {:?}\n", e))
+        .ok();
 
         Ok(Self {
             _instmem: instmem,
@@ -247,6 +249,7 @@ impl<'a> Channels<'a> {
     #[expect(clippy::too_many_arguments)]
     fn new(
         dev: &'a device::Device<device::Bound>,
+        hal: &'static dyn DisplayHal,
         bar: Bar0<'_>,
         cmdq: &Cmdq<'_>,
         mm: &mut GpuMm<'_>,
@@ -256,47 +259,33 @@ impl<'a> Channels<'a> {
         vram: Range<VramAddress>,
     ) -> Result<Self> {
         let client = display.client();
-        let root = RmAlloc::new(
-            client,
-            display.device(),
-            Handle::new(DISPLAY_HANDLE),
-            AllocDisplayGa102,
-        )
-        .send(dev, cmdq)?;
+        let root = hal.alloc_display(dev, cmdq, client, display.device(), DISPLAY_HANDLE)?;
 
         let setup = || -> Result<Self> {
             let core_push = PushBuffer::new(dev, DmaChannel::Core)?;
-            // The push buffer of a channel is set before the channel is allocated.
-            RmControl::new(
-                internal.client,
-                internal.subdevice,
-                DispChannelPushbuffer::core_ga102(core_push.dma_address()),
-            )
-            .send(dev, cmdq)?;
-            let core = RmAlloc::new(
+            let core = hal.alloc_core(
+                dev,
+                cmdq,
+                internal,
                 client,
                 root,
-                Handle::new(CORE_CHANNEL_HANDLE),
-                AllocCoreChannelGa102::new(0),
-            )
-            .send(dev, cmdq)?;
+                CORE_CHANNEL_HANDLE,
+                &core_push,
+            )?;
 
             // CAST: `WINDOW` is a window index, below 32.
             let window_index = WINDOW as u32;
             let window_push = PushBuffer::new(dev, DmaChannel::Window(WINDOW))?;
-            RmControl::new(
-                internal.client,
-                internal.subdevice,
-                DispChannelPushbuffer::window_ga102(window_index, window_push.dma_address()),
-            )
-            .send(dev, cmdq)?;
-            let window = RmAlloc::new(
+            let window = hal.alloc_window(
+                dev,
+                cmdq,
+                internal,
                 client,
                 root,
-                Handle::new(WINDOW_CHANNEL_HANDLE | window_index),
-                AllocWindowChannelGa102::new(window_index, 0),
-            )
-            .send(dev, cmdq)?;
+                window_index,
+                WINDOW_CHANNEL_HANDLE | window_index,
+                &window_push,
+            )?;
 
             // Surfaces are taken from anywhere in VRAM.
             instmem.bind_vram(mm, client, DmaChannel::Window(WINDOW), VRAM_CTXDMA, vram)?;
@@ -314,6 +303,7 @@ impl<'a> Channels<'a> {
 
             let mut channels = Self {
                 dev,
+                hal,
                 root,
                 _core: core,
                 core_push,
@@ -341,9 +331,7 @@ impl<'a> Channels<'a> {
             self.core_push.get(bar)
         );
 
-        // No notifier for the next update.
-        self.core_push
-            .push(bar, core_c67d::SET_CONTEXT_DMA_NOTIFIER, &[0])?;
+        self.hal.push_core_nop(bar, &mut self.core_push)?;
         self.core_push.kick(bar)?;
         self.core_push
             .wait_idle(bar)
@@ -356,60 +344,28 @@ impl<'a> Channels<'a> {
     /// Points the window at `surface`, shown 1:1, and updates it, returning once the update began
     /// taking effect: from then on, the surface shown before isn't read anymore.
     ///
-    /// The window bypasses composition, as NVIDIA's driver does to show a console: it is shown as
-    /// it is, which needs neither an input LUT on the window nor an output LUT on the head. The
-    /// head keeps the mode and output it has; the update is not interlocked with any other
-    /// channel, so it only changes the window.
+    /// The window bypasses composition, as NVIDIA's driver does to show a console. The head keeps
+    /// the mode and output it has.
     fn show(&mut self, bar: Bar0<'_>, surface: &Surface) -> Result {
-        use window_c67e::*;
-
         surface.check()?;
-        let size = surface.width | surface.height << 16;
-        let offset = u32::try_from(surface.addr.into_raw() >> 8)?;
-
-        /// Format conversion matrix leaving colors as they are, in S5.16 fixed point.
-        const IDENTITY: [u32; 12] = [
-            0x10000, 0, 0, 0, //
-            0, 0x10000, 0, 0, //
-            0, 0, 0x10000, 0,
-        ];
 
         let slot = self.notifier_slot;
         let status_word = slot * NOTIFIER_SLOT_WORDS;
         // CAST: the slots are within the first 256 bytes of the buffer.
-        let slot_offset = (status_word * size_of::<u32>()) as u32;
+        let notifier_offset = (status_word * size_of::<u32>()) as u32;
 
-        let methods = [
-            // The update reports its progress in the notifier of the slot, whose offset is in units
-            // of 16 bytes from bit 4.
-            (SET_CONTEXT_DMA_NOTIFIER, NOTIFIER_CTXDMA),
-            (SET_NOTIFIER_CONTROL, NOTIFIER_MODE_WRITE | slot_offset),
-            // At most one new surface per frame, switching between frames.
-            (SET_PRESENT_CONTROL, 1),
-            (SET_SIZE, size),
-            // Pitch-linear.
-            (SET_STORAGE, 0),
-            (SET_PARAMS, FORMAT_X8R8G8B8),
-            (set_planar_storage(0), surface.pitch >> 6),
-            (set_context_dma_iso(0), VRAM_CTXDMA),
-            (set_offset(0), offset),
-            (set_point_in(0), 0),
-            (SET_SIZE_IN, size),
-            (SET_SIZE_OUT, size),
-            // Shown as it is, without the input LUT that composition would need.
-            (SET_CONTEXT_DMA_ILUT, 0),
-            (SET_COMPOSITION_CONTROL, COMPOSITION_BYPASS),
-            // The update doesn't wait for any other channel.
-            (SET_INTERLOCK_FLAGS, 0),
-            (SET_WINDOW_INTERLOCK_FLAGS, 0),
-        ];
-
+        // The update reports its progress in the notifier of the slot.
         let push = &mut self.window_push;
-        for (method, value) in methods {
-            push.push(bar, method, &[value])?;
-        }
-        push.push(bar, SET_FMT_COEFFICIENT_C00, &IDENTITY)?;
-        push.push(bar, UPDATE, &[1])?;
+        self.hal.push_window_update(
+            bar,
+            push,
+            &WindowImage {
+                surface,
+                ctxdma: VRAM_CTXDMA,
+                notifier_ctxdma: NOTIFIER_CTXDMA,
+                notifier_offset,
+            },
+        )?;
 
         // The status is in bits 31:30 of the notifier's first word, the rest of which the update
         // writes.
@@ -437,73 +393,8 @@ impl<'a> Channels<'a> {
     }
 }
 
-/// Core channel methods of head 0 whose armed state is logged, with their names in `clc67d.h`.
-const LOGGED_HEAD_METHODS: [(&str, usize); 26] = [
-    ("PROCAMP", 0x2000),
-    ("CONTROL_OUTPUT_RESOURCE", 0x2004),
-    ("CONTROL", 0x2008),
-    ("PIXEL_CLOCK_FREQUENCY", 0x200c),
-    ("PIXEL_CLOCK_CONFIGURATION", 0x201c),
-    ("DISPLAY_ID(0)", 0x2020),
-    ("PIXEL_CLOCK_FREQUENCY_MAX", 0x2028),
-    ("HEAD_USAGE_BOUNDS", 0x2030),
-    ("VIEWPORT_POINT_IN", 0x2048),
-    ("VIEWPORT_SIZE_IN", 0x204c),
-    ("VIEWPORT_SIZE_OUT", 0x2058),
-    ("RASTER_SIZE", 0x2064),
-    ("RASTER_SYNC_END", 0x2068),
-    ("RASTER_BLANK_END", 0x206c),
-    ("RASTER_BLANK_START", 0x2070),
-    ("0x2074", 0x2074),
-    ("CONTEXT_DMA_CURSOR(0)", 0x2088),
-    ("OFFSET_CURSOR(0)", 0x2090),
-    ("CONTROL_CURSOR", 0x209c),
-    ("PRESENT_CONTROL", 0x218c),
-    ("DISPLAY_RATE", 0x21a8),
-    ("OLUT_CONTROL", 0x2280),
-    ("OLUT_FP_NORM_SCALE", 0x2284),
-    ("CONTEXT_DMA_OLUT", 0x2288),
-    ("OFFSET_OLUT", 0x228c),
-    ("DSC_CONTROL", 0x22d4),
-];
-
 /// Returns the armed value of the core channel method at `method`.
-fn armed(bar: Bar0<'_>, method: usize) -> Option<u32> {
+pub(super) fn armed(bar: Bar0<'_>, method: usize) -> Option<u32> {
     let reg = regs::NV_UDISP_CORE_ARMED::try_at(method / size_of::<u32>())?;
     Some(bar.read(reg).into_raw())
-}
-
-/// Logs the parts of the armed state of the core channel that taking over head 0 depends on.
-fn log_armed_state(dev: &device::Device, bar: Bar0<'_>) {
-    let log = |name: &str, method: usize| {
-        if let Some(value) = armed(bar, method) {
-            dev_dbg!(
-                dev,
-                "display: armed {} ({:#06x}) = {:#010x}\n",
-                name,
-                method,
-                value
-            );
-        }
-    };
-
-    log("SET_CONTEXT_DMA_NOTIFIER", 0x208);
-    for sor in 0..4 {
-        log("SOR_SET_CONTROL", 0x300 + sor * 0x20);
-    }
-    for window in 0..8 {
-        log("WINDOW_SET_CONTROL", 0x1000 + window * 0x80);
-    }
-    // What the window Nova uses is allowed to do.
-    let window = WINDOW * 0x80;
-    log("WINDOW_SET_WINDOW_FORMAT_USAGE_BOUNDS", 0x1004 + window);
-    log(
-        "WINDOW_SET_WINDOW_ROTATED_FORMAT_USAGE_BOUNDS",
-        0x1008 + window,
-    );
-    log("WINDOW_SET_MAX_INPUT_SCALE_FACTOR", 0x100c + window);
-    log("WINDOW_SET_WINDOW_USAGE_BOUNDS", 0x1010 + window);
-    for (name, method) in LOGGED_HEAD_METHODS {
-        log(name, method);
-    }
 }

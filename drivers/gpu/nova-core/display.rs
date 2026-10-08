@@ -9,6 +9,7 @@
 
 mod channel;
 mod engine;
+mod hal;
 mod instmem;
 mod regs;
 mod scanout;
