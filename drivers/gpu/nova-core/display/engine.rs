@@ -86,7 +86,12 @@ const NOTIFIER_CTXDMA: u32 = 0xf000_0000;
 /// Number of 32-bit words of the window's notifier buffer: a context DMA covers whole 256-byte
 /// blocks.
 const NOTIFIER_WORDS: usize = 256 / size_of::<u32>();
-static_assert!(num::u32_as_usize(notifier::SIZE) <= NOTIFIER_WORDS * size_of::<u32>());
+/// Number of notifiers in the buffer that updates take turns using, like nouveau: the display
+/// engine may still write the notifier of an update after the next one was sent.
+const NOTIFIER_SLOTS: usize = 2;
+/// Number of 32-bit words of a notifier.
+const NOTIFIER_SLOT_WORDS: usize = num::u32_as_usize(notifier::SIZE) / size_of::<u32>();
+static_assert!(NOTIFIER_SLOTS * NOTIFIER_SLOT_WORDS <= NOTIFIER_WORDS);
 
 /// How long an update may take to begin: a frame, even at the lowest refresh rates, with margin.
 const UPDATE_TIMEOUT: Delta = Delta::from_millis(500);
@@ -143,13 +148,16 @@ pub(crate) struct DisplayEngine<'a> {
 
 /// The display object and its channels.
 struct Channels<'a> {
+    dev: &'a device::Device<device::Bound>,
     root: Handle<DisplayRoot>,
     _core: Handle<DisplayCoreChannel>,
     core_push: PushBuffer<'a>,
     _window: Handle<DisplayWindowChannel>,
     window_push: PushBuffer<'a>,
-    /// Notifier of the window's updates, at the start of the buffer.
+    /// Notifiers of the window's updates, at the start of the buffer.
     notifier: Coherent<'a, [u32; NOTIFIER_WORDS]>,
+    /// Notifier slot of the next update.
+    notifier_slot: usize,
 }
 
 impl<'a> DisplayEngine<'a> {
@@ -305,12 +313,14 @@ impl<'a> Channels<'a> {
             )?;
 
             let mut channels = Self {
+                dev,
                 root,
                 _core: core,
                 core_push,
                 _window: window,
                 window_push,
                 notifier,
+                notifier_slot: 0,
             };
             channels.check_core(dev, bar)?;
             Ok(channels)
@@ -364,10 +374,16 @@ impl<'a> Channels<'a> {
             0, 0, 0x10000, 0,
         ];
 
+        let slot = self.notifier_slot;
+        let status_word = slot * NOTIFIER_SLOT_WORDS;
+        // CAST: the slots are within the first 256 bytes of the buffer.
+        let slot_offset = (status_word * size_of::<u32>()) as u32;
+
         let methods = [
-            // The update reports its progress in the notifier.
+            // The update reports its progress in the notifier of the slot, whose offset is in units
+            // of 16 bytes from bit 4.
             (SET_CONTEXT_DMA_NOTIFIER, NOTIFIER_CTXDMA),
-            (SET_NOTIFIER_CONTROL, NOTIFIER_MODE_WRITE),
+            (SET_NOTIFIER_CONTROL, NOTIFIER_MODE_WRITE | slot_offset),
             // At most one new surface per frame, switching between frames.
             (SET_PRESENT_CONTROL, 1),
             (SET_SIZE, size),
@@ -397,17 +413,27 @@ impl<'a> Channels<'a> {
 
         // The status is in bits 31:30 of the notifier's first word, the rest of which the update
         // writes.
-        io_write!(self.notifier, [build: 0], notifier::STATUS_NOT_BEGUN << 30);
+        io_write!(self.notifier, [try: status_word], notifier::STATUS_NOT_BEGUN << 30);
         push.kick(bar)?;
+        self.notifier_slot = (slot + 1) % NOTIFIER_SLOTS;
         push.wait_idle(bar)?;
 
+        let notifier = &self.notifier;
+        let read_status = || -> Result<u32> { Ok(io_read!(notifier, [try: status_word])) };
         read_poll_timeout(
-            || Ok(io_read!(self.notifier, [build: 0]) >> 30),
+            || Ok(read_status()? >> 30),
             |&status| matches!(status, notifier::STATUS_BEGUN | notifier::STATUS_FINISHED),
             Delta::from_micros(50),
             UPDATE_TIMEOUT,
         )
         .map(|_| ())
+        .inspect_err(|_| {
+            dev_err!(
+                self.dev,
+                "display: window update didn't begin, notifier {:#010x?}\n",
+                read_status().ok()
+            )
+        })
     }
 }
 
