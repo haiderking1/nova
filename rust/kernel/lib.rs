@@ -129,6 +129,8 @@ pub mod regulator;
 pub mod revocable;
 pub mod safety;
 pub mod scatterlist;
+#[cfg(CONFIG_SCREEN_INFO)]
+pub mod screen_info;
 pub mod security;
 pub mod seq_file;
 #[cfg(CONFIG_RUST_SERIAL_DEV_BUS_ABSTRACTIONS)]

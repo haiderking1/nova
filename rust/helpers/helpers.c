@@ -91,6 +91,7 @@
 #include "refcount.c"
 #include "regulator.c"
 #include "scatterlist.c"
+#include "screen_info.c"
 #include "security.c"
 #include "serdev.c"
 #include "signal.c"
