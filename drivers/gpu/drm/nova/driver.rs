@@ -22,7 +22,8 @@ use crate::gem::NovaGemObject;
 use nova_core::api::{
     ConnectorType,
     NovaCoreApi,
-    NovaCoreApiHandle, //
+    NovaCoreApiHandle,
+    ScanoutMode, //
 };
 
 pub(crate) struct NovaDriver;
@@ -37,6 +38,8 @@ pub(crate) struct BootDisplay {
     pub(crate) format: PixelFormat,
     /// Type of connector it is shown through.
     pub(crate) connector: ConnectorType,
+    /// nova-core's own scanout of its mode, which replaces its framebuffer if set up.
+    pub(crate) scanout: Option<ScanoutMode>,
 }
 
 /// Data of the DRM device.
@@ -95,6 +98,7 @@ impl auxiliary::Driver for NovaDriver {
                 dev_warn!(adev, "can't tell what the boot display is connected to: {:?}\n", err);
                 ConnectorType::Unknown
             });
+        let scanout = api.with(|api| api.scanout_mode());
         let boot_display = api
             .with(|api| api.boot_display_mode())
             .map(|mode| -> Result<_> {
@@ -108,6 +112,7 @@ impl auxiliary::Driver for NovaDriver {
                     stride: mode.stride,
                     format: mode.format,
                     connector,
+                    scanout,
                 })
             })
             .transpose()?;

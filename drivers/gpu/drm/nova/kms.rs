@@ -4,8 +4,10 @@
 //!
 //! nova-drm can't set modes yet. For now it drives the display the system firmware set up: one
 //! output (primary plane, CRTC, encoder and connector) offering only the firmware's mode, which
-//! the display engine keeps scanning out after nova-core boots the GSP. Frames are copied by the
-//! CPU from shadow-plane framebuffers into the firmware's framebuffer through nova-core.
+//! the display engine keeps after nova-core boots the GSP. Frames are copied by the CPU from
+//! shadow-plane framebuffers into the back buffer of nova-core's own scanout, which is then
+//! flipped, so frames show whole. Without that scanout, they are copied into the firmware's
+//! framebuffer, which shows on screen as it is drawn.
 //!
 //! The connector reports what GSP-RM knows about the display: the type of connector it is shown
 //! through, and the EDID of the monitor (its name, physical size and modes, of which only those
@@ -39,7 +41,8 @@ use kernel::{
                 DriverPlaneState,
                 PlaneState,
                 PlaneStateMutator,
-                RawPlaneState, //
+                RawPlaneState,
+                Rect, //
             },
             KmsDriver,
             KmsProbe,
@@ -59,7 +62,10 @@ use kernel::{
     },
 };
 
-use nova_core::api::ConnectorType;
+use nova_core::api::{
+    ConnectorType,
+    ScanoutMode, //
+};
 
 use crate::driver::{
     BootDisplay,
@@ -192,12 +198,100 @@ impl plane::DriverPlane for NovaPlane {
 
     fn atomic_update(commit: plane::PlaneAtomicCommit<'_, Self>) {
         let drm = commit.plane().drm_dev();
-        let (old_state, new_state) = commit.take_old_new_state();
+        let (old_state, mut new_state) = commit.take_old_new_state();
 
-        if let Err(err) = copy_to_boot_display(drm, old_state, &new_state) {
+        let scanout = drm.boot_display.as_ref().and_then(|display| display.scanout);
+        let result = match scanout {
+            Some(scanout) => draw_to_scanout(drm, &scanout, old_state, &mut new_state),
+            None => copy_to_boot_display(drm, old_state, &new_state),
+        };
+        if let Err(err) = result {
             pr_err!("nova-drm: failed to update the display: {:?}\n", err);
         }
     }
+}
+
+/// Draws the frame of `new_state` into the back buffer of nova-core's scanout, and flips it.
+///
+/// The back buffer holds the frame before the one shown: the parts of the framebuffer that changed
+/// since either are drawn.
+fn draw_to_scanout(
+    drm: &NovaDevice,
+    scanout: &ScanoutMode,
+    old_state: &PlaneState<NovaPlaneState>,
+    new_state: &mut PlaneStateMutator<'_, PlaneState<NovaPlaneState>>,
+) -> Result {
+    // Without a framebuffer, the last frame stays on screen.
+    if new_state.framebuffer().is_none() {
+        return Ok(());
+    }
+    // Nothing to do if the device is going away.
+    let Some(registered) = drm.registration_guard() else {
+        return Ok(());
+    };
+
+    let (src, dst) = (new_state.src(), new_state.dst());
+    let stride = usize::try_from(scanout.stride)?;
+    let mut row_buf = KVec::new();
+    let mut damage = None;
+
+    registered.registration_data_with(|reg| {
+        reg.api.with(|api| {
+            let state: &PlaneStateMutator<'_, _> = new_state;
+            let draw = |rect: &Rect, row_buf: &mut KVec<u8>| {
+                // `rect` is in framebuffer coordinates; the plane shows `src` at `dst`.
+                let x = usize::try_from(dst.x1 + (rect.x1 - src.x1))?;
+
+                state.read_rows(0, rect, row_buf, |fb_y, row| {
+                    let y = usize::try_from(dst.y1 + (i32::try_from(fb_y)? - src.y1))?;
+
+                    api.write_scanout(y * stride + x * CPP, row)
+                })
+            };
+
+            // What changed in the frame before, which the back buffer misses unless drawn again.
+            let mut previous = old_state.damage.and_then(|rect| intersection(&rect, &src));
+
+            for rect in state.damage(old_state) {
+                draw(&rect, &mut row_buf)?;
+                damage = Some(damage.map_or(rect, |damage| union(&damage, &rect)));
+                if previous.is_some_and(|previous| intersection(&previous, &rect) == Some(previous))
+                {
+                    previous = None;
+                }
+            }
+            if let Some(previous) = previous {
+                draw(&previous, &mut row_buf)?;
+            }
+
+            api.flip_scanout()
+        })
+    })?;
+
+    new_state.damage = damage;
+    Ok(())
+}
+
+/// Returns the smallest rectangle containing `a` and `b`.
+fn union(a: &Rect, b: &Rect) -> Rect {
+    Rect {
+        x1: a.x1.min(b.x1),
+        y1: a.y1.min(b.y1),
+        x2: a.x2.max(b.x2),
+        y2: a.y2.max(b.y2),
+    }
+}
+
+/// Returns the part of `a` within `b`, if any.
+fn intersection(a: &Rect, b: &Rect) -> Option<Rect> {
+    let rect = Rect {
+        x1: a.x1.max(b.x1),
+        y1: a.y1.max(b.y1),
+        x2: a.x2.min(b.x2),
+        y2: a.y2.min(b.y2),
+    };
+
+    (rect.x1 < rect.x2 && rect.y1 < rect.y2).then_some(rect)
 }
 
 /// Copies the parts of the framebuffer that changed since `old_state` to the boot display.
@@ -265,7 +359,11 @@ fn convert<'a>(format: &PixelFormat, row: &'a [u8], buf: &'a mut KVec<u8>) -> Re
 
 /// State of the boot display's plane, whose framebuffer the CPU copies to the display.
 #[derive(Clone, Default)]
-pub(crate) struct NovaPlaneState;
+pub(crate) struct NovaPlaneState {
+    /// Smallest rectangle containing what changed in the framebuffer in the frame of this state,
+    /// in framebuffer coordinates, if anything did and it was drawn into nova-core's scanout.
+    damage: Option<Rect>,
+}
 
 impl DriverPlaneState for NovaPlaneState {
     type Plane = NovaPlane;
