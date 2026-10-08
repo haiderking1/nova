@@ -12,6 +12,7 @@ mod channel;
 mod engine;
 mod instmem;
 mod regs;
+mod scanout;
 #[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
 pub(crate) mod scanout_test;
 
@@ -20,6 +21,8 @@ pub(crate) use engine::{
     InternalHandles,
     Surface, //
 };
+pub(crate) use scanout::Scanout;
+pub use scanout::ScanoutMode;
 
 use kernel::{
     device,

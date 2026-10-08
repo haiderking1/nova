@@ -15,6 +15,7 @@ use kernel::{
 };
 
 pub use crate::{
+    display::ScanoutMode,
     gpu::Spec,
     gsp::ConnectorType, //
 };
@@ -79,6 +80,34 @@ impl NovaCoreApi<'_> {
     /// without a usable boot display.
     pub fn write_boot_display(&self, offset: usize, data: &[u8]) -> Result {
         self.gpu.write_boot_display(offset, data)
+    }
+
+    /// Returns the size and layout of the framebuffers of Nova's own scanout of the boot display's
+    /// mode, if it is set up.
+    ///
+    /// Nova's scanout replaces the boot display's framebuffer: frames are drawn into its back
+    /// buffer with [`NovaCoreApi::write_scanout()`] and shown with
+    /// [`NovaCoreApi::flip_scanout()`].
+    pub fn scanout_mode(&self) -> Option<ScanoutMode> {
+        self.gpu.scanout_mode()
+    }
+
+    /// Writes `data` at `offset` into the back buffer of Nova's own scanout.
+    ///
+    /// `offset` is in bytes from the start of the framebuffer (see [`ScanoutMode`] for its
+    /// layout). `offset` and the length of `data` must be multiples of 4. Fails with `ENODEV` if
+    /// the scanout isn't set up.
+    pub fn write_scanout(&self, offset: usize, data: &[u8]) -> Result {
+        self.gpu.write_scanout(offset, data)
+    }
+
+    /// Shows the back buffer of Nova's own scanout from the next frame on, and returns once the
+    /// framebuffer shown before is the back buffer: it then holds the frame before the one just
+    /// flipped.
+    ///
+    /// Fails with `ENODEV` if the scanout isn't set up.
+    pub fn flip_scanout(&self) -> Result {
+        self.gpu.flip_scanout()
     }
 
     /// Returns the type of connector the boot display is shown through.

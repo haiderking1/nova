@@ -28,7 +28,9 @@ use crate::{
         Display,
         DisplayEngine,
         DisplayId,
-        InternalHandles, //
+        InternalHandles,
+        Scanout,
+        ScanoutMode, //
     },
     driver::{
         Bar0,
@@ -415,10 +417,13 @@ pub(crate) struct Gpu<'gpu> {
     display: Option<Display>,
     /// The display the boot display is shown on, if the display engine reports one as active.
     boot_output: Option<DisplayId>,
-    /// The display engine, once taken over from GSP-RM by [`Gpu::init_display_engine()`].
+    /// The display engine, once taken over from GSP-RM by [`Gpu::init_display_engine()`], and
+    /// Nova's own scanout through it.
     ///
-    /// Its RM objects are freed in [`Gpu`]'s `PinnedDrop`, while the GSP is still running.
-    display_engine: Option<DisplayEngine<'gpu>>,
+    /// Its RM objects are freed and the scanout unmapped in [`Gpu`]'s `PinnedDrop`, while the GSP
+    /// is still running.
+    #[pin]
+    display_engine: Mutex<Option<DisplayOutput<'gpu>>>,
     /// GPU memory manager owning memory management resources.
     ///
     /// Must be kept declared *before* `gsp_resources`, so that its components are dropped while
@@ -617,7 +622,7 @@ impl<'gpu> Gpu<'gpu> {
             }),
 
             // Set up by `Gpu::init_display_engine()`, which needs to allocate VRAM.
-            display_engine: None,
+            display_engine <- new_mutex!(None, "nova_display_engine"),
 
             // Create GPU memory manager owning memory management resources.
             mm: {
@@ -764,9 +769,58 @@ impl<'gpu> Gpu<'gpu> {
             );
         }
 
-        *this.display_engine = Some(engine);
+        // Nova's own scanout, of the boot display's mode: Nova can't set modes yet.
+        let scanout = this.boot_display.as_ref().and_then(|boot| {
+            Scanout::new(
+                this.mm,
+                this.bar_user.as_ref().get_ref(),
+                boot.width,
+                boot.height,
+            )
+            .inspect(|scanout| dev_info!(pdev, "display: scanout set up: {:?}\n", scanout.mode()))
+            .inspect_err(|e| dev_err!(pdev, "display: can't set up the scanout: {:?}\n", e))
+            .ok()
+        });
+
+        *this.display_engine.lock() = Some(DisplayOutput { engine, scanout });
 
         Ok(())
+    }
+
+    /// Returns the size and layout of the framebuffers of Nova's own scanout, if it is set up.
+    pub(crate) fn scanout_mode(&self) -> Option<ScanoutMode> {
+        self.display_engine
+            .lock()
+            .as_ref()
+            .and_then(|output| output.scanout.as_ref())
+            .map(Scanout::mode)
+    }
+
+    /// Writes `data` at `offset` into the back buffer of Nova's own scanout, which shows on
+    /// screen from the next [`Gpu::flip_scanout()`].
+    ///
+    /// `offset` and the length of `data` must be multiples of 4. Fails with `ENODEV` if the
+    /// scanout isn't set up.
+    pub(crate) fn write_scanout(&self, offset: usize, data: &[u8]) -> Result {
+        let output = self.display_engine.lock();
+        let scanout = output
+            .as_ref()
+            .and_then(|output| output.scanout.as_ref())
+            .ok_or(ENODEV)?;
+
+        scanout.write(&self.bar_user, offset, data)
+    }
+
+    /// Shows the back buffer of Nova's own scanout from the next frame on, and returns once the
+    /// framebuffer shown before can be drawn into.
+    ///
+    /// Fails with `ENODEV` if the scanout isn't set up.
+    pub(crate) fn flip_scanout(&self) -> Result {
+        let mut guard = self.display_engine.lock();
+        let output = Option::as_mut(&mut guard).ok_or(ENODEV)?;
+        let scanout = output.scanout.as_mut().ok_or(ENODEV)?;
+
+        scanout.flip(&mut output.engine, self.gsp_resources.bar)
     }
 
     /// Returns the display engine and the display the boot display is shown on.
@@ -823,6 +877,13 @@ impl<'gpu> Gpu<'gpu> {
     }
 }
 
+/// The display engine, and Nova's own scanout through it.
+struct DisplayOutput<'gpu> {
+    engine: DisplayEngine<'gpu>,
+    /// Nova's own scanout, if it could be set up.
+    scanout: Option<Scanout>,
+}
+
 #[pinned_drop]
 impl PinnedDrop for Gpu<'_> {
     fn drop(self: Pin<&mut Self>) {
@@ -844,10 +905,22 @@ impl PinnedDrop for Gpu<'_> {
         let dev = gsp_resources.device.as_ref();
 
         // The display engine's objects first, as they live under those of `display`.
-        if let (Some(mut engine), Some(display)) =
-            (this.display_engine.take(), this.display.as_ref())
+        let output = this.display_engine.lock().take();
+        if let Some(DisplayOutput {
+            mut engine,
+            scanout,
+        }) = output
         {
-            engine.free(dev, &gsp_resources.gsp.cmdq, display);
+            if let Some(display) = this.display.as_ref() {
+                engine.free(dev, &gsp_resources.gsp.cmdq, display);
+            }
+
+            // Once the window, which may show it, is freed.
+            if let Some(scanout) = scanout {
+                let _ = scanout
+                    .unmap(this.mm, this.bar_user.as_ref().get_ref())
+                    .inspect_err(|e| dev_err!(dev, "failed to unmap the scanout: {:?}\n", e));
+            }
         }
 
         if let Some(display) = this.display.take() {
