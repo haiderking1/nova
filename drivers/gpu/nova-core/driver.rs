@@ -67,6 +67,33 @@ pub(crate) fn bar1_resource_index(pdev: &pci::Device<Bound>) -> Result<u32> {
     }
 }
 
+// `linux/aperture.h` is not in the Rust bindings yet.
+unsafe extern "C" {
+    fn aperture_remove_conflicting_devices(
+        base: kernel::bindings::resource_size_t,
+        size: kernel::bindings::resource_size_t,
+        name: *const c_char,
+    ) -> c_int;
+}
+
+/// Removes firmware framebuffers (simpledrm, efifb) that live in BAR1.
+///
+/// UEFI leaves a framebuffer in VRAM, which the CPU reaches through BAR1, and the generic
+/// firmware framebuffer drivers claim that memory. Reserving BAR1 then fails with `EBUSY`, so
+/// take the memory over first, as other GPU drivers do. The firmware console stops working.
+fn remove_firmware_framebuffers(pdev: &pci::Device<Bound>) -> Result {
+    let bar1_idx = bar1_resource_index(pdev)?;
+    let base = pdev.resource_start(bar1_idx)?;
+    let size = pdev.resource_len(bar1_idx)?;
+
+    dev_dbg!(pdev, "Removing firmware framebuffers in BAR1 [{base:#x}, +{size:#x}].\n");
+
+    // SAFETY: `base` and `size` are plain values and the name is a NUL-terminated static string.
+    kernel::error::to_result(unsafe {
+        aperture_remove_conflicting_devices(base, size, c"nova-core".as_char_ptr())
+    })
+}
+
 kernel::pci_device_table!(
     PCI_TABLE,
     <NovaCoreDriver as pci::Driver>::IdInfo,
@@ -104,6 +131,7 @@ impl pci::Driver for NovaCoreDriver {
 
         try_pin_init!(NovaCore {
             _: {
+                remove_firmware_framebuffers(pdev)?;
                 pdev.enable_device_mem()?;
                 pdev.set_master();
             },
