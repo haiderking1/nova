@@ -19,6 +19,7 @@ use crate::{
         rm::device::RmDevice, //
     },
     mm::GpuMm,
+    num,
 };
 
 use super::{
@@ -50,6 +51,9 @@ const STORE_QMD: u64 = 0x200;
 const RESULT: u64 = 0x300;
 /// Offset of the word [`RELEASED`] is written to.
 const RELEASE: u64 = 0x310;
+
+/// What the test's memory page is filled with first, to tell the words written since.
+const UNWRITTEN: u32 = 0xa5a5_a5a5;
 
 /// Registers the programs use: up to R5, plus 2 the hardware reserves.
 const REGISTERS: u8 = 8;
@@ -93,9 +97,16 @@ fn run_on(
     channel.init(bar, mm)?;
 
     let page = mm.alloc_contiguous(SZ_4K, Alignment::new::<SZ_4K>())?;
-    mm.clear_vram(page.range())?;
+    let mut fill = KVec::new();
+    fill.resize(SZ_4K / size_of::<u32>(), UNWRITTEN, GFP_KERNEL)?;
+    mm.write_vram(page.range().start, &fill)?;
     let mapped = channel.map_vram(mm, page.range())?;
     let va = mapped.start().into_raw();
+    dev_info!(
+        dev,
+        "compute test: memory at GPU virtual address {:#x}\n",
+        va
+    );
 
     let result = (|| -> Result {
         let base = page.range().start;
@@ -148,6 +159,20 @@ fn run_on(
             RELEASED
         );
         if stored != VALUE || released != RELEASED {
+            // Where the shader wrote, if it did: the words written past the work descriptors.
+            let mut offset = RESULT;
+            while offset < num::usize_as_u64(SZ_4K) {
+                let word = mm.read_vram(base + offset)?;
+                if word != UNWRITTEN {
+                    dev_info!(
+                        dev,
+                        "compute test: word at {:#x} written: {:#010x}\n",
+                        offset,
+                        word
+                    );
+                }
+                offset += num::usize_as_u64(size_of::<u32>());
+            }
             return Err(EIO);
         }
 
