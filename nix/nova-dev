@@ -123,9 +123,11 @@ kernel() {
     echo "nova-dev: kernel config changed, configured $kernel_tree; the first build takes as long as a Nix build"
   fi
 
-  # The kernel and the modules are built against each other, which also checks every symbol the
-  # modules use against the new kernel
-  kmake "$kernel_tree" -j"$(nproc)" bzImage "${mods[@]}"
+  # The modules are built against this kernel, which also checks every symbol they use against
+  # it. Separately: make builds the goals of a "mixed" kernel+modules call one by one, and then
+  # nova-drm is checked without nova-core, whose symbols it uses.
+  kmake "$kernel_tree" -j"$(nproc)" bzImage
+  kmake "$kernel_tree" -j"$(nproc)" "${mods[@]}"
 
   # The dev kernel boots the nova system, which loads every other module from
   # the Nix-built kernel: refuse a kernel those won't load into
