@@ -439,6 +439,46 @@ impl<T: drm::Driver, C: DeviceContext> Device<T, C> {
     }
 }
 
+impl<T: drm::Driver> Device<T> {
+    /// Guard against the parent bus device being unbound, from contexts where the device may not
+    /// be registered, e.g. KMS callbacks touching the hardware.
+    ///
+    /// Returns a [`RegistrationGuard`] if the device is registered and has not been unplugged,
+    /// [`None`] otherwise.
+    #[must_use]
+    pub fn registration_guard(&self) -> Option<RegistrationGuard<'_, T>> {
+        let mut idx: i32 = 0;
+        // SAFETY: `self.as_raw()` is a valid pointer to a `struct drm_device`.
+        if !unsafe { bindings::drm_dev_enter(self.as_raw(), &mut idx) } {
+            return None;
+        }
+
+        // `drm_dev_register()` sets `registered` after the registration data was set up, and
+        // `drm_dev_unplug()` only clears it after waiting for `drm_dev_enter()` sections like
+        // this one to end.
+        //
+        // SAFETY: `self.as_raw()` is valid. The field is written without locking by
+        // registration, so read it once, volatile, like `READ_ONCE()`.
+        let registered = unsafe { ptr::read_volatile(&raw const (*self.as_raw()).registered) };
+        if !registered {
+            // SAFETY: `idx` was returned by the successful `drm_dev_enter()` above.
+            unsafe { bindings::drm_dev_exit(idx) };
+            return None;
+        }
+
+        // INVARIANT:
+        // - `idx` is the SRCU index from the successful `drm_dev_enter()` above.
+        // - The parent bus device is bound: the device is registered and `drm_dev_unplug()` has
+        //   not completed, as in `Device<T, Ioctl>::registration_guard()`.
+        Some(RegistrationGuard {
+            // SAFETY: See INVARIANT above; the `Registered` context invariant holds.
+            dev: unsafe { self.assume_ctx() },
+            idx,
+            _not_send: NotThreadSafe,
+        })
+    }
+}
+
 impl<T: drm::Driver> Device<T, Ioctl> {
     /// Guard against the parent bus device being unbound.
     ///
