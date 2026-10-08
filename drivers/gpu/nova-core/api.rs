@@ -21,6 +21,16 @@ use crate::{
     gsp::commands::GetGspStaticInfoReply, //
 };
 
+/// Mode of the display the system firmware set up on the GPU (e.g. through UEFI GOP), which the
+/// display engine keeps scanning out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BootDisplayMode {
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+}
+
 /// API handle for the auxiliary bus child drivers to interact with nova-core.
 pub struct NovaCoreApi<'bound> {
     pub(crate) gpu: Pin<&'bound Gpu<'bound>>,
@@ -42,6 +52,14 @@ impl NovaCoreApi<'_> {
     /// Returns the GPU [`Spec`].
     pub fn spec(&self) -> &Spec {
         &self.gpu.spec
+    }
+
+    /// Returns the mode of the display the system firmware set up on the GPU, if it set one up.
+    pub fn boot_display_mode(&self) -> Option<BootDisplayMode> {
+        self.gpu.boot_display.as_ref().map(|display| BootDisplayMode {
+            width: display.width,
+            height: display.height,
+        })
     }
 
     /// Returns the size of the PCIe BAR used for accessing VRAM, typically
