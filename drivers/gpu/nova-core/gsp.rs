@@ -28,6 +28,7 @@ mod regs;
 pub(crate) mod rm;
 mod sequencer;
 
+pub use fw::rm::ConnectorType;
 pub(crate) use fw::{
     GspFmcBootParams,
     GspFwWprMeta,

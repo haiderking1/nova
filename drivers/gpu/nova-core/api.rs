@@ -14,7 +14,10 @@ use kernel::{
     types::ForLt, //
 };
 
-pub use crate::gpu::Spec;
+pub use crate::{
+    gpu::Spec,
+    gsp::ConnectorType, //
+};
 
 use crate::{
     driver,
@@ -76,6 +79,20 @@ impl NovaCoreApi<'_> {
     /// without a usable boot display.
     pub fn write_boot_display(&self, offset: usize, data: &[u8]) -> Result {
         self.gpu.write_boot_display(offset, data)
+    }
+
+    /// Returns the type of connector the boot display is shown through.
+    ///
+    /// Fails with `ENODEV` if the display engine reports no active display.
+    pub fn boot_display_connector(&self) -> Result<ConnectorType> {
+        self.gpu.boot_display_connector()
+    }
+
+    /// Reads the EDID of the monitor the boot display is shown on, over the display's DDC channel.
+    ///
+    /// Fails with `ENODEV` if the display engine reports no active display.
+    pub fn boot_display_edid(&self) -> Result<KVec<u8>> {
+        self.gpu.boot_display_edid()
     }
 
     /// Returns the size of the PCIe BAR used for accessing VRAM, typically

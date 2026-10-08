@@ -822,6 +822,7 @@ pub(crate) enum MsgFunction {
     GetGspStaticInfo = bindings::NV_VGPU_MSG_FUNCTION_GET_GSP_STATIC_INFO,
     GetStaticInfo = bindings::NV_VGPU_MSG_FUNCTION_GET_STATIC_INFO,
     GspInitPostObjGpu = bindings::NV_VGPU_MSG_FUNCTION_GSP_INIT_POST_OBJGPU,
+    GspRmAlloc = bindings::NV_VGPU_MSG_FUNCTION_GSP_RM_ALLOC,
     GspRmControl = bindings::NV_VGPU_MSG_FUNCTION_GSP_RM_CONTROL,
     GspSetSystemInfo = bindings::NV_VGPU_MSG_FUNCTION_GSP_SET_SYSTEM_INFO,
     Log = bindings::NV_VGPU_MSG_FUNCTION_LOG,
@@ -865,6 +866,7 @@ impl TryFrom<u32> for MsgFunction {
             bindings::NV_VGPU_MSG_FUNCTION_GSP_INIT_POST_OBJGPU => {
                 Ok(MsgFunction::GspInitPostObjGpu)
             }
+            bindings::NV_VGPU_MSG_FUNCTION_GSP_RM_ALLOC => Ok(MsgFunction::GspRmAlloc),
             bindings::NV_VGPU_MSG_FUNCTION_GSP_RM_CONTROL => Ok(MsgFunction::GspRmControl),
             bindings::NV_VGPU_MSG_FUNCTION_GSP_SET_SYSTEM_INFO => Ok(MsgFunction::GspSetSystemInfo),
             bindings::NV_VGPU_MSG_FUNCTION_LOG => Ok(MsgFunction::Log),

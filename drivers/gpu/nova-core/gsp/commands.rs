@@ -48,7 +48,6 @@ pub(crate) struct Client;
 ///
 /// A device handle identifies a logical GPU device instance under a client. In multi-GPU
 /// configurations it can represent a grouped or logical device.
-#[expect(dead_code)]
 pub(crate) struct Device;
 
 /// Marker type for a GSP-RM subdevice handle.
@@ -56,6 +55,12 @@ pub(crate) struct Device;
 /// A subdevice handle identifies a child of a device that selects one specific GPU within that
 /// device.
 pub(crate) struct Subdevice;
+
+/// Marker type for the GSP-RM handle of the display engine's common object.
+///
+/// This object, a child of a device, is the target of the display engine's RM control commands
+/// that are not specific to a display channel.
+pub(crate) struct DisplayCommon;
 
 /// A typed GSP-RM object handle.
 ///

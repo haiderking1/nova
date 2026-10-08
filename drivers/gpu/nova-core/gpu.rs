@@ -24,6 +24,10 @@ use kernel::{
 use crate::{
     boot_display::BootDisplay,
     bounded_enum,
+    display::{
+        Display,
+        DisplayId, //
+    },
     driver::{
         Bar0,
         Bar1, //
@@ -39,6 +43,7 @@ use crate::{
         self,
         cmdq::Cmdq,
         commands::GetGspStaticInfoReply,
+        ConnectorType,
         Gsp,
         GspBootContext, //
     },
@@ -402,6 +407,12 @@ pub(crate) struct Gpu<'gpu> {
     _gsp_subtree: GspSubtree<'gpu>,
     /// Static GPU information as provided by the GSP.
     pub(crate) gsp_static_info: GetGspStaticInfoReply,
+    /// RM objects for the display engine, if they could be allocated.
+    ///
+    /// Freed in [`Gpu`]'s `PinnedDrop`, while the GSP is still running.
+    display: Option<Display>,
+    /// The display the boot display is shown on, if the display engine reports one as active.
+    boot_output: Option<DisplayId>,
     /// GPU memory manager owning memory management resources.
     ///
     /// Must be kept declared *before* `gsp_resources`, so that its components are dropped while
@@ -584,6 +595,21 @@ impl<'gpu> Gpu<'gpu> {
                 info
             },
 
+            // Not fatal: the display engine is only needed to describe the boot display.
+            display: Display::new(dev, &gsp_resources.gsp.cmdq)
+                .inspect_err(|e| dev_warn!(dev, "can't access the display engine: {:?}\n", e))
+                .ok(),
+
+            boot_output: display.as_ref().and_then(|display| {
+                let output = display
+                    .active_display(dev, &gsp_resources.gsp.cmdq)
+                    .inspect_err(|e| dev_warn!(dev, "can't find the active display: {:?}\n", e))
+                    .ok()
+                    .flatten();
+                dev_dbg!(dev, "boot display output: {:?}\n", output);
+                output
+            }),
+
             // Create GPU memory manager owning memory management resources.
             mm: {
                 let usable_vram = gsp_static_info.usable_fb_regions.first().ok_or(ENODEV)?;
@@ -687,6 +713,34 @@ impl<'gpu> Gpu<'gpu> {
         self.bar_user.write(mapped, offset, data)
     }
 
+    /// Returns the display engine and the display the boot display is shown on.
+    fn boot_output(&self) -> Result<(&Display, DisplayId)> {
+        let display = self.display.as_ref().ok_or(ENODEV)?;
+        let output = self.boot_output.ok_or(ENODEV)?;
+
+        Ok((display, output))
+    }
+
+    /// Returns the type of connector the boot display is shown through.
+    ///
+    /// Fails with `ENODEV` if the display engine reports no active display.
+    pub(crate) fn boot_display_connector(&self) -> Result<ConnectorType> {
+        let (display, output) = self.boot_output()?;
+        let dev = self.gsp_resources.device.as_ref();
+
+        display.connector_type(dev, &self.gsp_resources.gsp.cmdq, output)
+    }
+
+    /// Reads the EDID of the monitor the boot display is shown on.
+    ///
+    /// Fails with `ENODEV` if the display engine reports no active display.
+    pub(crate) fn boot_display_edid(&self) -> Result<KVec<u8>> {
+        let (display, output) = self.boot_output()?;
+        let dev = self.gsp_resources.device.as_ref();
+
+        display.edid(dev, &self.gsp_resources.gsp.cmdq, output)
+    }
+
     /// Runs self-tests on the constructed [`Gpu`], logging failures without failing probe.
     #[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
     pub(crate) fn run_selftests(self: Pin<&mut Self>, pdev: &pci::Device<device::Bound>) {
@@ -727,6 +781,16 @@ impl PinnedDrop for Gpu<'_> {
                 .get_ref()
                 .unmap(this.mm, mapped)
                 .inspect_err(|e| pr_err!("failed to unmap the boot display: {:?}\n", e));
+        }
+
+        // Before `gsp_resources` is dropped: freeing RM objects needs a running GSP.
+        if let Some(display) = this.display.take() {
+            let gsp_resources = this.gsp_resources.as_ref().get_ref();
+            let dev = gsp_resources.device.as_ref();
+
+            let _ = display
+                .free(dev, &gsp_resources.gsp.cmdq)
+                .inspect_err(|e| dev_err!(dev, "failed to free the display objects: {:?}\n", e));
         }
     }
 }
