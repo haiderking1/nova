@@ -415,11 +415,18 @@ impl<T: KmsDriver> private::KmsImpl for T {
         // CRTC supports it, or no CRTCs support it.
         //
         // In the future, I think this is likely a requirement we should be enforcing in DRM, so
-        // let's make it part of this patch series later on. But, leave this as a problem for after
-        // we get the thing rebased. For now, just assume it's implemented which is super broken.
+        // let's make it part of this patch series later on.
         //
-        // SAFETY: TODO
-        to_result(unsafe { bindings::drm_vblank_init(drm.as_raw(), drm.num_crtcs()) })?;
+        // All CRTCs of a driver are of type `T::Crtc`, so vblank support is all or nothing already.
+        // Only set up vblank handling if `T::Crtc` implements it: otherwise DRM would wait for
+        // vblank events that never come, instead of completing commits itself
+        // (`drm_crtc_state.no_vblank`).
+        let vblank_ops = <<T::Crtc as crtc::DriverCrtc>::VblankImpl as vblank::VblankImpl>::VBLANK_OPS;
+        if vblank_ops.enable_vblank.is_some() {
+            // SAFETY: All CRTCs were created in `T::probe()` above and the device isn't registered
+            // yet, as `drm_vblank_init()` requires.
+            to_result(unsafe { bindings::drm_vblank_init(drm.as_raw(), drm.num_crtcs()) })?;
+        }
 
         // TODO: Eventually add a hook to customize how state readback happens, for now just reset
         // SAFETY: Since all static modesetting objects were created in `T::create_objects()`, and
