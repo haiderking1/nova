@@ -145,16 +145,38 @@ impl Display {
         )
     }
 
-    /// Reads the EDID of `display` from the connected monitor.
+    /// Reads the EDID of `display` from the connected monitor, or returns the copy GSP-RM cached
+    /// if reading it fails.
     pub(crate) fn edid(
         &self,
         dev: &device::Device,
         cmdq: &Cmdq<'_>,
         display: DisplayId,
     ) -> Result<KVec<u8>> {
-        Ok(
-            RmControl::new(self.client, self.common, DispGetEdid::new(display.0)?)
-                .send(dev, cmdq)?,
-        )
+        let read = |cached| -> Result<KVec<u8>> {
+            RmControl::new(self.client, self.common, DispGetEdid::new(display.0, cached)?)
+                .send(dev, cmdq)
+                .inspect(|edid| {
+                    dev_dbg!(
+                        dev,
+                        "EDID of display {:#x} (cached: {}): {} bytes\n",
+                        display.0,
+                        cached,
+                        edid.len()
+                    );
+                })
+                .inspect_err(|e| {
+                    dev_warn!(
+                        dev,
+                        "reading the EDID of display {:#x} (cached: {}) failed: {:?}\n",
+                        display.0,
+                        cached,
+                        e
+                    );
+                })
+                .map_err(Error::from)
+        };
+
+        read(false).or_else(|_| read(true))
     }
 }

@@ -383,7 +383,14 @@ fn read_edid(drm: &NovaDevice) -> Result<Edid> {
 
     let edid = Edid::new(&data)?;
     if !edid.is_valid() {
-        return Err(EINVAL);
+        let dev: &auxiliary::Device = drm.as_ref();
+        dev_warn!(
+            dev,
+            "the EDID of the boot display is invalid ({} bytes, starting {:02x?})\n",
+            data.len(),
+            data.get(..16).unwrap_or(&data)
+        );
+        return Err(EBADMSG);
     }
 
     Ok(edid)

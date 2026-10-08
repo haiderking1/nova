@@ -512,9 +512,13 @@ disp_control!(
 pub(crate) struct DispGetEdid(KBox<DispGetEdidParams>);
 
 impl DispGetEdid {
-    /// Creates the command for `display_id`.
-    pub(crate) fn new(display_id: u32) -> Result<Self> {
-        Ok(Self(KBox::new(DispGetEdidParams::new(display_id), GFP_KERNEL)?))
+    /// Creates the command for `display_id`, reading the EDID from the display or, if `cached` is
+    /// true, returning the copy GSP-RM cached.
+    pub(crate) fn new(display_id: u32, cached: bool) -> Result<Self> {
+        Ok(Self(KBox::new(
+            DispGetEdidParams::new(display_id, cached),
+            GFP_KERNEL,
+        )?))
     }
 }
 

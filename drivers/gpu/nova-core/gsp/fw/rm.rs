@@ -394,12 +394,16 @@ pub(crate) struct DispGetEdidParams(bindings::NV0073_CTRL_SPECIFIC_GET_EDID_V2_P
 impl DispGetEdidParams {
     /// Creates the parameters to read the EDID of `display_id` on subdevice 0.
     ///
-    /// The flags ask GSP-RM to read the EDID from the display over DDC (rather than to return
-    /// the copy it cached), and to apply its usual EDID fix-ups.
-    pub(crate) fn new(display_id: u32) -> Self {
+    /// GSP-RM reads the EDID from the display over DDC, or returns the copy it cached if `cached`
+    /// is true. Either way it applies its usual EDID fix-ups.
+    pub(crate) fn new(display_id: u32, cached: bool) -> Self {
         let mut params = bindings::NV0073_CTRL_SPECIFIC_GET_EDID_V2_PARAMS {
             displayId: display_id,
-            flags: 0,
+            flags: if cached {
+                bindings::NV0073_CTRL_SPECIFIC_GET_EDID_FLAGS_COPY_CACHE_YES
+            } else {
+                bindings::NV0073_CTRL_SPECIFIC_GET_EDID_FLAGS_COPY_CACHE_NO
+            },
             ..Default::default()
         };
         // CAST: the buffer is 2048 bytes long.
