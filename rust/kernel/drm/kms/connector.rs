@@ -8,6 +8,7 @@ use crate::{
     alloc::KBox,
     bindings,
     drm::{
+        edid::Edid,
         kms::{
             atomic::*,
             encoder::*,
@@ -32,7 +33,7 @@ use core::{
     marker::*,
     mem::ManuallyDrop,
     ops::*,
-    ptr::{null_mut, NonNull},
+    ptr::{null, null_mut, NonNull},
     stringify,
 };
 use macros::paste;
@@ -555,6 +556,28 @@ impl<'a, T: DriverConnector> ConnectorGuard<'a, T> {
         // SAFETY: We hold the locks required to call this via our type invariants, and `mode` is
         // a valid `struct drm_display_mode`, which the helper only reads and copies.
         unsafe { bindings::drm_connector_helper_get_modes_fixed(self.as_raw(), mode.as_raw()) }
+    }
+
+    /// Updates the underlying [`Connector`] from the EDID of the display plugged into it, or
+    /// resets it if `edid` is `None` (e.g. after the display was unplugged).
+    ///
+    /// This updates the connector's display information (such as its physical size) and its
+    /// `EDID` property, and keeps the EDID for [`ConnectorGuard::add_edid_modes`].
+    pub fn update_edid(&self, edid: Option<&Edid>) -> Result {
+        // SAFETY: We hold the locks required to call this via our type invariants, and `edid` is
+        // either NULL or a valid `struct drm_edid`, which DRM copies.
+        to_result(unsafe {
+            bindings::drm_edid_connector_update(self.as_raw(), edid.map_or(null(), Edid::as_raw))
+        })
+    }
+
+    /// Adds the modes of the EDID last set with [`ConnectorGuard::update_edid`] to the underlying
+    /// [`Connector`]'s mode list.
+    ///
+    /// Returns how many modes were added.
+    pub fn add_edid_modes(&self) -> i32 {
+        // SAFETY: We hold the locks required to call this via our type invariants.
+        unsafe { bindings::drm_edid_connector_add_modes(self.as_raw()) }
     }
 }
 
