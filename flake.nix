@@ -36,6 +36,14 @@
           inherit version;
           modDirVersion = version;
           configfile = ./nix/kernel.config;
+          # What buildLinux declares by default; NixOS asserts on these.
+          # All are enabled in kernel.config (EFI_STUB, IA32_EMULATION,
+          # IP{,6}_NF_MATCH_RPFILTER).
+          features = {
+            efiBootStub = true;
+            ia32Emulation = true;
+            netfilterRPFilter = true;
+          };
         };
         # GSP firmware in the TLV layout nova-core loads, repackaged from
         # linux-firmware. The version must match nova's GSP bindings

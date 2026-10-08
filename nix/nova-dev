@@ -18,8 +18,9 @@ mods=(drivers/gpu/nova-core.ko drivers/gpu/nova-drm.ko)
 
 die() { echo "nova-dev: $*" >&2; exit 1; }
 
-# Build dir (lib/modules/<ver>/build) of the nova kernel in the newest generation
-nova_kbuild() {
+# Dev output (vmlinux + lib/modules/<ver>/build) of the nova kernel in the
+# newest generation
+nova_kdev() {
   local kernel drv dev
   kernel=$(readlink -f /nix/var/nix/profiles/system/specialisation/nova/kernel 2>/dev/null) ||
     die "no nova boot entry yet, run ./rebuild.sh in mother-base first"
@@ -27,6 +28,12 @@ nova_kbuild() {
   dev=$(nix-store -q --outputs "$drv" | grep -- '-dev$') ||
     die "can't find the dev output of $drv"
   [ -d "$dev" ] || die "$dev is missing (garbage collected?), run ./rebuild.sh"
+  echo "$dev"
+}
+
+nova_kbuild() {
+  local dev
+  dev=$(nova_kdev)
   echo "$dev"/lib/modules/*/build
 }
 
@@ -37,8 +44,9 @@ kmake() {
 
 build() {
   command -v rustc >/dev/null || die "run this inside 'nix develop' in $src"
-  local kbuild release
-  kbuild=$(nova_kbuild)
+  local kdev kbuild release
+  kdev=$(nova_kdev)
+  kbuild=$(echo "$kdev"/lib/modules/*/build)
   release=$(cat "$kbuild/include/config/kernel.release")
   mkdir -p "$ktree"
 
@@ -51,10 +59,18 @@ build() {
     kmake olddefconfig
     kmake -j"$(nproc)" modules_prepare
   fi
-  # vmlinux symbols, so modpost can check what the modules use
-  install -m644 "$kbuild/Module.symvers" "$ktree/Module.symvers"
+  # The real kernel's vmlinux, for module BTF that matches it
+  ln -sf "$kdev/vmlinux" "$ktree/vmlinux"
+  # Single-module builds only look for symbols in vmlinux.o, which we don't
+  # have. Feed modpost the real kernel's Module.symvers instead, so symbols are
+  # checked and module dependencies get recorded. (Ignore its "vmlinux.o is
+  # missing" warning.)
+  ln -sf "$kbuild/Module.symvers" "$ktree/Module.symvers"
+  printf '#!/bin/sh\nexec %q -i %q "$@"\n' \
+    "$ktree/scripts/mod/modpost" "$ktree/Module.symvers" > "$ktree/modpost-wrap"
+  chmod +x "$ktree/modpost-wrap"
 
-  kmake -j"$(nproc)" "${mods[@]}"
+  kmake -j"$(nproc)" MODPOST="$ktree/modpost-wrap" "${mods[@]}"
 
   local m vermagic
   for m in "${mods[@]}"; do
