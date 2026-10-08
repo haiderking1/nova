@@ -20,7 +20,14 @@
       # Full NixOS-compatible kernel built from this tree, with nova enabled.
       # mother-base boots it as the "nova" specialisation (second boot entry).
       packages.${system} = rec {
-        kernel = pkgs.buildLinux {
+        # nix/kernel.config is nixpkgs' full NixOS config plus:
+        #   RUST=y, DRM=y (nova-drm needs it built in), NOVA_CORE=m,
+        #   NOVA_CORE_SELFTESTS=y, DRM_NOVA=m, DRM_NOUVEAU=n (keep it off the
+        #   card), DRM_SIMPLEDRM=y + SYSFB_SIMPLEFB=y (UEFI framebuffer console)
+        # then trimmed with `make localmodconfig` to the modules this VM loads
+        # (lsmod, the nova entry's initrd modules, nova, fuse/overlay/tun/loop):
+        # ~200 modules instead of ~7300, so a full build takes minutes.
+        kernel = pkgs.linuxKernel.manualConfig {
           # Our nix files aren't kernel source; editing them shouldn't rebuild it
           src = lib.fileset.toSource {
             root = ./.;
@@ -28,25 +35,7 @@
           };
           inherit version;
           modDirVersion = version;
-          # rc kernels have options nixpkgs' common config doesn't know yet
-          ignoreConfigErrors = true;
-
-          structuredExtraConfig = with lib.kernel; {
-            RUST = yes;
-            DRM = yes; # DRM_NOVA requires built-in DRM
-            # nixpkgs' common config forces these off (WIP), so override it
-            NOVA_CORE = lib.mkForce module;
-            NOVA_CORE_SELFTESTS = yes;
-            DRM_NOVA = lib.mkForce module;
-
-            # Keep nouveau off the card so nova gets it
-            DRM_NOUVEAU = no;
-
-            # Firmware (UEFI GOP) framebuffer, so the console shows something
-            # until nova can drive the display itself
-            DRM_SIMPLEDRM = yes;
-            SYSFB_SIMPLEFB = yes;
-          };
+          configfile = ./nix/kernel.config;
         };
         # GSP firmware in the TLV layout nova-core loads, repackaged from
         # linux-firmware. The version must match nova's GSP bindings
