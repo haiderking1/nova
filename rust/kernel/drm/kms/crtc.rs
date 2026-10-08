@@ -71,6 +71,9 @@ pub trait DriverCrtc: Send + Sync + Sized {
     /// The generated C vtable for this [`DriverCrtc`] implementation.
     const OPS: &'static DriverCrtcOps = &DriverCrtcOps {
         funcs: bindings::drm_crtc_funcs {
+            // This tree still has `reset`; `drm_mode_config_reset()` uses `atomic_create_state`
+            // when it's unset.
+            reset: None,
             atomic_create_state: Some(atomic_create_state_callback::<Self::State>),
             atomic_destroy_state: Some(atomic_destroy_state_callback::<Self::State>),
             atomic_duplicate_state: Some(atomic_duplicate_state_callback::<Self::State>),
@@ -134,7 +137,6 @@ pub trait DriverCrtc: Send + Sync + Sized {
             mode_set_base: None,
             get_scanout_position: None,
             handle_vblank_timeout: None,
-            hw_reset: None,
         },
     };
 

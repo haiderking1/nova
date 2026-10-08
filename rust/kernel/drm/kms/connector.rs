@@ -138,7 +138,6 @@ pub trait DriverConnector: Send + Sync + Sized {
             atomic_best_encoder: None,
             prepare_writeback_job: None,
             cleanup_writeback_job: None,
-            force_ctx: None,
         },
     };
 

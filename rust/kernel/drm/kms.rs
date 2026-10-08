@@ -565,7 +565,6 @@ impl<T: StaticModeObject + Send + Sync, C: DeviceContext> KmsRef<T, C> {
     /// - The caller guarantees that at least one owned reference is taken out for the respective
     ///   [`Device`] this modesetting object is from.
     /// - The caller guarantees that `ptr` points to a valid instance of `T`.
-    #[expect(unused)]
     pub(super) unsafe fn from_raw(ptr: *mut T) -> Self {
         // SAFETY: The caller guarantees that `ptr` points to a valid instance of `T`.
         KmsRef(unsafe { NonNull::new_unchecked(ptr) }, PhantomData)

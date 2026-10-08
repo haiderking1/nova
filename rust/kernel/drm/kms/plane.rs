@@ -69,6 +69,9 @@ pub trait DriverPlane: Send + Sync + Sized {
     /// The generated C vtable for this [`DriverPlane`] implementation.
     const OPS: &'static DriverPlaneOps = &DriverPlaneOps {
         funcs: bindings::drm_plane_funcs {
+            // This tree still has `reset`; `drm_mode_config_reset()` uses `atomic_create_state`
+            // when it's unset.
+            reset: None,
             atomic_create_state: Some(atomic_create_state_callback::<Self::State>),
             update_plane: Some(bindings::drm_atomic_helper_update_plane),
             disable_plane: Some(bindings::drm_atomic_helper_disable_plane),
@@ -83,7 +86,6 @@ pub trait DriverPlane: Send + Sync + Sized {
             atomic_print_state: None,
             format_mod_supported: None,
             format_mod_supported_async: None,
-            display_panic_screen: None,
         },
 
         helper_funcs: bindings::drm_plane_helper_funcs {
