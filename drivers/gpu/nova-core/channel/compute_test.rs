@@ -54,101 +54,118 @@ const UNWRITTEN: u32 = 0xa5a5_a5a5;
 /// Registers the programs use: up to R5, plus 2 the hardware reserves.
 const REGISTERS: u8 = 8;
 
+/// Scheduling bits of an instruction (bits 105 to 121, in its last word): stall `delay` cycles
+/// before the next instruction, possibly yielding to other warps, without scoreboard barriers.
+/// Field positions are those of Mesa's NAK compiler (`set_instr_deps()`).
+const fn deps(delay: u32, yld: bool) -> u32 {
+    // Delay in bits 108:105, yield in bit 109, no write (112:110) or read (115:113) barrier.
+    delay << 9 | (yld as u32) << 13 | 7 << 14 | 7 << 17
+}
+
 /// Encodes the GA10x (SM86) instruction `MOV Rd, imm32`, which sets register `rd`.
-const fn mov(rd: u32, imm: u32) -> [u32; 4] {
-    [0x0000_7802 | rd << 16, imm, 0x0000_0f00, 0x000f_fe00]
+const fn mov(rd: u32, imm: u32, deps: u32) -> [u32; 4] {
+    [0x0000_7802 | rd << 16, imm, 0x0000_0f00, deps]
 }
 
 /// Encodes `STG.E [R2.64], Rdata`: stores register `data` at the address in registers R2 and R3.
-const fn stg(data: u32) -> [u32; 4] {
-    [0x0200_7986, data, 0x0c10_093f, 0x000f_e200]
+const fn stg(data: u32, deps: u32) -> [u32; 4] {
+    [0x0200_7986, data, 0x0c10_093f, deps]
+}
+
+/// Encodes `NOP`: does nothing.
+const fn nop(deps: u32) -> [u32; 4] {
+    [0x0000_7918, 0, 0, deps]
 }
 
 /// `EXIT`: ends the thread.
 const EXIT: [u32; 4] = [0x0000_794d, 0, 0x0380_0000, 0x000f_ea00];
-/// `NOP`: does nothing.
-const NOP: [u32; 4] = [0x0000_7918, 0, 0, 0x000f_c000];
 /// `BRA .`: loops on itself, after `EXIT`, as compilers end programs.
 const BRA_SELF: [u32; 4] = [0x0000_7947, 0xffff_fff0, 0x0383_ffff, 0x000f_c000];
+
+/// Scheduling bits of the first programs: the longest stall, yielding, as nvcc's control words.
+const FIRST_DEPS: u32 = deps(15, true);
 
 /// A storing program the test runs.
 struct Variant {
     /// What the variant tells.
     name: &'static str,
     /// The instructions storing, given the address to store to; `EXIT` and `BRA .` follow.
-    instructions: fn(u64) -> [[u32; 4]; 4],
+    instructions: fn(u64) -> [[u32; 4]; 6],
     /// Value the program stores, given the address it stores to.
     expected: fn(u64) -> u32,
-    /// Registers the program runs with.
-    registers: u8,
 }
 
 // CAST: addresses are split into their low and high 32 bits.
 const VARIANTS: [Variant; 5] = [
     Variant {
-        name: "store R2, the address register",
+        name: "store R5, as first",
         instructions: |addr| {
             [
-                mov(2, addr as u32),
-                mov(3, (addr >> 32) as u32),
-                stg(2),
-                NOP,
-            ]
-        },
-        expected: |addr| addr as u32,
-        registers: REGISTERS,
-    },
-    Variant {
-        name: "store R4",
-        instructions: |addr| {
-            [
-                mov(2, addr as u32),
-                mov(3, (addr >> 32) as u32),
-                mov(4, VALUE),
-                stg(4),
+                mov(2, addr as u32, FIRST_DEPS),
+                mov(3, (addr >> 32) as u32, FIRST_DEPS),
+                mov(5, VALUE, FIRST_DEPS),
+                stg(5, FIRST_DEPS),
+                nop(deps(1, false)),
+                nop(deps(1, false)),
             ]
         },
         expected: |_| VALUE,
-        registers: REGISTERS,
     },
     Variant {
-        name: "store R5, set first",
+        name: "store R5, stalling 5 cycles without yielding (NAK)",
         instructions: |addr| {
             [
-                mov(5, VALUE),
-                mov(2, addr as u32),
-                mov(3, (addr >> 32) as u32),
-                stg(5),
+                mov(2, addr as u32, deps(1, false)),
+                mov(3, (addr >> 32) as u32, deps(1, false)),
+                mov(5, VALUE, deps(5, false)),
+                stg(5, deps(1, false)),
+                nop(deps(1, false)),
+                nop(deps(1, false)),
             ]
         },
         expected: |_| VALUE,
-        registers: REGISTERS,
     },
     Variant {
-        name: "store R5",
+        name: "store R5, 2 NOPs before the store",
         instructions: |addr| {
             [
-                mov(2, addr as u32),
-                mov(3, (addr >> 32) as u32),
-                mov(5, VALUE),
-                stg(5),
+                mov(2, addr as u32, FIRST_DEPS),
+                mov(3, (addr >> 32) as u32, FIRST_DEPS),
+                mov(5, VALUE, FIRST_DEPS),
+                nop(FIRST_DEPS),
+                nop(FIRST_DEPS),
+                stg(5, FIRST_DEPS),
             ]
         },
         expected: |_| VALUE,
-        registers: REGISTERS,
     },
     Variant {
-        name: "store R5, with 16 registers",
+        name: "store R5, a NOP first",
         instructions: |addr| {
             [
-                mov(2, addr as u32),
-                mov(3, (addr >> 32) as u32),
-                mov(5, VALUE),
-                stg(5),
+                nop(FIRST_DEPS),
+                mov(2, addr as u32, FIRST_DEPS),
+                mov(3, (addr >> 32) as u32, FIRST_DEPS),
+                mov(5, VALUE, FIRST_DEPS),
+                stg(5, FIRST_DEPS),
+                nop(deps(1, false)),
             ]
         },
         expected: |_| VALUE,
-        registers: 16,
+    },
+    Variant {
+        name: "store R5, stalling 15 cycles without yielding",
+        instructions: |addr| {
+            [
+                mov(2, addr as u32, deps(15, false)),
+                mov(3, (addr >> 32) as u32, deps(15, false)),
+                mov(5, VALUE, deps(15, false)),
+                stg(5, deps(1, false)),
+                nop(deps(1, false)),
+                nop(deps(1, false)),
+            ]
+        },
+        expected: |_| VALUE,
     },
 ];
 
@@ -221,7 +238,7 @@ fn run_on(
             write(
                 mm,
                 qmd_offset,
-                qmd(program_offset, variant.registers)
+                qmd(program_offset, REGISTERS)
                     .release(va + RELEASE, RELEASED + u32::try_from(i)?)?
                     .words(),
             )?;
