@@ -10,11 +10,16 @@ use core::ops::Range;
 
 use kernel::{
     device,
+    dma::Coherent,
     io::{
+        io_read,
+        io_write,
+        poll::read_poll_timeout,
         register::Array,
         Io, //
     },
-    prelude::*, //
+    prelude::*,
+    time::Delta, //
 };
 
 use crate::{
@@ -32,6 +37,7 @@ use crate::{
         },
         disp::{
             core_c67d,
+            notifier,
             window_c67e, //
         },
         rm::commands::{
@@ -50,6 +56,7 @@ use crate::{
         GpuMm,
         VramAddress, //
     },
+    num, //
 };
 
 use super::{
@@ -73,6 +80,16 @@ const WINDOW_CHANNEL_HANDLE: u32 = 0xc67e_0000;
 
 /// Handle of the context DMA giving the window channels access to all of VRAM, for surfaces.
 const VRAM_CTXDMA: u32 = 0xfb00_0000;
+/// Handle of the context DMA of the window's notifier, after nouveau's.
+const NOTIFIER_CTXDMA: u32 = 0xf000_0000;
+
+/// Number of 32-bit words of the window's notifier buffer: a context DMA covers whole 256-byte
+/// blocks.
+const NOTIFIER_WORDS: usize = 256 / size_of::<u32>();
+static_assert!(num::u32_as_usize(notifier::SIZE) <= NOTIFIER_WORDS * size_of::<u32>());
+
+/// How long an update may take to begin: a frame, even at the lowest refresh rates, with margin.
+const UPDATE_TIMEOUT: Delta = Delta::from_millis(500);
 
 /// The window Nova shows surfaces on: window 0, which belongs to head 0.
 const WINDOW: usize = 0;
@@ -131,6 +148,8 @@ struct Channels<'a> {
     core_push: PushBuffer<'a>,
     _window: Handle<DisplayWindowChannel>,
     window_push: PushBuffer<'a>,
+    /// Notifier of the window's updates, at the start of the buffer.
+    notifier: Coherent<'a, [u32; NOTIFIER_WORDS]>,
 }
 
 impl<'a> DisplayEngine<'a> {
@@ -274,12 +293,24 @@ impl<'a> Channels<'a> {
             // Surfaces are taken from anywhere in VRAM.
             instmem.bind_vram(mm, client, DmaChannel::Window(WINDOW), VRAM_CTXDMA, vram)?;
 
+            let notifier = Coherent::<[u32; NOTIFIER_WORDS]>::zeroed(dev, GFP_KERNEL)?;
+            let start = notifier.dma_address();
+            let end = start + u64::try_from(NOTIFIER_WORDS * size_of::<u32>())?;
+            instmem.bind_coherent(
+                mm,
+                client,
+                DmaChannel::Window(WINDOW),
+                NOTIFIER_CTXDMA,
+                start..end,
+            )?;
+
             let mut channels = Self {
                 root,
                 _core: core,
                 core_push,
                 _window: window,
                 window_push,
+                notifier,
             };
             channels.check_core(dev, bar)?;
             Ok(channels)
@@ -312,7 +343,8 @@ impl<'a> Channels<'a> {
         Ok(())
     }
 
-    /// Points the window at `surface`, shown 1:1, and updates it.
+    /// Points the window at `surface`, shown 1:1, and updates it, returning once the update began
+    /// taking effect: from then on, the surface shown before isn't read anymore.
     ///
     /// The window bypasses composition, as NVIDIA's driver does to show a console: it is shown as
     /// it is, which needs neither an input LUT on the window nor an output LUT on the head. The
@@ -333,6 +365,9 @@ impl<'a> Channels<'a> {
         ];
 
         let methods = [
+            // The update reports its progress in the notifier.
+            (SET_CONTEXT_DMA_NOTIFIER, NOTIFIER_CTXDMA),
+            (SET_NOTIFIER_CONTROL, NOTIFIER_MODE_WRITE),
             // At most one new surface per frame, switching between frames.
             (SET_PRESENT_CONTROL, 1),
             (SET_SIZE, size),
@@ -359,9 +394,20 @@ impl<'a> Channels<'a> {
         }
         push.push(bar, SET_FMT_COEFFICIENT_C00, &IDENTITY)?;
         push.push(bar, UPDATE, &[1])?;
-        push.kick(bar)?;
 
-        push.wait_idle(bar)
+        // The status is in bits 31:30 of the notifier's first word, the rest of which the update
+        // writes.
+        io_write!(self.notifier, [build: 0], notifier::STATUS_NOT_BEGUN << 30);
+        push.kick(bar)?;
+        push.wait_idle(bar)?;
+
+        read_poll_timeout(
+            || Ok(io_read!(self.notifier, [build: 0]) >> 30),
+            |&status| matches!(status, notifier::STATUS_BEGUN | notifier::STATUS_FINISHED),
+            Delta::from_micros(50),
+            UPDATE_TIMEOUT,
+        )
+        .map(|_| ())
     }
 }
 

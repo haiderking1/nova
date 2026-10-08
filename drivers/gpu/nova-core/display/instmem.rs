@@ -43,6 +43,8 @@ const CTXDMA_SIZE: u64 = 32;
 
 /// `NV_DMA_TARGET_NODE_PHYSICAL_NVM`: the context DMA points to VRAM.
 const CTXDMA_TARGET_VRAM: u32 = 1;
+/// `NV_DMA_TARGET_NODE_PHYSICAL_PCI_COHERENT`: the context DMA points to coherent system memory.
+const CTXDMA_TARGET_PCI_COHERENT: u32 = 3;
 /// `NV_DMA_ACCESS_READ_AND_WRITE`.
 const CTXDMA_ACCESS_READ_AND_WRITE: u32 = 1 << 2;
 
@@ -89,7 +91,38 @@ impl InstMem {
         handle: u32,
         range: Range<VramAddress>,
     ) -> Result {
-        let (start, end) = (range.start.into_raw(), range.end.into_raw());
+        let range = range.start.into_raw()..range.end.into_raw();
+
+        self.bind(mm, client, channel, handle, CTXDMA_TARGET_VRAM, range)
+    }
+
+    /// Binds a context DMA named `handle` to `channel`, giving it read and write access to the
+    /// coherent system memory at the DMA addresses in `range`, which must be 256-byte aligned.
+    ///
+    /// `client` is the RM client the channel was allocated under.
+    pub(super) fn bind_coherent(
+        &mut self,
+        mm: &mut GpuMm<'_>,
+        client: Handle<Client>,
+        channel: DmaChannel,
+        handle: u32,
+        range: Range<u64>,
+    ) -> Result {
+        self.bind(mm, client, channel, handle, CTXDMA_TARGET_PCI_COHERENT, range)
+    }
+
+    /// Binds a context DMA named `handle` to `channel`, giving it read and write access to the
+    /// pitch-linear memory in `range` of `target`.
+    fn bind(
+        &mut self,
+        mm: &mut GpuMm<'_>,
+        client: Handle<Client>,
+        channel: DmaChannel,
+        handle: u32,
+        target: u32,
+        range: Range<u64>,
+    ) -> Result {
+        let (start, end) = (range.start, range.end);
         if start % 256 != 0 || end % 256 != 0 || start >= end {
             return Err(EINVAL);
         }
@@ -107,7 +140,7 @@ impl InstMem {
         let last = (end - 1) >> 8;
         // CAST: the low and high halves of block numbers are stored separately.
         let words = [
-            CTXDMA_TARGET_VRAM | CTXDMA_ACCESS_READ_AND_WRITE,
+            target | CTXDMA_ACCESS_READ_AND_WRITE,
             first as u32,
             (first >> 32) as u32,
             last as u32,
