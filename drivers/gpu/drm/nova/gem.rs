@@ -4,7 +4,10 @@ use kernel::{
     drm,
     drm::{
         gem,
-        gem::BaseObject, //
+        gem::{
+            shmem,
+            BaseObject, //
+        },
     },
     page,
     prelude::*,
@@ -15,6 +18,9 @@ use crate::{
     driver::{NovaDevice, NovaDriver},
     file::File,
 };
+
+/// GEM object backed by system memory pages, which the display scans out through shadow planes.
+pub(crate) type NovaGemObject = shmem::Object<NovaObject>;
 
 /// GEM Object inner driver data
 #[pin_data]
@@ -31,13 +37,13 @@ impl gem::DriverObject for NovaObject {
 
 impl NovaObject {
     /// Create a new DRM GEM object.
-    pub(crate) fn new(dev: &NovaDevice, size: usize) -> Result<ARef<gem::Object<Self>>> {
+    pub(crate) fn new(dev: &NovaDevice, size: usize) -> Result<ARef<NovaGemObject>> {
         if size == 0 {
             return Err(EINVAL);
         }
         let aligned_size = page::page_align(size).ok_or(EINVAL)?;
 
-        gem::Object::<Self>::new(dev, aligned_size, ())
+        shmem::Object::new(dev, aligned_size, Default::default(), ())
     }
 
     /// Look up a GEM object handle for a `File` and return an `ObjectRef` for it.
@@ -45,7 +51,7 @@ impl NovaObject {
     pub(crate) fn lookup_handle(
         file: &drm::File<File>,
         handle: u32,
-    ) -> Result<ARef<gem::Object<Self>>> {
-        gem::Object::lookup_handle(file, handle)
+    ) -> Result<ARef<NovaGemObject>> {
+        NovaGemObject::lookup_handle(file, handle)
     }
 }

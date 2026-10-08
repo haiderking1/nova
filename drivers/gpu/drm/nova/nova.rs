@@ -5,6 +5,7 @@
 mod driver;
 mod file;
 mod gem;
+mod kms;
 
 use crate::driver::NovaDriver;
 

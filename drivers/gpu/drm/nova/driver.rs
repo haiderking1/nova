@@ -8,15 +8,15 @@ use kernel::{
     },
     drm::{
         self,
-        gem,
-        ioctl, //
+        ioctl,
+        kms::modes::OwnedDisplayMode, //
     },
     prelude::*,
     sync::aref::ARef, //
 };
 
 use crate::file::File;
-use crate::gem::NovaObject;
+use crate::gem::NovaGemObject;
 
 use nova_core::api::{
     NovaCoreApi,
@@ -24,6 +24,12 @@ use nova_core::api::{
 };
 
 pub(crate) struct NovaDriver;
+
+/// Data of the DRM device.
+pub(crate) struct NovaData {
+    /// Mode of the display the system firmware set up, the only one nova-drm can drive yet.
+    pub(crate) boot_display: Option<OwnedDisplayMode>,
+}
 
 pub(crate) struct Nova<'bound> {
     #[expect(unused)]
@@ -68,10 +74,21 @@ impl auxiliary::Driver for NovaDriver {
         adev: &'bound auxiliary::Device<Core<'_>>,
         _info: &'bound Self::IdInfo,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
-        let drm = drm::UnregisteredDevice::<Self>::new(adev, Ok(()))?;
-        let reg_data = DrmRegData {
-            api: NovaCoreApi::of(adev)?,
-        };
+        let api = NovaCoreApi::of(adev)?;
+        let boot_display = api
+            .with(|api| api.boot_display_mode())
+            .map(|mode| -> Result<_> {
+                Ok(OwnedDisplayMode::simple(
+                    mode.width.try_into()?,
+                    mode.height.try_into()?,
+                    0,
+                    0,
+                ))
+            })
+            .transpose()?;
+
+        let drm = drm::UnregisteredDevice::<Self>::new(adev, Ok(NovaData { boot_display }))?;
+        let reg_data = DrmRegData { api };
         // SAFETY: `reg` is stored in `Nova` and dropped when the driver is unbound; it is
         // never forgotten.
         let reg = unsafe { drm::Registration::new(adev.as_ref(), drm, reg_data, 0)? };
@@ -85,12 +102,12 @@ impl auxiliary::Driver for NovaDriver {
 
 #[vtable]
 impl drm::Driver for NovaDriver {
-    type Data = ();
+    type Data = NovaData;
     type RegistrationData<'a> = DrmRegData<'a>;
     type File = File;
-    type Object = gem::Object<NovaObject>;
+    type Object = NovaGemObject;
     type ParentDevice<Ctx: DeviceContext> = auxiliary::Device<Ctx>;
-    type Kms = drm::kms::NoKms<Self>;
+    type Kms = Self;
 
     const INFO: drm::DriverInfo = INFO;
     const FEAT_RENDER: bool = true;
