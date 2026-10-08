@@ -30,8 +30,10 @@ use crate::{
             DmaUnsetPageDirectory,
             RmAlloc,
             RmControl,
-            RmFree, //
+            RmFree,
+            VaspaceCopyServerReservedPdes, //
         },
+        ServerReservedLevel, RM_SERVER_VA,
     },
     mm::{
         pagetable::{
@@ -45,9 +47,11 @@ use crate::{
         ContiguousVram,
         GpuMm,
         Pfn,
+        VirtualAddress,
         VramAddress,
         PAGE_SIZE, //
     },
+    num,
 };
 
 /// Size of the address spaces of channels: plenty for kernel channels.
@@ -55,8 +59,20 @@ const VA_SIZE: u64 = 1 << 40;
 /// Start of the addresses mapped: those below are left unmapped, so that null pointers fault.
 const VA_START: u64 = 1 << 16;
 /// Start of the addresses of aligned mappings, away from the other mappings, which take the
-/// lowest free addresses.
-const ALIGNED_VA_START: u64 = 1 << 32;
+/// lowest free addresses, and from GSP-RM's part of split address spaces.
+const ALIGNED_VA_START: u64 = 1 << 33;
+static_assert!(RM_SERVER_VA.end <= ALIGNED_VA_START);
+
+/// How GSP-RM sees an address space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mode {
+    /// Nova owns the page tables, and GSP-RM is only told about the root page directory.
+    ClientOwned,
+    /// The address space is split between Nova and GSP-RM, which maps buffers of its own in
+    /// [`RM_SERVER_VA`], as building the golden context of the graphics engine needs. GSP-RM is
+    /// given the page directories above its part with [`AddressSpace::share_with_rm`].
+    Split,
+}
 
 /// A GPU virtual address space whose page tables Nova owns.
 ///
@@ -65,6 +81,8 @@ pub(crate) struct AddressSpace {
     client: Handle<Client>,
     device: Handle<Device>,
     handle: Handle<VaSpace>,
+    mode: Mode,
+    mmu_version: MmuVersion,
     /// The root page directory.
     _pdb: ContiguousVram,
     vmm: Vmm,
@@ -73,7 +91,8 @@ pub(crate) struct AddressSpace {
 }
 
 impl AddressSpace {
-    /// Allocates an empty address space named `handle` under `device` of `client`.
+    /// Allocates an empty address space named `handle` in `mode` under `device` of `client`.
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         dev: &device::Device,
         cmdq: &Cmdq<'_>,
@@ -82,6 +101,7 @@ impl AddressSpace {
         client: Handle<Client>,
         device: Handle<Device>,
         handle: u32,
+        mode: Mode,
     ) -> Result<Self> {
         // An empty root page directory: no mappings.
         let pdb = mm.alloc_contiguous(SZ_4K, Alignment::new::<SZ_4K>())?;
@@ -90,33 +110,96 @@ impl AddressSpace {
         let vmm = Vmm::new(pdb_addr, mmu_version, VA_SIZE)?;
         vmm.reserve(0..VA_START)?;
 
-        let handle = RmAlloc::new(
-            client,
-            device,
-            Handle::new(handle),
-            AllocVaSpace::externally_owned(),
-        )
-        .send(dev, cmdq)?;
+        let handle = match mode {
+            Mode::ClientOwned => {
+                let handle = RmAlloc::new(
+                    client,
+                    device,
+                    Handle::new(handle),
+                    AllocVaSpace::externally_owned(),
+                )
+                .send(dev, cmdq)?;
 
-        let num_entries = u32::try_from(mmu_version.pdb_entries())?;
-        RmControl::new(
-            client,
-            device,
-            DmaSetPageDirectory::new(handle, pdb_addr, num_entries),
-        )
-        .send(dev, cmdq)
-        .inspect_err(|_| {
-            let _ = RmFree::new(client, handle).send(dev, cmdq);
-        })?;
+                let num_entries = u32::try_from(mmu_version.pdb_entries())?;
+                RmControl::new(
+                    client,
+                    device,
+                    DmaSetPageDirectory::new(handle, pdb_addr, num_entries),
+                )
+                .send(dev, cmdq)
+                .inspect_err(|_| {
+                    let _ = RmFree::new(client, handle).send(dev, cmdq);
+                })?;
+
+                handle
+            }
+            Mode::Split => {
+                // Nova mustn't map anything in GSP-RM's part.
+                vmm.reserve(RM_SERVER_VA)?;
+
+                RmAlloc::new(client, device, Handle::new(handle), AllocVaSpace::split())
+                    .send(dev, cmdq)?
+            }
+        };
 
         Ok(Self {
             client,
             device,
             handle,
+            mode,
+            mmu_version,
             _pdb: pdb,
             vmm,
             next_aligned: ALIGNED_VA_START,
         })
+    }
+
+    /// Gives GSP-RM the page directories above its part of the address space, which must be split.
+    /// They must exist: something must be mapped below the first 512 GiB.
+    pub(crate) fn share_with_rm(
+        &self,
+        dev: &device::Device,
+        cmdq: &Cmdq<'_>,
+        mm: &mut GpuMm<'_>,
+    ) -> Result {
+        if self.mode != Mode::Split {
+            return Err(EINVAL);
+        }
+
+        // The levels down to the one whose entries cover GSP-RM's part.
+        let rm_size = RM_SERVER_VA.end - RM_SERVER_VA.start;
+        let rm_start = VirtualAddress::from_raw(RM_SERVER_VA.start);
+        let mut levels = KVec::new();
+        for depth in 0.. {
+            let layout = self.mmu_version.directory_layout(depth).ok_or(EINVAL)?;
+            let entry_size = 1u64 << layout.va_shift;
+            if entry_size < rm_size {
+                return Err(EINVAL);
+            }
+            let addr = self.vmm.directory_at(mm, rm_start, depth)?.ok_or(ENOENT)?;
+            levels.push(
+                ServerReservedLevel {
+                    addr: addr.into_raw(),
+                    size: num::usize_as_u64(layout.size),
+                    va_shift: u8::try_from(layout.va_shift)?,
+                },
+                GFP_KERNEL,
+            )?;
+
+            if entry_size == rm_size {
+                return Ok(RmControl::new(
+                    self.client,
+                    self.handle,
+                    VaspaceCopyServerReservedPdes::new(&levels, entry_size)?,
+                )
+                .send(dev, cmdq)
+                .inspect_err(|e| {
+                    dev_err!(dev, "GSP-RM rejected the split address space: {:?}\n", e)
+                })?);
+            }
+        }
+
+        Err(EINVAL)
     }
 
     /// Returns the RM handle of the address space.
@@ -188,6 +271,10 @@ impl AddressSpace {
     /// Releases the address space from GSP-RM. Its page tables are freed when it is dropped, so
     /// no channel may use it anymore.
     pub(crate) fn free(&self, dev: &device::Device, cmdq: &Cmdq<'_>) -> Result {
+        if self.mode == Mode::Split {
+            return Ok(RmFree::new(self.client, self.handle).send(dev, cmdq)?);
+        }
+
         let unset = RmControl::new(
             self.client,
             self.device,

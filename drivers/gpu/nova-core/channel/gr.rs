@@ -54,7 +54,10 @@ use crate::{
     num,
 };
 
-use super::gpfifo::Channel;
+use super::{
+    gpfifo::Channel,
+    vaspace::Mode, //
+};
 
 /// Handle of the 3D object allocated to build the golden context.
 const THREE_D_HANDLE: u32 = 0xc797_0000;
@@ -141,7 +144,9 @@ fn promote(
         command.push(entry)?;
     }
 
-    Ok(RmControl::new(rm.client(), rm.subdevice(), command).send(dev, cmdq)?)
+    Ok(RmControl::new(rm.client(), rm.subdevice(), command)
+        .send(dev, cmdq)
+        .inspect_err(|e| dev_err!(dev, "gr: GSP-RM rejected the context buffers: {:?}\n", e))?)
 }
 
 /// The context of the graphics engine: the layout of its context buffers, and the global ones.
@@ -232,7 +237,18 @@ impl GrContext {
         chid: u32,
     ) -> Result {
         // The golden context is built when the 3D object is allocated: the channel runs no work.
-        let mut channel = Channel::new(dev, cmdq, mm, chipset, rm, self.engine, chid, false)?;
+        let mut channel = Channel::new(
+            dev,
+            cmdq,
+            mm,
+            chipset,
+            rm,
+            self.engine,
+            chid,
+            false,
+            // GSP-RM maps buffers of its own to build the golden context.
+            Mode::Split,
+        )?;
         let mut own = KVec::new();
         let mut mappings = KVec::new();
 
@@ -338,7 +354,17 @@ impl<'a> ComputeChannel<'a> {
         context: &GrContext,
         chid: u32,
     ) -> Result<Self> {
-        let channel = Channel::new(dev, cmdq, mm, chipset, rm, context.engine, chid, true)?;
+        let channel = Channel::new(
+            dev,
+            cmdq,
+            mm,
+            chipset,
+            rm,
+            context.engine,
+            chid,
+            true,
+            Mode::ClientOwned,
+        )?;
         let mut compute = Self {
             channel,
             _buffers: KVec::new(),

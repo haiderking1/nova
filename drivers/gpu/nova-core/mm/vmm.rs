@@ -231,6 +231,17 @@ impl Vmm {
         self.pt_walk.walk_to_pte(mm, vfn)
     }
 
+    /// Returns the address of the page directory `depth` levels below the root one used for the
+    /// virtual address `va`, if it exists.
+    pub(crate) fn directory_at(
+        &self,
+        mm: &mut GpuMm<'_>,
+        va: VirtualAddress,
+        depth: usize,
+    ) -> Result<Option<VramAddress>> {
+        self.pt_walk.directory_at(mm, Vfn::from(va), depth)
+    }
+
     /// Read the [`Pfn`] for a mapped [`Vfn`] if one is mapped.
     pub(super) fn read_mapping(&self, mm: &mut GpuMm<'_>, vfn: Vfn) -> Result<Option<Pfn>> {
         match self.pt_walk.walk_to_pte(mm, vfn)? {

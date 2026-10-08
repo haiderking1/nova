@@ -33,7 +33,10 @@ use crate::{
     },
 };
 
-use super::gpfifo::Channel;
+use super::{
+    gpfifo::Channel,
+    vaspace::Mode, //
+};
 
 /// Handle of the copy engine object of the channel.
 const COPY_ENGINE_HANDLE: u32 = 0xc7b5_0000;
@@ -62,7 +65,17 @@ impl<'a> CopyChannel<'a> {
         let index = engine.copy_engine_index().ok_or(ENODEV)?;
         dev_dbg!(dev, "channel: copy engine {:?}\n", engine);
 
-        let mut channel = Channel::new(dev, cmdq, mm, chipset, rm, engine, super::COPY_CHID, true)?;
+        let mut channel = Channel::new(
+            dev,
+            cmdq,
+            mm,
+            chipset,
+            rm,
+            engine,
+            super::COPY_CHID,
+            true,
+            Mode::ClientOwned,
+        )?;
         if let Err(err) = channel.alloc_object(
             dev,
             cmdq,

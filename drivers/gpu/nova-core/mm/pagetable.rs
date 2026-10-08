@@ -55,12 +55,40 @@ impl From<Architecture> for MmuVersion {
     }
 }
 
+/// Layout of a page directory level.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DirectoryLayout {
+    /// Size in bytes of a directory of the level.
+    pub(crate) size: usize,
+    /// Position of the lowest virtual address bit indexing the level: an entry covers
+    /// `1 << va_shift` bytes.
+    pub(crate) va_shift: u32,
+}
+
 impl MmuVersion {
     /// Returns the number of entries of the root page directory of an address space.
     pub(crate) fn pdb_entries(self) -> usize {
         match self {
             Self::V2 => MmuV2::entries_per_page(PageTableLevel::Pdb),
             Self::V3 => MmuV3::entries_per_page(PageTableLevel::Pdb),
+        }
+    }
+
+    /// Returns the layout of the page directory level `depth` levels below the root one, if
+    /// there is such a page directory level.
+    pub(crate) fn directory_layout(self, depth: usize) -> Option<DirectoryLayout> {
+        fn layout<M: MmuConfig>(depth: usize) -> Option<DirectoryLayout> {
+            let level = *M::PDE_LEVELS.get(depth)?;
+
+            Some(DirectoryLayout {
+                size: M::entries_per_page(level) * M::entry_size(level),
+                va_shift: M::va_shift(level),
+            })
+        }
+
+        match self {
+            Self::V2 => layout::<MmuV2>(depth),
+            Self::V3 => layout::<MmuV3>(depth),
         }
     }
 }
@@ -268,6 +296,10 @@ pub(super) trait MmuConfig: 'static {
     /// Extract the page table index at `level` from `va`.
     fn level_index(va: VirtualAddress, level: u64) -> u64;
 
+    /// Returns the position of the lowest virtual address bit indexing `level`: an entry of
+    /// `level` covers `1 << va_shift(level)` bytes.
+    fn va_shift(level: PageTableLevel) -> u32;
+
     /// Get the entry size in bytes for a given level.
     fn entry_size(level: PageTableLevel) -> usize {
         if level == Self::DUAL_PDE_LEVEL {
@@ -327,6 +359,17 @@ impl MmuConfig for MmuV2 {
     fn level_index(va: VirtualAddress, level: u64) -> u64 {
         ver2::VirtualAddressV2::new(va).level_index(level)
     }
+
+    fn va_shift(level: PageTableLevel) -> u32 {
+        // See `VirtualAddressV2`.
+        match level {
+            PageTableLevel::Pdb => 47,
+            PageTableLevel::L1 => 38,
+            PageTableLevel::L2 => 29,
+            PageTableLevel::L3 => 21,
+            PageTableLevel::L4 | PageTableLevel::L5 => 12,
+        }
+    }
 }
 
 /// Marker struct for MMU v3 (Hopper and later).
@@ -351,6 +394,18 @@ impl MmuConfig for MmuV3 {
 
     fn level_index(va: VirtualAddress, level: u64) -> u64 {
         ver3::VirtualAddressV3::new(va).level_index(level)
+    }
+
+    fn va_shift(level: PageTableLevel) -> u32 {
+        // See `VirtualAddressV3`.
+        match level {
+            PageTableLevel::Pdb => 56,
+            PageTableLevel::L1 => 47,
+            PageTableLevel::L2 => 38,
+            PageTableLevel::L3 => 29,
+            PageTableLevel::L4 => 21,
+            PageTableLevel::L5 => 12,
+        }
     }
 }
 

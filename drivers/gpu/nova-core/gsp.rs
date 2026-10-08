@@ -38,7 +38,9 @@ pub(crate) use fw::{
         EngineInfo,
         GrContextBuffer,
         PromoteEntry,
+        ServerReservedLevel,
         DISP_PUSHBUFFER_SIZE,
+        RM_SERVER_VA,
         GR_CONTEXT_BUFFERS,
         GR_UNRESTRICTED_PRIV_ACCESS_MAP, //
     },

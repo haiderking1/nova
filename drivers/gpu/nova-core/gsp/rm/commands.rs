@@ -700,9 +700,15 @@ impl RmAllocCommand for AllocWindowChannelGa102 {
 pub(crate) struct AllocVaSpace(VaSpaceAllocParams);
 
 impl AllocVaSpace {
-    /// Creates the command.
+    /// Creates the command for an address space whose page tables the client owns.
     pub(crate) fn externally_owned() -> Self {
         Self(VaSpaceAllocParams::externally_owned())
+    }
+
+    /// Creates the command for an address space split between the client and GSP-RM: see
+    /// [`VaspaceCopyServerReservedPdes`].
+    pub(crate) fn split() -> Self {
+        Self(VaSpaceAllocParams::split())
     }
 }
 
@@ -992,6 +998,27 @@ rm_control!(
     Subdevice,
     GpuPromoteCtx,
     PromoteCtxParams,
+    (),
+    |_p| ()
+);
+
+/// RM control command giving GSP-RM the page directories above its part of a split address
+/// space, [`RM_SERVER_VA`], sent to the address space. GSP-RM then uses the client's page tables,
+/// and fills the entry of the last level covering its part.
+pub(crate) struct VaspaceCopyServerReservedPdes(CopyServerReservedPdesParams);
+
+impl VaspaceCopyServerReservedPdes {
+    /// Creates the command, see [`CopyServerReservedPdesParams::new`].
+    pub(crate) fn new(levels: &[ServerReservedLevel], entry_size: u64) -> Result<Self> {
+        Ok(Self(CopyServerReservedPdesParams::new(levels, entry_size)?))
+    }
+}
+
+rm_control!(
+    VaspaceCopyServerReservedPdes,
+    VaSpace,
+    VaspaceCopyServerReservedPdes,
+    CopyServerReservedPdesParams,
     (),
     |_p| ()
 );

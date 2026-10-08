@@ -57,6 +57,8 @@ pub(crate) enum RmControlMsgFunction {
         bindings::NV2080_CTRL_CMD_INTERNAL_STATIC_KGR_GET_CONTEXT_BUFFERS_INFO,
     /// Give the context buffers of a channel to GSP-RM.
     GpuPromoteCtx = bindings::NV2080_CTRL_CMD_GPU_PROMOTE_CTX,
+    /// Give GSP-RM the page directories above its part of a split address space.
+    VaspaceCopyServerReservedPdes = bindings::NV90F1_CTRL_CMD_VASPACE_COPY_SERVER_RESERVED_PDES,
 }
 
 // TODO[FPRI]: This is a temporary solution to be replaced with the corresponding derive macros
@@ -95,6 +97,9 @@ impl TryFrom<u32> for RmControlMsgFunction {
                 Ok(Self::InternalStaticKgrGetContextBuffersInfo)
             }
             bindings::NV2080_CTRL_CMD_GPU_PROMOTE_CTX => Ok(Self::GpuPromoteCtx),
+            bindings::NV90F1_CTRL_CMD_VASPACE_COPY_SERVER_RESERVED_PDES => {
+                Ok(Self::VaspaceCopyServerReservedPdes)
+            }
             _ => Err(EINVAL),
         }
     }
@@ -626,7 +631,21 @@ impl VaSpaceAllocParams {
             ..Default::default()
         })
     }
+
+    /// Creates the parameters to allocate a new GPU virtual address space split between the client
+    /// and GSP-RM: GSP-RM maps its own buffers in [`RM_SERVER_VA`], whose page directories the
+    /// client gives it with [`CopyServerReservedPdesParams`].
+    pub(crate) fn split() -> Self {
+        Self(bindings::NV_VASPACE_ALLOCATION_PARAMETERS {
+            index: bindings::NV_VASPACE_ALLOCATION_INDEX_GPU_NEW,
+            ..Default::default()
+        })
+    }
 }
+
+/// The part of a split address space GSP-RM maps its own buffers in: where it expects it
+/// (`SPLIT_VAS_SERVER_RM_MANAGED_VA_START` and `_SIZE` in RM's `gpu_vaspace.h`).
+pub(crate) const RM_SERVER_VA: core::ops::Range<u64> = 0x1_0000_0000..0x1_2000_0000;
 
 // SAFETY: Padding is explicit and will not contain uninitialized data.
 unsafe impl AsBytes for VaSpaceAllocParams {}
@@ -1150,3 +1169,52 @@ unsafe impl FromBytes for PromoteCtxParams {}
 
 // SAFETY: Padding is explicit and will not contain uninitialized data.
 unsafe impl AsBytes for PromoteCtxParams {}
+
+/// A page directory level given to GSP-RM with [`CopyServerReservedPdesParams`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ServerReservedLevel {
+    /// VRAM address of the page directory.
+    pub(crate) addr: u64,
+    /// Size of the page directory in bytes.
+    pub(crate) size: u64,
+    /// Position of the lowest virtual address bit indexing the level.
+    pub(crate) va_shift: u8,
+}
+
+/// Wrapper for [`bindings::NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS`].
+#[repr(transparent)]
+pub(crate) struct CopyServerReservedPdesParams(
+    bindings::NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS,
+);
+
+impl CopyServerReservedPdesParams {
+    /// Creates the parameters giving GSP-RM `levels`, the page directories in VRAM above
+    /// [`RM_SERVER_VA`] from the root one down, whose last level's entries cover `entry_size`
+    /// bytes.
+    pub(crate) fn new(levels: &[ServerReservedLevel], entry_size: u64) -> Result<Self> {
+        let mut params = bindings::NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS {
+            pageSize: entry_size,
+            virtAddrLo: RM_SERVER_VA.start,
+            virtAddrHi: RM_SERVER_VA.end - 1,
+            numLevelsToCopy: u32::try_from(levels.len())?,
+            ..Default::default()
+        };
+        if levels.len() > params.levels.len() {
+            return Err(EINVAL);
+        }
+        for (dst, level) in params.levels.iter_mut().zip(levels) {
+            dst.physAddress = level.addr;
+            dst.size = level.size;
+            dst.aperture = bindings::GMMU_APERTURE_GMMU_APERTURE_VIDEO;
+            dst.pageShift = level.va_shift;
+        }
+
+        Ok(Self(params))
+    }
+}
+
+// SAFETY: This struct only contains integer types for which all bit patterns are valid.
+unsafe impl FromBytes for CopyServerReservedPdesParams {}
+
+// SAFETY: Padding is explicit and will not contain uninitialized data.
+unsafe impl AsBytes for CopyServerReservedPdesParams {}

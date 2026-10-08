@@ -168,6 +168,33 @@ impl<M: MmuConfig> PtWalkInner<M> {
         })
     }
 
+    /// Returns the address of the page directory `depth` levels below the root one used for
+    /// `vfn`, if it exists.
+    pub(super) fn directory_at(
+        &self,
+        mm: &mut GpuMm<'_>,
+        vfn: Vfn,
+        depth: usize,
+    ) -> Result<Option<VramAddress>> {
+        let va = VirtualAddress::from(vfn);
+        let pramin = mm.pramin_mut();
+        let mut table = self.pdb_addr;
+
+        for &level in M::PDE_LEVELS.get(..depth).ok_or(EINVAL)? {
+            if level == M::DUAL_PDE_LEVEL {
+                return Err(EINVAL);
+            }
+            let idx = M::level_index(va, level.as_index());
+            let pde = M::Pde::read(pramin, Self::entry_addr(table, level, idx))?;
+            if !pde.is_valid_vram() {
+                return Ok(None);
+            }
+            table = pde.table_vram_address();
+        }
+
+        Ok(Some(table))
+    }
+
     /// Walk to PTE for lookup only (no allocation).
     ///
     /// Returns [`WalkResult::PageTableMissing`] if intermediate tables don't exist.
@@ -240,5 +267,16 @@ impl PtWalk {
     /// Walk to PTE for lookup.
     pub(in crate::mm) fn walk_to_pte(&self, mm: &mut GpuMm<'_>, vfn: Vfn) -> Result<WalkResult> {
         pt_walk_dispatch!(self, walk_to_pte_lookup(mm, vfn))
+    }
+
+    /// Returns the address of the page directory `depth` levels below the root one used for
+    /// `vfn`, if it exists.
+    pub(in crate::mm) fn directory_at(
+        &self,
+        mm: &mut GpuMm<'_>,
+        vfn: Vfn,
+        depth: usize,
+    ) -> Result<Option<VramAddress>> {
+        pt_walk_dispatch!(self, directory_at(mm, vfn, depth))
     }
 }

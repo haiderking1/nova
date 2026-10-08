@@ -62,7 +62,10 @@ use crate::{
     regs, //
 };
 
-use super::vaspace::AddressSpace;
+use super::vaspace::{
+    AddressSpace,
+    Mode, //
+};
 
 /// Handle of the address space of a channel, after nouveau's, completed with the channel's ID.
 const VA_SPACE_HANDLE: u32 = 0x90f1_0000;
@@ -114,8 +117,9 @@ pub(crate) struct Channel<'a> {
 
 impl<'a> Channel<'a> {
     /// Allocates channel `chid` on `engine` under the device of `rm`, in an address space of its
-    /// own. Unless `scheduled`, the channel is only allocated: it is neither bound to its engine
-    /// nor scheduled, so it can't run work.
+    /// own in `mode`. Unless `scheduled`, the channel is only allocated: it is neither bound to its
+    /// engine nor scheduled, so it can't run work.
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         dev: &'a device::Device<device::Bound>,
         cmdq: &Cmdq<'_>,
@@ -125,6 +129,7 @@ impl<'a> Channel<'a> {
         engine: EngineInfo,
         chid: u32,
         scheduled: bool,
+        mode: Mode,
     ) -> Result<Self> {
         let (client, device) = (rm.client(), rm.device());
 
@@ -151,6 +156,7 @@ impl<'a> Channel<'a> {
             client,
             device,
             VA_SPACE_HANDLE | chid,
+            mode,
         )?;
 
         let mut channel = Self {
@@ -175,6 +181,11 @@ impl<'a> Channel<'a> {
                     .map_vram(mm, channel.control.range(), Access::READ_WRITE)?;
             let gpfifo = control_mapped.start().into_raw() + num::usize_as_u64(GPFIFO);
             channel.control_mapped = Some(control_mapped);
+
+            // The control memory's mapping created the page directories GSP-RM takes.
+            if mode == Mode::Split {
+                channel.address_space.share_with_rm(dev, cmdq, mm)?;
+            }
 
             let memory = ChannelMemory {
                 instance: channel.instance.range().start.into_raw(),
@@ -240,7 +251,16 @@ impl<'a> Channel<'a> {
     {
         Ok(
             RmAlloc::new(self.client, self.handle()?, Handle::new(handle), command)
-                .send(dev, cmdq)?,
+                .send(dev, cmdq)
+                .inspect_err(|e| {
+                    dev_err!(
+                        dev,
+                        "channel {}: can't allocate an object of class {:#x}: {:?}\n",
+                        self.chid,
+                        u32::from(A::CLASS),
+                        e
+                    )
+                })?,
         )
     }
 
