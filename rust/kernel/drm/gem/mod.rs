@@ -381,7 +381,6 @@ impl<T: DriverObject, Ctx: DeviceContext> AllocImpl for Object<T, Ctx> {
         gem_prime_import_sg_table: None,
         dumb_create: None,
         dumb_map_offset: None,
-        fbdev_probe: None,
     };
 }
 
