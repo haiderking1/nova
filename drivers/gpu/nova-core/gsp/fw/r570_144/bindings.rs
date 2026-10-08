@@ -33,6 +33,10 @@ impl<T> ::core::fmt::Debug for __IncompleteArrayField<T> {
 pub const NV2080_CTRL_GPU_SET_POWER_STATE_GPU_LEVEL_0: u32 = 0;
 pub const NV2080_CTRL_GPU_SET_POWER_STATE_GPU_LEVEL_3: u32 = 3;
 pub const NV2080_CTRL_GPU_SET_POWER_STATE_GPU_LEVEL_7: u32 = 7;
+pub const NV0073_CTRL_CMD_SYSTEM_GET_NUM_HEADS: u32 = 7536898;
+pub const NV0073_CTRL_CMD_SYSTEM_GET_ACTIVE: u32 = 7536908;
+pub const NV20_SUBDEVICE_0: u32 = 8320;
+pub const NV01_ROOT: u32 = 0;
 pub const NV_VGPU_MSG_SIGNATURE_VALID: u32 = 1129337430;
 pub const GSP_FW_HEAP_PARAM_OS_SIZE_LIBOS2: u32 = 0;
 pub const GSP_FW_HEAP_PARAM_OS_SIZE_LIBOS3_BAREMETAL: u32 = 23068672;
@@ -50,6 +54,43 @@ pub const GSP_FW_WPR_META_MAGIC: i64 = -2577556379034558285;
 pub const REGISTRY_TABLE_ENTRY_TYPE_DWORD: u32 = 1;
 pub const GSP_MSG_QUEUE_ELEMENT_SIZE_MAX: u32 = 65536;
 pub const NV2080_CTRL_CMD_CE_GET_FAULT_METHOD_BUFFER_SIZE: u32 = 545270280;
+pub const NV04_DISPLAY_COMMON: u32 = 115;
+pub const NV01_DEVICE_0: u32 = 128;
+pub const NV0073_CTRL_CMD_SPECIFIC_GET_EDID_V2: u32 = 7537221;
+pub const NV0073_CTRL_CMD_SPECIFIC_GET_CONNECTOR_DATA: u32 = 7537232;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_VGA_15_PIN: u32 = 0;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_TV_COMPOSITE: u32 = 16;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_TV_SVIDEO: u32 = 17;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_TV_HDTV_COMPONENT: u32 = 19;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_TV_SCART: u32 = 20;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_TV_COMPOSITE_SCART_OVER_EIAJ4120_BLUE: u32 = 22;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_TV_HDTV_EIAJ4120: u32 = 23;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_PC_POD_HDTV_YPRPB: u32 = 24;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_PC_POD_SVIDEO: u32 = 25;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_PC_POD_COMPOSITE: u32 = 26;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_DVI_I_TV_SVIDEO: u32 = 32;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_DVI_I_TV_COMPOSITE: u32 = 33;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_DVI_I: u32 = 48;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_DVI_D: u32 = 49;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_ADC: u32 = 50;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_LFH_DVI_I_1: u32 = 56;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_LFH_DVI_I_2: u32 = 57;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_SPWG: u32 = 64;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_OEM: u32 = 65;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_DP_EXT: u32 = 70;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_DP_INT: u32 = 71;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_DP_MINI_EXT: u32 = 72;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_DP_SERIALIZER: u32 = 73;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_HDMI_A: u32 = 97;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_HDMI_C_MINI: u32 = 99;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_LFH_DP_1: u32 = 100;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_LFH_DP_2: u32 = 101;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_VIRTUAL_WFD: u32 = 112;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_USB_C: u32 = 113;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_DSI: u32 = 114;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_STEREO_3PIN_DIN: u32 = 115;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_USB_C_UHBR: u32 = 116;
+pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_UNKNOWN: u32 = 4294967295;
 pub type __u8 = ffi::c_uchar;
 pub type __u16 = ffi::c_ushort;
 pub type __u32 = ffi::c_uint;
@@ -538,6 +579,44 @@ pub struct NV2080_CTRL_GPU_GET_GID_INFO_PARAMS {
     pub data: [u8_; 256usize],
 }
 impl Default for NV2080_CTRL_GPU_GET_GID_INFO_PARAMS {
+    fn default() -> Self {
+        let mut s = ::core::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::core::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV0073_CTRL_SYSTEM_GET_NUM_HEADS_PARAMS {
+    pub subDeviceInstance: u32_,
+    pub flags: u32_,
+    pub numHeads: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV0073_CTRL_SYSTEM_GET_ACTIVE_PARAMS {
+    pub subDeviceInstance: u32_,
+    pub head: u32_,
+    pub flags: u32_,
+    pub displayId: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV2080_ALLOC_PARAMETERS {
+    pub subDeviceId: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone, MaybeZeroable)]
+pub struct NV0000_ALLOC_PARAMETERS {
+    pub hClient: u32_,
+    pub processID: u32_,
+    pub processName: [ffi::c_char; 100usize],
+    pub __bindgen_padding_0: [u8; 4usize],
+    pub pOsPidInfo: *mut ffi::c_void,
+}
+impl Default for NV0000_ALLOC_PARAMETERS {
     fn default() -> Self {
         let mut s = ::core::mem::MaybeUninit::<Self>::uninit();
         unsafe {
@@ -1113,11 +1192,37 @@ impl Default for GSP_FMC_BOOT_PARAMS {
 }
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NVOS00_PARAMETERS_v03_00 {
+    pub hRoot: u32_,
+    pub hObjectParent: u32_,
+    pub hObjectOld: u32_,
+    pub status: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct rpc_free_v03_00 {
+    pub params: NVOS00_PARAMETERS_v03_00,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
 pub struct rpc_unloading_guest_driver_v1F_07 {
     pub bInPMTransition: u8_,
     pub bGc6Entering: u8_,
     pub __bindgen_padding_0: [u8; 2usize],
     pub newLevel: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Default, MaybeZeroable)]
+pub struct rpc_gsp_rm_alloc_v03_00 {
+    pub hClient: u32_,
+    pub hParent: u32_,
+    pub hObject: u32_,
+    pub hClass: u32_,
+    pub status: u32_,
+    pub paramsSize: u32_,
+    pub flags: u32_,
+    pub reserved: [u8_; 4usize],
+    pub params: __IncompleteArrayField<u8_>,
 }
 #[repr(C)]
 #[derive(Debug, Default, MaybeZeroable)]
@@ -1213,4 +1318,55 @@ impl Default for GSP_SEQUENCER_BUFFER_CMD {
             s.assume_init()
         }
     }
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV0080_ALLOC_PARAMETERS {
+    pub deviceId: u32_,
+    pub hClientShare: u32_,
+    pub hTargetClient: u32_,
+    pub hTargetDevice: u32_,
+    pub flags: u32_,
+    pub __bindgen_padding_0: [u8; 4usize],
+    pub vaSpaceSize: u64_,
+    pub vaStartInternal: u64_,
+    pub vaLimitInternal: u64_,
+    pub vaMode: u32_,
+    pub __bindgen_padding_1: [u8; 4usize],
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone, MaybeZeroable)]
+pub struct NV0073_CTRL_SPECIFIC_GET_EDID_V2_PARAMS {
+    pub subDeviceInstance: u32_,
+    pub displayId: u32_,
+    pub bufferSize: u32_,
+    pub flags: u32_,
+    pub edidBuffer: [u8_; 2048usize],
+}
+impl Default for NV0073_CTRL_SPECIFIC_GET_EDID_V2_PARAMS {
+    fn default() -> Self {
+        let mut s = ::core::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::core::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV0073_CTRL_SPECIFIC_GET_CONNECTOR_DATA_PARAMS {
+    pub subDeviceInstance: u32_,
+    pub displayId: u32_,
+    pub flags: u32_,
+    pub DDCPartners: u32_,
+    pub count: u32_,
+    pub data: [NV0073_CTRL_SPECIFIC_GET_CONNECTOR_DATA_PARAMS__bindgen_ty_1; 4usize],
+    pub platform: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV0073_CTRL_SPECIFIC_GET_CONNECTOR_DATA_PARAMS__bindgen_ty_1 {
+    pub index: u32_,
+    pub type_: u32_,
+    pub location: u32_,
 }
