@@ -34,8 +34,13 @@ pub(crate) use fw::{
     fifo,
     rm::{
         ChannelMemory,
+        ContextBufferInfo,
         EngineInfo,
-        DISP_PUSHBUFFER_SIZE, //
+        GrContextBuffer,
+        PromoteEntry,
+        DISP_PUSHBUFFER_SIZE,
+        GR_CONTEXT_BUFFERS,
+        GR_UNRESTRICTED_PRIV_ACCESS_MAP, //
     },
 };
 pub(crate) use fw::{

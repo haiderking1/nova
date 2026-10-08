@@ -24,6 +24,10 @@ use kernel::{
 use crate::{
     boot_display::BootDisplay,
     bounded_enum,
+    channel::{
+        self,
+        gr::GrContext, //
+    },
     display::{
         Display,
         DisplayEngine,
@@ -49,6 +53,7 @@ use crate::{
         commands::GetGspStaticInfoReply,
         rm::device::RmDevice,
         ConnectorType,
+        EngineInfo,
         Gsp,
         GspBootContext, //
     },
@@ -429,6 +434,8 @@ pub(crate) struct Gpu<'gpu> {
     /// is still running.
     #[pin]
     display_engine: Mutex<Option<DisplayOutput<'gpu>>>,
+    /// The context of the graphics engine, once set up by [`Gpu::init_graphics()`].
+    gr: Option<GrContext>,
     /// GPU memory manager owning memory management resources.
     ///
     /// Must be kept declared *before* `gsp_resources`, so that its components are dropped while
@@ -636,6 +643,9 @@ impl<'gpu> Gpu<'gpu> {
             // Set up by `Gpu::init_display_engine()`, which needs to allocate VRAM.
             display_engine <- new_mutex!(None, "nova_display_engine"),
 
+            // Set up by `Gpu::init_graphics()`, which needs to allocate VRAM.
+            gr: None,
+
             // Create GPU memory manager owning memory management resources.
             mm: {
                 let usable_vram = gsp_static_info.usable_fb_regions.first().ok_or(ENODEV)?;
@@ -739,6 +749,38 @@ impl<'gpu> Gpu<'gpu> {
         self.bar_user.write(mapped, offset, data)
     }
 
+    /// Sets up the context of the graphics engine, which channels on it need.
+    ///
+    /// Must be done before any other channel is allocated.
+    pub(crate) fn init_graphics(self: Pin<&mut Self>) -> Result {
+        let this = self.project();
+        let gsp_resources = this.gsp_resources.as_ref().get_ref();
+        let pdev = gsp_resources.device;
+        let cmdq = &gsp_resources.gsp.cmdq;
+        let rm = this.rm.as_ref().ok_or(ENODEV)?;
+        let internal = InternalHandles {
+            client: this.gsp_static_info.client(),
+            subdevice: this.gsp_static_info.subdevice(),
+        };
+
+        let engine = channel::engines(pdev.as_ref(), cmdq, rm)?
+            .into_iter()
+            .find(EngineInfo::is_graphics)
+            .ok_or(ENODEV)?;
+        *this.gr = Some(GrContext::new(
+            pdev.as_ref(),
+            cmdq,
+            this.mm,
+            this.spec.chipset,
+            rm,
+            &internal,
+            engine,
+            channel::GOLDEN_CHID,
+        )?);
+
+        Ok(())
+    }
+
     /// Takes over the display engine from GSP-RM, so that Nova can drive displays itself.
     ///
     /// Fails with `ENOTSUPP` on GPUs whose display engine isn't supported yet.
@@ -783,6 +825,21 @@ impl<'gpu> Gpu<'gpu> {
             .inspect_err(|e| dev_err!(pdev, "channel: can't set up a copy channel: {:?}\n", e))
             .ok();
 
+            // Blue if a compute shader ran right, green otherwise.
+            let computed = this.gr.as_ref().is_some_and(|gr| {
+                crate::channel::compute_test::run(
+                    pdev.as_ref(),
+                    &gsp_resources.gsp.cmdq,
+                    gsp_resources.bar,
+                    this.mm,
+                    this.spec.chipset,
+                    this.rm.as_ref(),
+                    gr,
+                )
+                .inspect_err(|e| dev_err!(pdev, "compute test failed: {:?}\n", e))
+                .is_ok()
+            });
+
             let _ = crate::display::scanout_test::run(
                 pdev.as_ref(),
                 gsp_resources.bar,
@@ -790,6 +847,7 @@ impl<'gpu> Gpu<'gpu> {
                 &mut engine,
                 boot,
                 channel.as_mut(),
+                computed,
             );
 
             if let Some(mut channel) = channel {

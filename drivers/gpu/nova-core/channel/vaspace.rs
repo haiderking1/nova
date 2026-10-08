@@ -54,6 +54,9 @@ use crate::{
 const VA_SIZE: u64 = 1 << 40;
 /// Start of the addresses mapped: those below are left unmapped, so that null pointers fault.
 const VA_START: u64 = 1 << 16;
+/// Start of the addresses of aligned mappings, away from the other mappings, which take the
+/// lowest free addresses.
+const ALIGNED_VA_START: u64 = 1 << 32;
 
 /// A GPU virtual address space whose page tables Nova owns.
 ///
@@ -65,6 +68,8 @@ pub(crate) struct AddressSpace {
     /// The root page directory.
     _pdb: ContiguousVram,
     vmm: Vmm,
+    /// Where the next aligned mapping may start.
+    next_aligned: u64,
 }
 
 impl AddressSpace {
@@ -110,6 +115,7 @@ impl AddressSpace {
             handle,
             _pdb: pdb,
             vmm,
+            next_aligned: ALIGNED_VA_START,
         })
     }
 
@@ -126,6 +132,40 @@ impl AddressSpace {
         range: Range<VramAddress>,
         access: Access,
     ) -> Result<MappedRange> {
+        self.vmm.map_pages(mm, &Self::pfns(range)?, None, access)
+    }
+
+    /// Like [`AddressSpace::map_vram`], but at a virtual address aligned to `alignment`, a power
+    /// of two. Aligned mappings aren't meant to be torn down before the address space is freed:
+    /// their addresses aren't reused.
+    pub(crate) fn map_vram_aligned(
+        &mut self,
+        mm: &mut GpuMm<'_>,
+        range: Range<VramAddress>,
+        alignment: u64,
+        access: Access,
+    ) -> Result<MappedRange> {
+        if !alignment.is_power_of_two() {
+            return Err(EINVAL);
+        }
+        let pfns = Self::pfns(range.clone())?;
+        let start = self
+            .next_aligned
+            .checked_next_multiple_of(alignment)
+            .ok_or(ENOSPC)?;
+        let end = start
+            .checked_add(range.end - range.start)
+            .filter(|&end| end <= VA_SIZE)
+            .ok_or(ENOSPC)?;
+
+        let mapped = self.vmm.map_pages(mm, &pfns, Some(start..end), access)?;
+        self.next_aligned = end;
+
+        Ok(mapped)
+    }
+
+    /// Returns the frames of the page-aligned VRAM `range`.
+    fn pfns(range: Range<VramAddress>) -> Result<KVec<Pfn>> {
         let (start, end) = (range.start.into_raw(), range.end.into_raw());
         let page_size = u64::try_from(PAGE_SIZE)?;
         if start % page_size != 0 || end % page_size != 0 || start >= end {
@@ -137,7 +177,7 @@ impl AddressSpace {
             pfns.push(Pfn::new(pfn), GFP_KERNEL)?;
         }
 
-        self.vmm.map_pages(mm, &pfns, None, access)
+        Ok(pfns)
     }
 
     /// Tears down a mapping made by [`AddressSpace::map_vram`].

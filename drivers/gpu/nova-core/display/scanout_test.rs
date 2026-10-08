@@ -3,8 +3,9 @@
 //! Self-test of Nova's own scanout: shows a solid surface Nova allocated, then goes back to the
 //! boot display's framebuffer.
 //!
-//! With a copy channel, the GPU fills the surface with green; otherwise the CPU fills it with red.
-//! The color on screen thus tells who drew it.
+//! With a copy channel, the GPU fills the surface: with blue if a compute shader ran right before,
+//! with green otherwise. Without a copy channel, the CPU fills it with red. The color on screen
+//! thus tells what works.
 
 use kernel::{
     device,
@@ -38,6 +39,8 @@ const SHOW_TIME: Delta = Delta::from_secs(1);
 const RED: u32 = 0xff0000;
 /// Color of the test surface filled by the GPU.
 const GREEN: u32 = 0x00ff00;
+/// Color of the test surface filled by the GPU, after a compute shader ran right.
+const BLUE: u32 = 0x0000ff;
 
 /// Shows the test surface for a few seconds, then the boot display's framebuffer again.
 pub(crate) fn run(
@@ -47,6 +50,7 @@ pub(crate) fn run(
     engine: &mut DisplayEngine<'_>,
     boot: &BootDisplay,
     channel: Option<&mut CopyChannel<'_>>,
+    computed: bool,
 ) -> Result {
     if boot.format.bits_per_pixel != 32 {
         return Err(ENOTSUPP);
@@ -75,8 +79,9 @@ pub(crate) fn run(
     };
     test.check()?;
 
+    let gpu_color = if computed { BLUE } else { GREEN };
     let gpu_filled = match channel {
-        Some(channel) => gpu_fill(bar, mm, channel, fb.range(), &test, GREEN)
+        Some(channel) => gpu_fill(bar, mm, channel, fb.range(), &test, gpu_color)
             .inspect_err(|e| {
                 dev_err!(
                     dev,
@@ -98,7 +103,11 @@ pub(crate) fn run(
     dev_info!(
         dev,
         "display: showing the scanout test surface (solid {}, filled by the {})\n",
-        if gpu_filled { "green" } else { "red" },
+        match (gpu_filled, computed) {
+            (false, _) => "red",
+            (true, false) => "green",
+            (true, true) => "blue",
+        },
         if gpu_filled { "GPU" } else { "CPU" }
     );
     let shown = engine.show(bar, &test);
