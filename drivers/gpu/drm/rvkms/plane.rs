@@ -66,4 +66,5 @@ pub(crate) struct RvkmsPlaneState;
 
 impl DriverPlaneState for RvkmsPlaneState {
     type Plane = RvkmsPlane;
+    type Kind = plane::Plain;
 }

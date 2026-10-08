@@ -91,8 +91,10 @@ pub trait DriverPlane: Send + Sync + Sized {
         helper_funcs: bindings::drm_plane_helper_funcs {
             prepare_fb: None,
             cleanup_fb: None,
-            begin_fb_access: None,
-            end_fb_access: None,
+            begin_fb_access:
+                <<Self::State as DriverPlaneState>::Kind as PlaneStateKind>::Raw::BEGIN_FB_ACCESS,
+            end_fb_access:
+                <<Self::State as DriverPlaneState>::Kind as PlaneStateKind>::Raw::END_FB_ACCESS,
             atomic_check: if Self::HAS_ATOMIC_CHECK {
                 Some(atomic_check_callback::<Self>)
             } else {
@@ -529,8 +531,6 @@ pub(crate) mod private {
     }
 }
 
-pub(crate) use private::AsRawPlaneState as AsRawPlaneStatePrivate;
-
 /// A trait implemented for any type which can be constructed directly from a
 /// [`struct drm_plane_state`] pointer.
 ///
@@ -648,8 +648,244 @@ impl<T: AsRawPlaneState + ?Sized> RawPlaneState for T {}
 #[derive(Default)]
 #[repr(C)]
 pub struct PlaneState<T: DriverPlaneState> {
-    state: bindings::drm_plane_state,
+    state: <T::Kind as PlaneStateKind>::Raw,
     inner: T,
+}
+
+/// The kind of C state a [`PlaneState`] is built on, chosen with [`DriverPlaneState::Kind`].
+///
+/// - [`Plain`]: a [`struct drm_plane_state`].
+/// - [`Shadow`]: a [`struct drm_shadow_plane_state`], for planes the CPU copies to the hardware.
+///   The framebuffer is then mapped for the CPU during each commit, see
+///   [`PlaneStateMutator::read_rows()`].
+///
+/// [`struct drm_plane_state`]: srctree/include/drm/drm_plane.h
+/// [`struct drm_shadow_plane_state`]: srctree/include/drm/drm_gem_atomic_helper.h
+pub trait PlaneStateKind: Sealed + 'static {
+    /// The C state struct.
+    #[doc(hidden)]
+    type Raw: RawPlaneStateBase;
+}
+
+/// A plane state built on a plain [`struct drm_plane_state`].
+///
+/// [`struct drm_plane_state`]: srctree/include/drm/drm_plane.h
+pub enum Plain {}
+
+impl Sealed for Plain {}
+
+impl PlaneStateKind for Plain {
+    type Raw = bindings::drm_plane_state;
+}
+
+/// A plane state built on a [`struct drm_shadow_plane_state`].
+///
+/// The framebuffer is mapped for the CPU between `begin_fb_access` and `end_fb_access`, which
+/// cover the atomic update, using DRM's shadow-plane helpers.
+///
+/// [`struct drm_shadow_plane_state`]: srctree/include/drm/drm_gem_atomic_helper.h
+pub enum Shadow {}
+
+impl Sealed for Shadow {}
+
+impl PlaneStateKind for Shadow {
+    type Raw = bindings::drm_shadow_plane_state;
+}
+
+/// Type of `struct drm_plane_helper_funcs.begin_fb_access`.
+#[doc(hidden)]
+pub type BeginFbAccess =
+    unsafe extern "C" fn(*mut bindings::drm_plane, *mut bindings::drm_plane_state) -> c_int;
+
+/// Type of `struct drm_plane_helper_funcs.end_fb_access`.
+#[doc(hidden)]
+pub type EndFbAccess = unsafe extern "C" fn(*mut bindings::drm_plane, *mut bindings::drm_plane_state);
+
+/// The C struct a plane state starts with, and the DRM helpers managing it.
+///
+/// # Safety
+///
+/// - The data layout of the implementor must start with a [`struct drm_plane_state`].
+/// - `init()`, `duplicate()` and `destroy()` must manage the state like the equivalent DRM
+///   helpers, and the fb access callbacks must be valid for states of this type.
+///
+/// [`struct drm_plane_state`]: srctree/include/drm/drm_plane.h
+#[doc(hidden)]
+pub unsafe trait RawPlaneStateBase: Default + Sized {
+    /// The `begin_fb_access` helper for this kind of state.
+    const BEGIN_FB_ACCESS: Option<BeginFbAccess>;
+    /// The `end_fb_access` helper for this kind of state.
+    const END_FB_ACCESS: Option<EndFbAccess>;
+
+    /// Initialize a new state for `plane`.
+    ///
+    /// # Safety
+    ///
+    /// `plane` must be a valid `struct drm_plane` and `self` must be zeroed.
+    unsafe fn init(&mut self, plane: *mut bindings::drm_plane);
+
+    /// Duplicate the current state of `plane` into `self`.
+    ///
+    /// # Safety
+    ///
+    /// `plane` must be a valid `struct drm_plane` whose current state is of type `Self`, and
+    /// `self` must be zeroed.
+    unsafe fn duplicate(&mut self, plane: *mut bindings::drm_plane);
+
+    /// Release the resources of the state.
+    ///
+    /// # Safety
+    ///
+    /// The state must have been set up with `init()` or `duplicate()`, and must not be used
+    /// afterwards.
+    unsafe fn destroy(&mut self);
+
+    /// Return the [`struct drm_plane_state`] this state starts with.
+    ///
+    /// [`struct drm_plane_state`]: srctree/include/drm/drm_plane.h
+    fn base(&self) -> &bindings::drm_plane_state;
+
+    /// Return the [`struct drm_plane_state`] this state starts with, mutably.
+    ///
+    /// [`struct drm_plane_state`]: srctree/include/drm/drm_plane.h
+    fn base_mut(&mut self) -> &mut bindings::drm_plane_state;
+}
+
+// SAFETY: `drm_plane_state` starts with itself, and the functions use the plain DRM state helpers.
+unsafe impl RawPlaneStateBase for bindings::drm_plane_state {
+    const BEGIN_FB_ACCESS: Option<BeginFbAccess> = None;
+    const END_FB_ACCESS: Option<EndFbAccess> = None;
+
+    unsafe fn init(&mut self, plane: *mut bindings::drm_plane) {
+        // SAFETY: `plane` is valid and `self` is zeroed, per our safety contract.
+        unsafe { bindings::__drm_atomic_helper_plane_state_init(self, plane) };
+    }
+
+    unsafe fn duplicate(&mut self, plane: *mut bindings::drm_plane) {
+        // SAFETY: `plane` is valid and `self` is zeroed, per our safety contract.
+        unsafe { bindings::__drm_atomic_helper_plane_duplicate_state(plane, self) };
+    }
+
+    unsafe fn destroy(&mut self) {
+        // SAFETY: The state was set up by `init()` or `duplicate()`, per our safety contract.
+        unsafe { bindings::__drm_atomic_helper_plane_destroy_state(self) };
+    }
+
+    fn base(&self) -> &bindings::drm_plane_state {
+        self
+    }
+
+    fn base_mut(&mut self) -> &mut bindings::drm_plane_state {
+        self
+    }
+}
+
+// SAFETY: `drm_shadow_plane_state` starts with its `base` plane state, and the functions use
+// DRM's shadow-plane helpers.
+unsafe impl RawPlaneStateBase for bindings::drm_shadow_plane_state {
+    const BEGIN_FB_ACCESS: Option<BeginFbAccess> = Some(bindings::drm_gem_begin_shadow_fb_access);
+    const END_FB_ACCESS: Option<EndFbAccess> = Some(end_shadow_fb_access_callback);
+
+    unsafe fn init(&mut self, plane: *mut bindings::drm_plane) {
+        // SAFETY: `plane` is valid and `self` is zeroed, per our safety contract. This is what
+        // `__drm_gem_reset_shadow_plane()` does, without installing the state on `plane`.
+        unsafe {
+            bindings::__drm_atomic_helper_plane_state_init(&mut self.base, plane);
+            bindings::drm_format_conv_state_init(&mut self.fmtcnv_state);
+        }
+    }
+
+    unsafe fn duplicate(&mut self, plane: *mut bindings::drm_plane) {
+        // SAFETY: `plane` is valid, its current state is a shadow plane state, and `self` is
+        // zeroed, per our safety contract.
+        unsafe { bindings::__drm_gem_duplicate_shadow_plane_state(plane, self) };
+    }
+
+    unsafe fn destroy(&mut self) {
+        // SAFETY: The state was set up by `init()` or `duplicate()`, per our safety contract.
+        unsafe { bindings::__drm_gem_destroy_shadow_plane_state(self) };
+    }
+
+    fn base(&self) -> &bindings::drm_plane_state {
+        &self.base
+    }
+
+    fn base_mut(&mut self) -> &mut bindings::drm_plane_state {
+        &mut self.base
+    }
+}
+
+/// `end_fb_access` for shadow plane states: unmap the framebuffer, then forget the mappings, so
+/// a state never hands out pointers to memory that is no longer mapped.
+unsafe extern "C" fn end_shadow_fb_access_callback(
+    plane: *mut bindings::drm_plane,
+    plane_state: *mut bindings::drm_plane_state,
+) {
+    // SAFETY: DRM passes a valid plane and state, mapped by `drm_gem_begin_shadow_fb_access()`.
+    unsafe { bindings::drm_gem_end_shadow_fb_access(plane, plane_state) };
+
+    // SAFETY: `plane_state` is the `base` of a `drm_shadow_plane_state`, since only shadow plane
+    // states use this callback, and DRM gives us exclusive access to it here.
+    let shadow = unsafe { &mut *container_of!(plane_state, bindings::drm_shadow_plane_state, base) };
+    shadow.map = Default::default();
+    shadow.data = Default::default();
+}
+
+/// A rectangle in a framebuffer or on the display, see [`struct drm_rect`].
+///
+/// `x2` and `y2` are exclusive.
+///
+/// [`struct drm_rect`]: srctree/include/drm/drm_rect.h
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Rect {
+    /// Left edge.
+    pub x1: i32,
+    /// Top edge.
+    pub y1: i32,
+    /// Right edge, exclusive.
+    pub x2: i32,
+    /// Bottom edge, exclusive.
+    pub y2: i32,
+}
+
+impl Rect {
+    /// Width of the rectangle.
+    pub fn width(&self) -> i32 {
+        self.x2 - self.x1
+    }
+
+    /// Height of the rectangle.
+    pub fn height(&self) -> i32 {
+        self.y2 - self.y1
+    }
+}
+
+/// Iterator over the damaged areas of a plane in an atomic commit, see
+/// [`PlaneStateMutator::damage()`].
+pub struct DamageIter<'a> {
+    iter: bindings::drm_atomic_helper_damage_iter,
+    _p: PhantomData<&'a bindings::drm_plane_state>,
+}
+
+impl Iterator for DamageIter<'_> {
+    type Item = Rect;
+
+    fn next(&mut self) -> Option<Rect> {
+        let mut rect = bindings::drm_rect::default();
+
+        // SAFETY: `self.iter` was set up by `drm_atomic_helper_damage_iter_init()` from states
+        // that outlive `'a`.
+        if unsafe { bindings::drm_atomic_helper_damage_iter_next(&mut self.iter, &mut rect) } {
+            Some(Rect {
+                x1: rect.x1,
+                y1: rect.y1,
+                x2: rect.x2,
+                y2: rect.y2,
+            })
+        } else {
+            None
+        }
+    }
 }
 
 /// The main trait for implementing the [`struct drm_plane_state`] API for a [`Plane`].
@@ -669,6 +905,10 @@ pub struct PlaneState<T: DriverPlaneState> {
 pub trait DriverPlaneState: Clone + Default + Sized {
     /// The type for this driver's drm_plane implementation
     type Plane: DriverPlane;
+
+    /// The kind of C state this plane state is built on: [`Plain`], or [`Shadow`] for planes the
+    /// CPU copies to the hardware.
+    type Kind: PlaneStateKind;
 }
 
 impl<T: DriverPlaneState> Sealed for PlaneState<T> {}
@@ -680,12 +920,116 @@ impl<T: DriverPlaneState> AsRawPlaneState for PlaneState<T> {
 impl<T: DriverPlaneState> private::AsRawPlaneState for PlaneState<T> {
     #[inline]
     fn as_raw(&self) -> &bindings::drm_plane_state {
-        &self.state
+        self.state.base()
     }
 
     #[inline]
     unsafe fn as_raw_mut(&mut self) -> &mut bindings::drm_plane_state {
-        &mut self.state
+        self.state.base_mut()
+    }
+}
+
+impl<T: DriverPlaneState> PlaneState<T> {
+    /// Iterate over the areas of the framebuffer that changed since `old_state`, clipped to the
+    /// plane's source. See [`drm_atomic_helper_damage_iter_init()`].
+    ///
+    /// [`drm_atomic_helper_damage_iter_init()`]: srctree/drivers/gpu/drm/drm_damage_helper.c
+    fn damage<'a>(&'a self, old_state: &'a Self) -> DamageIter<'a> {
+        let mut iter = bindings::drm_atomic_helper_damage_iter::default();
+
+        // SAFETY: Both states are valid plane states that outlive `'a`, and the iterator only
+        // reads them.
+        unsafe {
+            bindings::drm_atomic_helper_damage_iter_init(
+                &mut iter,
+                old_state.state.base(),
+                self.state.base(),
+            )
+        };
+
+        DamageIter {
+            iter,
+            _p: PhantomData,
+        }
+    }
+}
+
+impl<T: DriverPlaneState<Kind = Shadow>> PlaneState<T> {
+    /// See [`PlaneStateMutator::read_rows()`].
+    fn read_rows(
+        &self,
+        index: usize,
+        rect: &Rect,
+        buf: &mut KVec<u8>,
+        mut f: impl FnMut(u32, &[u8]) -> Result,
+    ) -> Result {
+        let base = self.state.base();
+        if base.fb.is_null() {
+            return Err(EINVAL);
+        }
+        // SAFETY: A plane state holds a reference on its framebuffer, which is immutable after
+        // creation.
+        let fb = unsafe { &*base.fb };
+        // SAFETY: Every framebuffer has a valid format.
+        let format = unsafe { &*fb.format };
+
+        if index >= usize::from(format.num_planes) || index >= self.state.data.len() {
+            return Err(EINVAL);
+        }
+        let map = &self.state.data[index];
+        if map.is_iomem {
+            return Err(ENOTSUPP);
+        }
+        // SAFETY: `is_iomem` is false, so `vaddr` is the active union member.
+        let vaddr = unsafe { map.__bindgen_anon_1.vaddr };
+        if vaddr.is_null() {
+            // Not mapped: only valid while the framebuffer is accessed by an atomic commit.
+            return Err(EINVAL);
+        }
+
+        // Rows are copied pixel-wise, which doesn't work for formats with multi-pixel blocks.
+        if format.block_w[index] > 1 || format.block_h[index] > 1 {
+            return Err(ENOTSUPP);
+        }
+        // SAFETY: `cpp` and `char_per_block` are both `[u8; 4]` aliasing the same bytes, which for
+        // formats with one-pixel blocks are the bytes per pixel.
+        let cpp = u32::from(unsafe { format.__bindgen_anon_1.cpp[index] });
+        let pitch = fb.pitches[index];
+        let vsub = if index == 0 { 1 } else { u32::from(format.vsub) };
+        let (width, height) = (fb.width, fb.height.div_ceil(vsub));
+        let (Ok(x1), Ok(y1), Ok(x2), Ok(y2)) = (
+            u32::try_from(rect.x1),
+            u32::try_from(rect.y1),
+            u32::try_from(rect.x2),
+            u32::try_from(rect.y2),
+        ) else {
+            return Err(EINVAL);
+        };
+        if x1 > x2 || x2 > width || y1 > y2 || y2 > height {
+            return Err(EINVAL);
+        }
+        let start = usize::try_from(x1 * cpp)?;
+        let len = usize::try_from((x2 - x1) * cpp)?;
+        if start + len > usize::try_from(pitch)? {
+            return Err(EINVAL);
+        }
+
+        buf.resize(len, 0, GFP_KERNEL)?;
+        for y in y1..y2 {
+            let offset = usize::try_from(y)? * usize::try_from(pitch)? + start;
+
+            // SAFETY:
+            // - `vaddr` maps the whole plane (`pitch * height` bytes) while the framebuffer is
+            //   accessed, and `offset + len` is within that.
+            // - `buf` holds `len` bytes.
+            // - `memcpy()` is a volatile copy, so userspace writing the framebuffer concurrently
+            //   only affects the copied values.
+            unsafe { bindings::memcpy(buf.as_mut_ptr().cast(), vaddr.byte_add(offset), len) };
+
+            f(y, buf)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -883,6 +1227,42 @@ impl<'a, T: DriverPlaneState> DerefMut for PlaneStateMutator<'a, PlaneState<T>> 
     }
 }
 
+impl<'a, T: DriverPlaneState> PlaneStateMutator<'a, PlaneState<T>> {
+    /// Iterate over the areas of the framebuffer that changed since `old_state`, clipped to the
+    /// plane's source, in framebuffer coordinates.
+    ///
+    /// Each area needs updating, e.g. copying to the hardware for a [`Shadow`] plane. Without
+    /// damage information this is the whole visible framebuffer. See
+    /// [`drm_atomic_helper_damage_iter_init()`].
+    ///
+    /// [`drm_atomic_helper_damage_iter_init()`]: srctree/drivers/gpu/drm/drm_damage_helper.c
+    pub fn damage<'b>(&'b self, old_state: &'b PlaneState<T>) -> DamageIter<'b> {
+        self.state.damage(old_state)
+    }
+}
+
+impl<'a, T: DriverPlaneState<Kind = Shadow>> PlaneStateMutator<'a, PlaneState<T>> {
+    /// Read the rows of `rect` from color plane `index` of the framebuffer, as mapped for the
+    /// current commit.
+    ///
+    /// For each row from `rect.y1` to `rect.y2`, the pixels from `rect.x1` to `rect.x2` are copied
+    /// into `buf`, and `f` is called with the row's `y` and the copied bytes. Userspace may write
+    /// the framebuffer concurrently, which only affects the values read.
+    ///
+    /// The framebuffer is only mapped while the commit accesses it, e.g. in
+    /// [`DriverPlane::atomic_update()`]. Fails with `EINVAL` outside of that, if `index` or `rect`
+    /// don't fit the framebuffer, and with `ENOTSUPP` for framebuffers in I/O memory.
+    pub fn read_rows(
+        &self,
+        index: usize,
+        rect: &Rect,
+        buf: &mut KVec<u8>,
+        f: impl FnMut(u32, &[u8]) -> Result,
+    ) -> Result {
+        self.state.read_rows(index, rect, buf, f)
+    }
+}
+
 // SAFETY: Shares the safety guarantees of `T`'s ModeObjectVtable impl
 unsafe impl<'a, T: FromRawPlaneState> ModeObjectVtable for PlaneStateMutator<'a, T>
 where
@@ -973,22 +1353,19 @@ unsafe extern "C" fn atomic_duplicate_state_callback<T: DriverPlaneState>(
     // SAFETY: This cast is safe via `DriverPlaneState`s type invariants.
     let state = unsafe { PlaneState::<T>::from_raw(state) };
 
-    let new: Result<KBox<_>> = KBox::try_init(
+    let new: Result<KBox<PlaneState<T>>> = KBox::try_init(
         try_init!(PlaneState {
             inner: state.inner.clone(),
-            state: bindings::drm_plane_state {
-                ..Default::default()
-            },
+            state: Default::default(),
         }),
         GFP_KERNEL,
     );
 
     if let Ok(mut new) = new {
         // SAFETY:
-        // - `new` provides a valid pointer to a newly allocated `drm_plane_state` via type
-        //   invariants
-        // - This initializes `new` via memcpy()
-        unsafe { bindings::__drm_atomic_helper_plane_duplicate_state(plane, new.as_raw_mut()) };
+        // - `plane` is valid and its current state is a `PlaneState<T>`, so of the same kind.
+        // - `new.state` was just zeroed.
+        unsafe { new.state.duplicate(plane) };
 
         KBox::into_raw(new).cast()
     } else {
@@ -1001,13 +1378,18 @@ unsafe extern "C" fn atomic_destroy_state_callback<T: DriverPlaneState>(
     _plane: *mut bindings::drm_plane,
     state: *mut bindings::drm_plane_state,
 ) {
-    // SAFETY: DRM guarantees that `state` points to a valid instance of `drm_plane_state`
-    unsafe { bindings::__drm_atomic_helper_plane_destroy_state(state) };
+    // This cast is safe via our type invariants.
+    let state = state.cast::<PlaneState<T>>();
+
+    // SAFETY:
+    // - DRM guarantees we are the only one with access to this state.
+    // - It was set up by `atomic_create_state_callback()` or `atomic_duplicate_state_callback()`.
+    unsafe { (*state).state.destroy() };
 
     // SAFETY:
     // * DRM guarantees we are the only one with access to this `drm_plane_state`
     // * This cast is safe via our type invariants.
-    drop(unsafe { KBox::from_raw(state.cast::<PlaneState<T>>()) });
+    drop(unsafe { KBox::from_raw(state) });
 }
 
 #[allow(clippy::missing_safety_doc)]
@@ -1024,14 +1406,14 @@ unsafe extern "C" fn atomic_create_state_callback<T: DriverPlaneState>(
 
     match new {
         Ok(mut new) => {
-            // SAFETY: This initializes `new`.state, and is safe to call on an uninitialized state.
-            unsafe { bindings::__drm_atomic_helper_plane_state_init(&mut new.state, plane) };
+            // SAFETY: DRM passes a valid `plane`, and `new.state` was just zeroed.
+            unsafe { new.state.init(plane) };
 
             // SAFETY: We will recover this `KBox` in atomic_destroy_state_callback
             let raw = KBox::into_raw(new);
 
             // SAFETY: We successfully allocated `new` above, so `raw` is safe to dereference.
-            unsafe { &mut (*raw).state }
+            unsafe { (*raw).state.base_mut() }
         },
         Err(e) => e.to_ptr()
     }

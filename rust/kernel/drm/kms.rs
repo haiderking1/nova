@@ -299,6 +299,17 @@ pub trait KmsDriver: Driver {
     where
         Self: Sized;
 
+    /// Whether framebuffers report changes made by the CPU, from the `DIRTYFB` ioctl and the
+    /// fbdev console, as plane damage.
+    ///
+    /// Drivers that copy framebuffers to the hardware, e.g. with [`plane::Shadow`] plane states,
+    /// need this to see such changes. Uses [`drm_gem_fb_create_with_dirty()`] instead of
+    /// [`drm_gem_fb_create()`].
+    ///
+    /// [`drm_gem_fb_create_with_dirty()`]: srctree/drivers/gpu/drm/drm_gem_framebuffer_helper.c
+    /// [`drm_gem_fb_create()`]: srctree/drivers/gpu/drm/drm_gem_framebuffer_helper.c
+    const FB_DIRTY: bool = false;
+
     /// The optional [`atomic_commit_tail`] callback for this [`Device`].
     ///
     /// It must return a [`CommittedAtomicState`] to prove that it has signaled completion of the hw
@@ -329,7 +340,11 @@ impl<T: KmsDriver> private::KmsImpl for T {
     const MODE_CONFIG_OPS: Option<ModeConfigOps> = Some(ModeConfigOps {
         kms_vtable: bindings::drm_mode_config_funcs {
             atomic_check: Some(bindings::drm_atomic_helper_check),
-            fb_create: Some(bindings::drm_gem_fb_create),
+            fb_create: if Self::FB_DIRTY {
+                Some(bindings::drm_gem_fb_create_with_dirty)
+            } else {
+                Some(bindings::drm_gem_fb_create)
+            },
             mode_valid: None,
             atomic_commit: Some(bindings::drm_atomic_helper_commit),
             get_format_info: None,
