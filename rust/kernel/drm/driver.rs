@@ -18,6 +18,17 @@ use core::ptr::NonNull;
 pub(crate) const FEAT_GEM: u32 = bindings::drm_driver_feature_DRIVER_GEM;
 /// Driver supports render nodes, i.e.: /dev/dri/renderDXX devices.
 pub(crate) const FEAT_RENDER: u32 = bindings::drm_driver_feature_DRIVER_RENDER;
+/// Driver supports kernel mode setting (KMS).
+pub(crate) const FEAT_MODESET: u32 = bindings::drm_driver_feature_DRIVER_MODESET;
+/// Driver supports atomic mode setting.
+pub(crate) const FEAT_ATOMIC: u32 = bindings::drm_driver_feature_DRIVER_ATOMIC;
+
+/// Callback that sets up the framebuffer of the fbdev emulation, see
+/// [`Driver::FBDEV_PROBE`].
+pub type FbdevProbe = unsafe extern "C" fn(
+    fb_helper: *mut bindings::drm_fb_helper,
+    sizes: *mut bindings::drm_fb_helper_surface_size,
+) -> core::ffi::c_int;
 
 /// Information data for a DRM Driver.
 pub struct DriverInfo {
@@ -138,6 +149,21 @@ pub trait Driver {
     /// usable from the render node (i.e. marked DRM_RENDER_ALLOW), whereas
     /// userspace processes using the master node can invoke any ioctl.
     const FEAT_RENDER: bool = false;
+
+    /// Sets the `DRIVER_MODESET` feature for this driver.
+    ///
+    /// The driver drives a display: it sets up the KMS objects (planes, CRTCs, encoders and
+    /// connectors) before registering the device.
+    const FEAT_MODESET: bool = false;
+
+    /// Sets the `DRIVER_ATOMIC` feature for this driver.
+    ///
+    /// The driver implements atomic mode setting. Requires [`Driver::FEAT_MODESET`].
+    const FEAT_ATOMIC: bool = false;
+
+    /// Sets up the framebuffer of the fbdev emulation (the kernel console), e.g.
+    /// `bindings::drm_fbdev_shmem_driver_fbdev_probe` for drivers using shmem GEM objects.
+    const FBDEV_PROBE: Option<FbdevProbe> = None;
 }
 
 /// The registration type of a `drm::Device`.
