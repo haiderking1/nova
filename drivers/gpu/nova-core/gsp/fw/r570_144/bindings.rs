@@ -62,6 +62,28 @@ pub const NV04_DISPLAY_COMMON: u32 = 115;
 pub const NVC670_DISPLAY: u32 = 50800;
 pub const NVC67D_CORE_CHANNEL_DMA: u32 = 50813;
 pub const NVC67D_SET_CONTEXT_DMA_NOTIFIER: u32 = 520;
+pub const NVC67E_WINDOW_CHANNEL_DMA: u32 = 50814;
+pub const NVC67E_UPDATE: u32 = 512;
+pub const NVC67E_SET_SIZE: u32 = 548;
+pub const NVC67E_SET_STORAGE: u32 = 552;
+pub const NVC67E_SET_PARAMS: u32 = 556;
+pub const NVC67E_SET_PARAMS_FORMAT_X8R8G8B8: u32 = 230;
+pub const NVC67E_SET_SIZE_IN: u32 = 664;
+pub const NVC67E_SET_SIZE_OUT: u32 = 676;
+pub const NVC67E_SET_COMPOSITION_CONTROL: u32 = 748;
+pub const NVC67E_SET_COMPOSITION_CONSTANT_ALPHA: u32 = 752;
+pub const NVC67E_SET_COMPOSITION_FACTOR_SELECT: u32 = 756;
+pub const NVC67E_SET_COMPOSITION_FACTOR_SELECT_SRC_COLOR_FACTOR_MATCH_SELECT_K1: u32 = 2;
+pub const NVC67E_SET_COMPOSITION_FACTOR_SELECT_DST_COLOR_FACTOR_MATCH_SELECT_NEG_K1: u32 = 4;
+pub const NVC67E_SET_KEY_ALPHA: u32 = 760;
+pub const NVC67E_SET_KEY_RED_CR: u32 = 764;
+pub const NVC67E_SET_KEY_GREEN_Y: u32 = 768;
+pub const NVC67E_SET_KEY_BLUE_CB: u32 = 772;
+pub const NVC67E_SET_PRESENT_CONTROL: u32 = 776;
+pub const NVC67E_SET_INTERLOCK_FLAGS: u32 = 880;
+pub const NVC67E_SET_WINDOW_INTERLOCK_FLAGS: u32 = 884;
+pub const NVC67E_SET_FMT_COEFFICIENT_C00: u32 = 1024;
+pub const NVC67E_SET_CONTEXT_DMA_ILUT: u32 = 1092;
 pub const NV01_DEVICE_0: u32 = 128;
 pub const NV0073_CTRL_CMD_SPECIFIC_GET_EDID_V2: u32 = 7537221;
 pub const NV0073_CTRL_SPECIFIC_GET_EDID_FLAGS_COPY_CACHE_NO: u32 = 0;
@@ -1324,6 +1346,24 @@ pub struct rpc_run_cpu_sequencer_v17_00 {
     pub cmdIndex: u32_,
     pub regSaveArea: [u32_; 8usize],
     pub commandBuffer: __IncompleteArrayField<u32_>,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone, MaybeZeroable)]
+pub struct rpc_os_error_log_v17_00 {
+    pub exceptType: u32_,
+    pub runlistId: u32_,
+    pub chid: u32_,
+    pub errString: [ffi::c_char; 256usize],
+    pub preemptiveRemovalPreviousXid: u32_,
+}
+impl Default for rpc_os_error_log_v17_00 {
+    fn default() -> Self {
+        let mut s = ::core::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::core::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
 }
 pub const GSP_SEQ_BUF_OPCODE_GSP_SEQ_BUF_OPCODE_REG_WRITE: GSP_SEQ_BUF_OPCODE = 0;
 pub const GSP_SEQ_BUF_OPCODE_GSP_SEQ_BUF_OPCODE_REG_MODIFY: GSP_SEQ_BUF_OPCODE = 1;
