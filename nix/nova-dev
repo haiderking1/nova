@@ -9,11 +9,15 @@
 # Builds happen in a local kernel tree ($NOVA_KTREE, default
 # ~/.cache/nova-ktree) using the exact .config and Module.symvers of the
 # Nix-built nova kernel, so the modules match it. Run inside `nix develop`.
+#
+# NOVA_SYSTEM=<toplevel> builds against a system that isn't switched to yet,
+# NOVA_OUT=<dir> puts the modules somewhere else.
 set -euo pipefail
 
 src=$(git -C "$(dirname "$(readlink -f "$0")")" rev-parse --show-toplevel)
 ktree=${NOVA_KTREE:-$HOME/.cache/nova-ktree}
-out=/var/lib/nova/dev
+out=${NOVA_OUT:-/var/lib/nova/dev}
+system=${NOVA_SYSTEM:-/nix/var/nix/profiles/system} # system generation to build against
 mods=(drivers/gpu/nova-core.ko drivers/gpu/nova-drm.ko)
 
 die() { echo "nova-dev: $*" >&2; exit 1; }
@@ -22,7 +26,7 @@ die() { echo "nova-dev: $*" >&2; exit 1; }
 # newest generation
 nova_kdev() {
   local kernel drv dev
-  kernel=$(readlink -f /nix/var/nix/profiles/system/specialisation/nova/kernel 2>/dev/null) ||
+  kernel=$(readlink -f "$system"/specialisation/nova/kernel 2>/dev/null) ||
     die "no nova boot entry yet, run ./rebuild.sh in mother-base first"
   drv=$(nix-store -q --deriver "$kernel")
   dev=$(nix-store -q --outputs "$drv" | grep -- '-dev$') ||
@@ -64,8 +68,11 @@ build() {
   # Single-module builds only look for symbols in vmlinux.o, which we don't
   # have. Feed modpost the real kernel's Module.symvers instead, so symbols are
   # checked and module dependencies get recorded. (Ignore its "vmlinux.o is
-  # missing" warning.)
-  ln -sf "$kbuild/Module.symvers" "$ktree/Module.symvers"
+  # missing" warning.) Leave out nova's own exports: the modules being built
+  # provide them, and modpost rejects symbols exported twice.
+  rm -f "$ktree/Module.symvers"
+  awk -F'\t' '$3 != "drivers/gpu/nova-core" && $3 != "drivers/gpu/nova-drm"' \
+    "$kbuild/Module.symvers" > "$ktree/Module.symvers"
   printf '#!/bin/sh\nexec %q -i %q "$@"\n' \
     "$ktree/scripts/mod/modpost" "$ktree/Module.symvers" > "$ktree/modpost-wrap"
   chmod +x "$ktree/modpost-wrap"
