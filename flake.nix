@@ -23,7 +23,8 @@
         # nix/kernel.config is nixpkgs' full NixOS config plus:
         #   RUST=y, DRM=y (nova-drm needs it built in), NOVA_CORE=m,
         #   NOVA_CORE_SELFTESTS=y, DRM_NOVA=m, DRM_NOUVEAU=n (keep it off the
-        #   card), DRM_SIMPLEDRM=y + SYSFB_SIMPLEFB=y (UEFI framebuffer console)
+        #   card), DRM_SIMPLEDRM=y + SYSFB_SIMPLEFB=y (UEFI framebuffer console),
+        #   RUST_DEBUG_ASSERTIONS=y (Rust dev_dbg!/pr_debug! only print with it)
         # then trimmed with `make localmodconfig` to the modules this VM loads
         # (lsmod, the nova entry's initrd modules, nova, fuse/overlay/tun/loop):
         # ~200 modules instead of ~7300, so a full build takes minutes.
