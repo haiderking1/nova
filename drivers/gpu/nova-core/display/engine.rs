@@ -58,7 +58,6 @@ use super::{
         PushBuffer, //
     },
     instmem::InstMem,
-    lut::InputLut,
     regs,
     Display, //
 };
@@ -132,8 +131,6 @@ struct Channels<'a> {
     core_push: PushBuffer<'a>,
     _window: Handle<DisplayWindowChannel>,
     window_push: PushBuffer<'a>,
-    /// Input LUT of the window, which XRGB8888 surfaces need.
-    ilut: InputLut,
 }
 
 impl<'a> DisplayEngine<'a> {
@@ -274,9 +271,8 @@ impl<'a> Channels<'a> {
             )
             .send(dev, cmdq)?;
 
-            // Surfaces and the input LUT are taken from anywhere in VRAM.
+            // Surfaces are taken from anywhere in VRAM.
             instmem.bind_vram(mm, client, DmaChannel::Window(WINDOW), VRAM_CTXDMA, vram)?;
-            let ilut = InputLut::identity(mm)?;
 
             let mut channels = Self {
                 root,
@@ -284,7 +280,6 @@ impl<'a> Channels<'a> {
                 core_push,
                 _window: window,
                 window_push,
-                ilut,
             };
             channels.check_core(dev, bar)?;
             Ok(channels)
@@ -327,7 +322,6 @@ impl<'a> Channels<'a> {
         surface.check()?;
         let size = surface.width | surface.height << 16;
         let offset = u32::try_from(surface.addr.into_raw() >> 8)?;
-        let ilut_offset = u32::try_from(self.ilut.addr().into_raw() >> 8)?;
 
         /// Format conversion matrix leaving colors as they are, in S5.16 fixed point.
         const IDENTITY: [u32; 12] = [
@@ -351,10 +345,8 @@ impl<'a> Channels<'a> {
             (set_point_in(0), 0),
             (SET_SIZE_IN, size),
             (SET_SIZE_OUT, size),
-            // Colors converted to FP16 as they are.
-            (SET_ILUT_CONTROL, self.ilut.control()),
-            (SET_CONTEXT_DMA_ILUT, VRAM_CTXDMA),
-            (SET_OFFSET_ILUT, ilut_offset),
+            // No input LUT.
+            (SET_CONTEXT_DMA_ILUT, 0),
             // Topmost and opaque: the window's color times K1 (255), plus what's below times
             // 1 - K1. Color keys never match.
             (SET_COMPOSITION_CONTROL, 255 << 4),
@@ -441,12 +433,6 @@ fn log_armed_state(dev: &device::Device, bar: Bar0<'_>) {
     for window in 0..8 {
         log("WINDOW_SET_CONTROL", 0x1000 + window * 0x80);
     }
-    // What the window Nova uses is allowed to do.
-    let window = WINDOW * 0x80;
-    log("WINDOW_SET_WINDOW_FORMAT_USAGE_BOUNDS", 0x1004 + window);
-    log("WINDOW_SET_WINDOW_ROTATED_FORMAT_USAGE_BOUNDS", 0x1008 + window);
-    log("WINDOW_SET_MAX_INPUT_SCALE_FACTOR", 0x100c + window);
-    log("WINDOW_SET_WINDOW_USAGE_BOUNDS", 0x1010 + window);
     for (name, method) in LOGGED_HEAD_METHODS {
         log(name, method);
     }
