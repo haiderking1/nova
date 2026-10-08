@@ -7,6 +7,21 @@
 
 use super::bindings;
 
+/// Notifiers, which display channels write to report the progress of an update
+/// (`NV_DISP_NOTIFIER` in `clc67d.h`).
+pub(crate) mod notifier {
+    use super::bindings;
+
+    /// Size of a notifier in bytes. Its first word holds its status in bits 31:30.
+    pub(crate) const SIZE: u32 = bindings::NV_DISP_NOTIFIER_SIZEOF;
+    /// Status of an update that hasn't begun yet, as set before the update.
+    pub(crate) const STATUS_NOT_BEGUN: u32 = bindings::NV_DISP_NOTIFIER__0_STATUS_NOT_BEGUN;
+    /// Status of an update that began taking effect.
+    pub(crate) const STATUS_BEGUN: u32 = bindings::NV_DISP_NOTIFIER__0_STATUS_BEGUN;
+    /// Status of an update that finished.
+    pub(crate) const STATUS_FINISHED: u32 = bindings::NV_DISP_NOTIFIER__0_STATUS_FINISHED;
+}
+
 /// Methods of the GA10x core channel (`NVC67D_CORE_CHANNEL_DMA`, `clc67d.h`).
 pub(crate) mod core_c67d {
     use super::bindings;
@@ -21,6 +36,13 @@ pub(crate) mod window_c67e {
 
     /// Makes the methods sent since the last update take effect.
     pub(crate) const UPDATE: u32 = bindings::NVC67E_UPDATE;
+    /// Sets the context DMA of the notifier written by the next update, 0 for none.
+    pub(crate) const SET_CONTEXT_DMA_NOTIFIER: u32 = bindings::NVC67E_SET_CONTEXT_DMA_NOTIFIER;
+    /// Notifier of the next update: mode in bit 0, offset in its context DMA in units of 16 bytes
+    /// in bits 11:4.
+    pub(crate) const SET_NOTIFIER_CONTROL: u32 = bindings::NVC67E_SET_NOTIFIER_CONTROL;
+    /// Notifier mode: the notifier is written, without raising an interrupt.
+    pub(crate) const NOTIFIER_MODE_WRITE: u32 = bindings::NVC67E_SET_NOTIFIER_CONTROL_MODE_WRITE;
     /// Size of the surface: width in bits 15:0, height in bits 31:16.
     pub(crate) const SET_SIZE: u32 = bindings::NVC67E_SET_SIZE;
     /// Block height of block-linear surfaces, 0 for pitch-linear ones.
