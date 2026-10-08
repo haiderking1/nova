@@ -9,20 +9,28 @@
 //! flipped, so frames show whole. Without that scanout, they are copied into the firmware's
 //! framebuffer, which shows on screen as it is drawn.
 //!
+//! With nova-core's scanout, the CRTC has vblanks: nova-core passes on the vblank interrupts of the
+//! head showing the scanout. A flip returns once the frame flipped is on screen, so a commit's
+//! event is sent once its planes are updated, and a commit waits for that rather than for the
+//! next vblank.
+//!
 //! The connector reports what GSP-RM knows about the display: the type of connector it is shown
 //! through, and the EDID of the monitor (its name, physical size and modes, of which only those
 //! of the firmware's resolution are kept).
 
-use core::marker::{
-    PhantomData,
-    PhantomPinned, //
-};
+use core::marker::PhantomPinned;
 
 use kernel::{
     auxiliary,
     drm::{
         fourcc::XRGB888,
         kms::{
+            atomic::{
+                AtomicCommitTail,
+                CommittedAtomicState,
+                ModesetsReadyToken,
+                PlaneUpdatesReadyToken, //
+            },
             connector::{
                 self,
                 ConnectorGuard, //
@@ -44,8 +52,15 @@ use kernel::{
                 RawPlaneState,
                 Rect, //
             },
+            vblank::{
+                RawVblankCrtcState,
+                VblankGuard,
+                VblankSupport,
+                VblankTimestamp, //
+            },
             KmsDriver,
             KmsProbe,
+            KmsRef,
             ModeConfigGuard,
             ModeConfigInfo,
             ModeObject, //
@@ -55,16 +70,20 @@ use kernel::{
         Early,
         Normal, //
     },
+    interrupt::LocalInterruptDisabled,
     prelude::*,
     screen_info::{
         Channel,
         PixelFormat, //
     },
+    sync::Arc,
 };
 
 use nova_core::api::{
     ConnectorType,
-    ScanoutMode, //
+    NovaCoreApi,
+    ScanoutMode,
+    VblankHandler, //
 };
 
 use crate::driver::{
@@ -118,7 +137,10 @@ impl KmsDriver for NovaDriver {
 
     fn mode_config_info(drm: &Device<Self, Early>) -> Result<ModeConfigInfo> {
         let (width, height) = drm.boot_display.as_ref().map_or((1, 1), |display| {
-            (display.mode.hdisplay().into(), display.mode.vdisplay().into())
+            (
+                display.mode.hdisplay().into(),
+                display.mode.vdisplay().into(),
+            )
         });
 
         Ok(ModeConfigInfo {
@@ -162,6 +184,57 @@ impl KmsDriver for NovaDriver {
 
         connector.attach_encoder(encoder)
     }
+
+    fn atomic_commit_tail<'a>(
+        mut state: AtomicCommitTail<'a, Self>,
+        modeset_token: ModesetsReadyToken<'_>,
+        plane_update_token: PlaneUpdatesReadyToken<'_>,
+    ) -> CommittedAtomicState<'a, Self> {
+        let modeset_token = state.commit_modeset_disables(modeset_token);
+        let plane_update_token = state.commit_planes(plane_update_token, Default::default());
+        let modeset_token = state.commit_modeset_enables(modeset_token);
+        state.fake_vblank();
+
+        let state = state.commit_hw_done(modeset_token, plane_update_token);
+        // The commit's event is sent once its frame is on screen, which is all to wait for: not
+        // the vblank after, as the default commit tail does.
+        state.wait_for_flip_done();
+
+        state
+    }
+}
+
+/// Runs `f` with nova-core's API, unless the device is going away. Doesn't sleep.
+pub(crate) fn with_api<R>(
+    drm: &NovaDevice,
+    f: impl FnOnce(&NovaCoreApi<'_>) -> Result<R>,
+) -> Result<R> {
+    let registered = drm.registration_guard().ok_or(ENODEV)?;
+
+    registered.registration_data_with(|reg| reg.api.with(|api| f(&api)))
+}
+
+/// Returns the head showing nova-core's scanout, which the CRTC's vblanks are those of.
+fn scanout_head(drm: &NovaDevice) -> Result<u32> {
+    drm.boot_display
+        .as_ref()
+        .and_then(|display| display.scanout)
+        .map(|scanout| scanout.head)
+        .ok_or(ENODEV)
+}
+
+/// Passes on the vblanks of the head showing the CRTC to the CRTC.
+struct NovaVblankHandler {
+    crtc: KmsRef<Crtc>,
+    head: u32,
+}
+
+impl VblankHandler for NovaVblankHandler {
+    fn vblank(&self, head: u32) {
+        if head == self.head {
+            self.crtc.handle_vblank();
+        }
+    }
 }
 
 /// The primary plane of the boot display.
@@ -200,7 +273,14 @@ impl plane::DriverPlane for NovaPlane {
         let drm = commit.plane().drm_dev();
         let (old_state, mut new_state) = commit.take_old_new_state();
 
-        let scanout = drm.boot_display.as_ref().and_then(|display| display.scanout);
+        let scanout = drm
+            .boot_display
+            .as_ref()
+            .and_then(|display| display.scanout);
+        // Vblank interrupts stay on until the flip is done, so that DRM counts the vblank the
+        // frame shows from, which the commit's event then carries.
+        let crtc = new_state.crtc().map(Crtc::from_opaque);
+        let _vblank = crtc.and_then(|crtc| crtc.vblank_get().ok());
         let result = match scanout {
             Some(scanout) => draw_to_scanout(drm, &scanout, old_state, &mut new_state),
             None => copy_to_boot_display(drm, old_state, &new_state),
@@ -382,7 +462,7 @@ impl crtc::DriverCrtc for NovaCrtc {
     type Args = ();
     type Driver = NovaDriver;
     type State = NovaCrtcState;
-    type VblankImpl = PhantomData<Self>;
+    type VblankImpl = Self;
 
     fn new(_drm: &Device<NovaDriver, KmsProbe>, _args: &Self::Args) -> impl PinInit<Self, Error> {
         try_pin_init!(Self { _p: PhantomPinned })
@@ -394,6 +474,80 @@ impl crtc::DriverCrtc for NovaCrtc {
             Some(display) => crtc.mode_valid_fixed(mode, &display.mode),
             None => ModeStatus::OK,
         }
+    }
+
+    fn atomic_flush(commit: crtc::CrtcAtomicCommit<'_, Self>) {
+        let mut new_state = commit.take_new_state();
+
+        // The planes were flipped, and the flip returned once the frame was on screen: from the
+        // vblank just handled.
+        if let Some(event) = new_state.get_pending_vblank_event() {
+            event.send();
+        }
+    }
+
+    fn atomic_enable(commit: crtc::CrtcAtomicCommit<'_, Self>) {
+        let crtc = commit.crtc();
+        let drm = crtc.drm_dev();
+
+        // Without vblank interrupts, DRM completes commits without vblanks.
+        let registered = scanout_head(drm).and_then(|head| {
+            let handler: Arc<dyn VblankHandler> = Arc::new(
+                NovaVblankHandler {
+                    crtc: KmsRef::from(crtc),
+                    head,
+                },
+                GFP_KERNEL,
+            )?;
+            with_api(drm, |api| {
+                api.set_vblank_handler(Some(handler));
+                Ok(())
+            })
+        });
+        if registered.is_ok() {
+            crtc.vblank_on();
+        }
+    }
+
+    fn atomic_disable(commit: crtc::CrtcAtomicCommit<'_, Self>) {
+        let crtc = commit.crtc();
+
+        crtc.vblank_off();
+        // The handler holds a reference to the CRTC, so it must not outlive its use.
+        let _ = with_api(crtc.drm_dev(), |api| {
+            api.set_vblank_handler(None);
+            Ok(())
+        });
+    }
+}
+
+impl VblankSupport for NovaCrtc {
+    type Crtc = Self;
+
+    fn enable_vblank(
+        crtc: &Crtc,
+        _vblank: &VblankGuard<'_, Self::Crtc>,
+        _irq: &LocalInterruptDisabled,
+    ) -> Result {
+        let drm = crtc.drm_dev();
+        let head = scanout_head(drm)?;
+
+        with_api(drm, |api| api.set_vblank_interrupt(head, true))
+    }
+
+    fn disable_vblank(
+        crtc: &Crtc,
+        _vblank: &VblankGuard<'_, Self::Crtc>,
+        _irq: &LocalInterruptDisabled,
+    ) {
+        let drm = crtc.drm_dev();
+        let _ = scanout_head(drm)
+            .and_then(|head| with_api(drm, |api| api.set_vblank_interrupt(head, false)));
+    }
+
+    // DRM timestamps vblanks when they are handled.
+    fn get_vblank_timestamp(_crtc: &Crtc, _in_vblank_irq: bool) -> Option<VblankTimestamp> {
+        None
     }
 }
 
@@ -441,7 +595,10 @@ impl connector::DriverConnector for NovaConnector {
         try_pin_init!(Self { _p: PhantomPinned })
     }
 
-    fn get_modes(connector: ConnectorGuard<'_, Self>, _guard: &ModeConfigGuard<'_, NovaDriver>) -> i32 {
+    fn get_modes(
+        connector: ConnectorGuard<'_, Self>,
+        _guard: &ModeConfigGuard<'_, NovaDriver>,
+    ) -> i32 {
         let drm = connector.drm_dev();
         let dev: &auxiliary::Device = drm.as_ref();
         // Only created with a boot display, whose mode is the only one that works.
@@ -519,7 +676,9 @@ fn output_types(connector: ConnectorType) -> (connector::Type, encoder::Type) {
         ConnectorType::DviD => (connector::Type::DviD, encoder::Type::Tmds),
         ConnectorType::DisplayPort => (connector::Type::DisplayPort, encoder::Type::Tmds),
         ConnectorType::EmbeddedDisplayPort => (connector::Type::Edp, encoder::Type::Tmds),
-        ConnectorType::HdmiA | ConnectorType::HdmiC => (connector::Type::HdmiA, encoder::Type::Tmds),
+        ConnectorType::HdmiA | ConnectorType::HdmiC => {
+            (connector::Type::HdmiA, encoder::Type::Tmds)
+        }
         ConnectorType::UsbC => (connector::Type::Usb, encoder::Type::Tmds),
         ConnectorType::Dsi => (connector::Type::Dsi, encoder::Type::Dsi),
         ConnectorType::Unknown => (connector::Type::Unknown, encoder::Type::None),

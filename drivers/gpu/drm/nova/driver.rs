@@ -49,9 +49,18 @@ pub(crate) struct NovaData {
 }
 
 pub(crate) struct Nova<'bound> {
-    #[expect(unused)]
     drm: ARef<drm::Device<NovaDriver>>,
     _reg: drm::Registration<'bound, NovaDriver>,
+}
+
+impl Drop for Nova<'_> {
+    fn drop(&mut self) {
+        // nova-core may still hold the vblank handler, which references the CRTC.
+        let _ = crate::kms::with_api(&self.drm, |api| {
+            api.set_vblank_handler(None);
+            Ok(())
+        });
+    }
 }
 
 /// DRM registration data, accessible from ioctl handlers via the registration guard.
@@ -95,7 +104,11 @@ impl auxiliary::Driver for NovaDriver {
         let connector = api
             .with(|api| api.boot_display_connector())
             .unwrap_or_else(|err| {
-                dev_warn!(adev, "can't tell what the boot display is connected to: {:?}\n", err);
+                dev_warn!(
+                    adev,
+                    "can't tell what the boot display is connected to: {:?}\n",
+                    err
+                );
                 ConnectorType::Unknown
             });
         let scanout = api.with(|api| api.scanout_mode());
