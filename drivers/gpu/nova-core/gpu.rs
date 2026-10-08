@@ -20,6 +20,7 @@ use kernel::{
 };
 
 use crate::{
+    boot_display::BootDisplay,
     bounded_enum,
     driver::{
         Bar0,
@@ -380,6 +381,8 @@ impl<'a> GspSubtree<'a> {
 #[pin_data]
 pub(crate) struct Gpu<'gpu> {
     pub(crate) spec: Spec,
+    /// The display the system firmware set up on this GPU, if any.
+    pub(crate) boot_display: Option<BootDisplay>,
     /// GSP event interrupt registration, and the enable of its subtree.
     ///
     /// Must be kept declared *before* `gsp_resources`, so that the handler is unregistered, and
@@ -456,6 +459,12 @@ impl<'gpu> Gpu<'gpu> {
             spec: Spec::new(dev, bar).inspect(|spec| {
                 dev_info!(dev,"NVIDIA ({})\n", spec);
             })?,
+
+            // Before the GSP boots: `BootDisplay::find()` relies on BAR1 still mapping VRAM 1:1.
+            boot_display: BootDisplay::find(pdev).unwrap_or_else(|err| {
+                dev_warn!(dev, "ignoring the firmware display: {:?}\n", err);
+                None
+            }),
 
             tree: Tree::new(pdev, bar, spec.chipset, irq::gsp::GSP_SUBTREE.into())?,
 
@@ -630,9 +639,10 @@ impl<'gpu> Gpu<'gpu> {
             dev_err!(dev, "self-tests failed: {:?}\n", err);
         }
 
-        // soka/experiments: put pixels on screen through the UEFI framebuffer.
-        if let Err(err) = crate::mm::efifb::draw_test_pattern(dev, this.mm, regions) {
-            dev_err!(dev, "efifb: test pattern failed: {:?}\n", err);
+        if let Some(display) = this.boot_display {
+            if let Err(err) = crate::mm::boot_display_test::draw(dev, this.mm, display, regions) {
+                dev_err!(dev, "boot display test pattern failed: {:?}\n", err);
+            }
         }
     }
 }

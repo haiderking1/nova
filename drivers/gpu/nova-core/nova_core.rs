@@ -11,6 +11,7 @@ use kernel::{
 };
 
 pub mod api;
+mod boot_display;
 mod driver;
 mod falcon;
 mod fb;

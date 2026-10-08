@@ -292,64 +292,96 @@ impl From<Vfn> for u64 {
 
 impl_frame_number_bounded!(Vfn, 52);
 
-/// soka/experiments: draw into the UEFI framebuffer.
+/// Test pattern for the display the firmware set up at boot.
 ///
-/// The display engine keeps scanning out the mode UEFI set up after nova takes the GPU over, so
-/// writing that framebuffer puts pixels on screen before nova can set a mode itself.
-pub(crate) mod efifb {
+/// Draws through PRAMIN, which reaches any VRAM address without a BAR1 mapping, to check on real
+/// hardware that writing the [`BootDisplay`] framebuffer shows on screen.
+#[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
+pub(crate) mod boot_display_test {
     use core::ops::Range;
 
     use kernel::{
         device,
-        io::io_write, //
+        io::{
+            io_write,
+            Io, //
+        },
+        screen_info::{
+            Channel,
+            PixelFormat, //
+        },
     };
 
     use super::*;
+    use crate::{
+        boot_display::BootDisplay,
+        num::IntoSafeCast, //
+    };
 
-    /// UEFI GOP framebuffer on soka's GA104 VM, from `screen_info`
-    /// (`/sys/kernel/boot_params/data`): 1280x800 XRGB8888 with 8192-byte rows, at the start of
-    /// BAR1, which maps VRAM 1:1 before the GSP boots.
-    const BASE: VramAddress = VramAddress::ZERO;
-    const WIDTH: usize = 1280;
-    const HEIGHT: usize = 800;
-    const STRIDE: u64 = 8192;
-
-    /// Pixels written per PRAMIN access: small enough for the stack, and divides `WIDTH`.
+    /// Pixels written per PRAMIN access: amortizes the window check and ordering read.
     const CHUNK: usize = 64;
 
-    /// Fills the framebuffer with eight vertical color bars.
-    pub(crate) fn draw_test_pattern(
+    /// Returns `rgb` (8 bits per channel, `0xRRGGBB`) encoded in `format`.
+    fn encode(format: &PixelFormat, rgb: u32) -> u32 {
+        let channel = |c: Channel, value: u32| {
+            let value = value & 0xff;
+            match c.length {
+                0 => 0,
+                l @ 1..=8 => (value >> (8 - l)) << c.offset,
+                l => (value << (l - 8)) << c.offset,
+            }
+        };
+
+        channel(format.red, rgb >> 16) | channel(format.green, rgb >> 8) | channel(format.blue, rgb)
+    }
+
+    /// Fills the boot display with eight vertical color bars.
+    pub(crate) fn draw(
         dev: &device::Device<device::Bound>,
         mm: &mut GpuMm<'_>,
+        display: &BootDisplay,
         usable_fb_regions: &[Range<u64>],
     ) -> Result {
         const BARS: [u32; 8] = [
             0xffffff, 0xffff00, 0x00ffff, 0x00ff00, 0xff00ff, 0xff0000, 0x0000ff, 0x202020,
         ];
 
-        let start = BASE.into_raw();
-        let end = start + STRIDE * HEIGHT as u64;
-        dev_info!(dev, "efifb: usable VRAM regions: {:#x?}\n", usable_fb_regions);
-
+        let (start, end) = (display.vram.start.into_raw(), display.vram.end.into_raw());
         // Don't draw over memory nova may hand out.
         if usable_fb_regions.iter().any(|r| r.start < end && start < r.end) {
-            dev_warn!(dev, "efifb: framebuffer [{start:#x}, {end:#x}) is usable VRAM, not drawing\n");
+            dev_warn!(dev, "boot display: [{start:#x}, {end:#x}) is usable VRAM, not drawing\n");
             return Err(EBUSY);
         }
+        if display.format.bits_per_pixel != 32 {
+            dev_info!(dev, "boot display: {} bpp not supported by the test pattern\n",
+                display.format.bits_per_pixel);
+            return Err(ENOTSUPP);
+        }
 
+        let width: usize = display.width.into_safe_cast();
+        let bar = |x: usize| encode(&display.format, BARS[x * BARS.len() / width]);
         let pramin = mm.pramin_mut();
-        for y in 0..HEIGHT {
-            for x in (0..WIDTH).step_by(CHUNK) {
-                let addr = BASE + (STRIDE * y as u64 + (x * size_of::<u32>()) as u64);
-                let access = pramin.window_at::<[u32; CHUNK]>(addr)?;
-                let view = access.view();
-                for i in 0..CHUNK {
-                    io_write!(view, [try: i], BARS[(x + i) * BARS.len() / WIDTH]);
+
+        for y in 0..u64::from(display.height) {
+            let line = display.vram.start + y * u64::from(display.stride);
+            let mut x = 0;
+            while x < width {
+                let addr = line + (x * size_of::<u32>()).into_safe_cast();
+                if x + CHUNK <= width {
+                    let access = pramin.window_at::<[u32; CHUNK]>(addr)?;
+                    let view = access.view();
+                    for i in 0..CHUNK {
+                        io_write!(view, [try: i], bar(x + i));
+                    }
+                    x += CHUNK;
+                } else {
+                    pramin.window_at::<u32>(addr)?.view().write_val(bar(x));
+                    x += 1;
                 }
             }
         }
 
-        dev_info!(dev, "efifb: drew test pattern ({WIDTH}x{HEIGHT})\n");
+        dev_info!(dev, "boot display: drew test pattern ({}x{})\n", display.width, display.height);
         Ok(())
     }
 }
