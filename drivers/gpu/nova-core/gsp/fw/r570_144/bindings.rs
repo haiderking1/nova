@@ -50,6 +50,7 @@ pub const NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE: u32 = 545263890;
 pub const NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_MAX_ENTRIES: u32 = 32;
 pub const NV0073_CTRL_CMD_SYSTEM_GET_NUM_HEADS: u32 = 7536898;
 pub const NV0073_CTRL_CMD_SYSTEM_GET_ACTIVE: u32 = 7536908;
+pub const NV90F1_CTRL_CMD_VASPACE_COPY_SERVER_RESERVED_PDES: u32 = 2431713542;
 pub const NV2080_CTRL_CMD_INTERNAL_DISPLAY_GET_STATIC_INFO: u32 = 545262081;
 pub const NV2080_CTRL_CMD_INTERNAL_STATIC_KGR_GET_CONTEXT_BUFFERS_INFO: u32 = 545262130;
 pub const NV2080_CTRL_CMD_INTERNAL_DISPLAY_WRITE_INST_MEM: u32 = 545262153;
@@ -761,6 +762,27 @@ pub struct NV0073_CTRL_SYSTEM_GET_ACTIVE_PARAMS {
     pub head: u32_,
     pub flags: u32_,
     pub displayId: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS {
+    pub hSubDevice: u32_,
+    pub subDeviceId: u32_,
+    pub pageSize: u64_,
+    pub virtAddrLo: u64_,
+    pub virtAddrHi: u64_,
+    pub numLevelsToCopy: u32_,
+    pub __bindgen_padding_0: [u8; 4usize],
+    pub levels: [NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS__bindgen_ty_1; 6usize],
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS__bindgen_ty_1 {
+    pub physAddress: u64_,
+    pub size: u64_,
+    pub aperture: u32_,
+    pub pageShift: u8_,
+    pub __bindgen_padding_0: [u8; 3usize],
 }
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
@@ -1774,3 +1796,10 @@ pub const ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_INVALID: ENGINE_INFO_TYPE = 15;
 pub const ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_ENGINE_DATA_ARRAY_SIZE: ENGINE_INFO_TYPE = 15;
 pub const ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_PBDMA_ID: ENGINE_INFO_TYPE = 16;
 pub type ENGINE_INFO_TYPE = ffi::c_uint;
+pub const GMMU_APERTURE_GMMU_APERTURE_INVALID: GMMU_APERTURE = 0;
+pub const GMMU_APERTURE_GMMU_APERTURE_VIDEO: GMMU_APERTURE = 1;
+pub const GMMU_APERTURE_GMMU_APERTURE_PEER: GMMU_APERTURE = 2;
+pub const GMMU_APERTURE_GMMU_APERTURE_SYS_NONCOH: GMMU_APERTURE = 3;
+pub const GMMU_APERTURE_GMMU_APERTURE_SYS_COH: GMMU_APERTURE = 4;
+pub const GMMU_APERTURE_GMMU_APERTURE__COUNT: GMMU_APERTURE = 5;
+pub type GMMU_APERTURE = ffi::c_uint;
