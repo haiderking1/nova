@@ -760,13 +760,31 @@ impl<'gpu> Gpu<'gpu> {
 
         #[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
         if let Some(boot) = this.boot_display.as_ref() {
+            // A copy channel for the GPU to fill the test surface.
+            let mut channel = crate::channel::copy::CopyChannel::new(
+                pdev.as_ref(),
+                &gsp_resources.gsp.cmdq,
+                this.mm,
+                this.spec.chipset,
+                display.client(),
+                display.device(),
+                display.subdevice(),
+            )
+            .inspect_err(|e| dev_err!(pdev, "channel: can't set up a copy channel: {:?}\n", e))
+            .ok();
+
             let _ = crate::display::scanout_test::run(
                 pdev.as_ref(),
                 gsp_resources.bar,
                 this.mm,
                 &mut engine,
                 boot,
+                channel.as_mut(),
             );
+
+            if let Some(mut channel) = channel {
+                channel.free(pdev.as_ref(), &gsp_resources.gsp.cmdq, this.mm);
+            }
         }
 
         // Nova's own scanout, of the boot display's mode: Nova can't set modes yet.

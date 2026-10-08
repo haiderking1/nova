@@ -31,7 +31,12 @@ mod sequencer;
 pub use fw::rm::ConnectorType;
 pub(crate) use fw::{
     disp,
-    rm::DISP_PUSHBUFFER_SIZE, //
+    fifo,
+    rm::{
+        ChannelMemory,
+        EngineInfo,
+        DISP_PUSHBUFFER_SIZE, //
+    },
 };
 pub(crate) use fw::{
     GspFmcBootParams,

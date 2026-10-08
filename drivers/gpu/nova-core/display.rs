@@ -76,6 +76,7 @@ pub(crate) struct DisplayId(u32);
 pub(crate) struct Display {
     client: Handle<Client>,
     device: Handle<Device>,
+    subdevice: Handle<Subdevice>,
     common: Handle<DisplayCommon>,
 }
 
@@ -87,38 +88,40 @@ impl Display {
         // A client is its own parent.
         RmAlloc::new(client, client, client, AllocRoot::new(client)).send(dev, cmdq)?;
 
-        let alloc_children = || -> Result<(Handle<Device>, Handle<DisplayCommon>)> {
-            let device = RmAlloc::new(
-                client,
-                client,
-                Handle::<Device>::new(DEVICE_HANDLE),
-                AllocDevice::new(client),
-            )
-            .send(dev, cmdq)?;
+        let alloc_children =
+            || -> Result<(Handle<Device>, Handle<Subdevice>, Handle<DisplayCommon>)> {
+                let device = RmAlloc::new(
+                    client,
+                    client,
+                    Handle::<Device>::new(DEVICE_HANDLE),
+                    AllocDevice::new(client),
+                )
+                .send(dev, cmdq)?;
 
-            RmAlloc::new(
-                client,
-                device,
-                Handle::<Subdevice>::new(SUBDEVICE_HANDLE),
-                AllocSubdevice::new(),
-            )
-            .send(dev, cmdq)?;
+                let subdevice = RmAlloc::new(
+                    client,
+                    device,
+                    Handle::<Subdevice>::new(SUBDEVICE_HANDLE),
+                    AllocSubdevice::new(),
+                )
+                .send(dev, cmdq)?;
 
-            let common = RmAlloc::new(
-                client,
-                device,
-                Handle::<DisplayCommon>::new(DISPLAY_COMMON_HANDLE),
-                AllocDisplayCommon,
-            )
-            .send(dev, cmdq)?;
+                let common = RmAlloc::new(
+                    client,
+                    device,
+                    Handle::<DisplayCommon>::new(DISPLAY_COMMON_HANDLE),
+                    AllocDisplayCommon,
+                )
+                .send(dev, cmdq)?;
 
-            Ok((device, common))
-        };
+                Ok((device, subdevice, common))
+            };
 
         match alloc_children() {
-            Ok((device, common)) => Ok(Self {
+            Ok((device, subdevice, common)) => Ok(Self {
                 client,
                 device,
+                subdevice,
                 common,
             }),
             Err(err) => {
@@ -137,6 +140,11 @@ impl Display {
     /// Returns the device the display engine's objects are allocated under.
     pub(crate) fn device(&self) -> Handle<Device> {
         self.device
+    }
+
+    /// Returns the subdevice the display engine's objects are allocated under.
+    pub(crate) fn subdevice(&self) -> Handle<Subdevice> {
+        self.subdevice
     }
 
     /// Frees the RM objects. GSP-RM frees all the objects of the client along with it.

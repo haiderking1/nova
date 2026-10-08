@@ -12,6 +12,7 @@ use kernel::{
 
 pub mod api;
 mod boot_display;
+mod channel;
 mod display;
 mod driver;
 mod falcon;

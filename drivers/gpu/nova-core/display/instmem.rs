@@ -108,7 +108,14 @@ impl InstMem {
         handle: u32,
         range: Range<u64>,
     ) -> Result {
-        self.bind(mm, client, channel, handle, CTXDMA_TARGET_PCI_COHERENT, range)
+        self.bind(
+            mm,
+            client,
+            channel,
+            handle,
+            CTXDMA_TARGET_PCI_COHERENT,
+            range,
+        )
     }
 
     /// Binds a context DMA named `handle` to `channel`, giving it read and write access to the

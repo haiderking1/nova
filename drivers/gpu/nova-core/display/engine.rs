@@ -497,7 +497,10 @@ fn log_armed_state(dev: &device::Device, bar: Bar0<'_>) {
     // What the window Nova uses is allowed to do.
     let window = WINDOW * 0x80;
     log("WINDOW_SET_WINDOW_FORMAT_USAGE_BOUNDS", 0x1004 + window);
-    log("WINDOW_SET_WINDOW_ROTATED_FORMAT_USAGE_BOUNDS", 0x1008 + window);
+    log(
+        "WINDOW_SET_WINDOW_ROTATED_FORMAT_USAGE_BOUNDS",
+        0x1008 + window,
+    );
     log("WINDOW_SET_MAX_INPUT_SCALE_FACTOR", 0x100c + window);
     log("WINDOW_SET_WINDOW_USAGE_BOUNDS", 0x1010 + window);
     for (name, method) in LOGGED_HEAD_METHODS {
