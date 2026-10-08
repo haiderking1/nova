@@ -3,8 +3,7 @@
 //! The display engine, as exposed by GSP-RM.
 //!
 //! GSP-RM owns the display hardware. Nova queries and controls it through RM control commands sent
-//! to an `NV04_DISPLAY_COMMON` object, which lives in an RM object tree that Nova allocates for
-//! itself: client -> device -> subdevice, and the display common object under the device.
+//! to an `NV04_DISPLAY_COMMON` object, which Nova allocates under the device of its RM client.
 //!
 //! To drive the display engine itself, Nova takes it over from GSP-RM: see [`DisplayEngine`].
 
@@ -35,101 +34,58 @@ use crate::gsp::{
         Client,
         Device,
         DisplayCommon,
-        Handle,
-        Subdevice, //
+        Handle, //
     },
-    rm::commands::{
-        AllocDevice,
-        AllocDisplayCommon,
-        AllocRoot,
-        AllocSubdevice,
-        DispGetActive,
-        DispGetConnectorType,
-        DispGetEdid,
-        DispGetNumHeads,
-        RmAlloc,
-        RmControl,
-        RmFree, //
+    rm::{
+        commands::{
+            AllocDisplayCommon,
+            DispGetActive,
+            DispGetConnectorType,
+            DispGetEdid,
+            DispGetNumHeads,
+            RmAlloc,
+            RmControl,
+            RmFree, //
+        },
+        device::RmDevice,
     },
     ConnectorType,
 };
 
-// Handles of the RM objects Nova allocates for the display engine. The caller of an allocation picks
-// the handle; these are the values nouveau uses for the same objects.
-
-/// Handle of the client, the first in the range GSP-RM uses for clients.
-const CLIENT_HANDLE: u32 = 0xc1d0_0000;
-/// Handle of the device.
-const DEVICE_HANDLE: u32 = 0xde1d_0000;
-/// Handle of the subdevice.
-const SUBDEVICE_HANDLE: u32 = 0x5d1d_0000;
-/// Handle of the display common object, after its class.
+/// Handle of the display common object, after its class. The caller of an allocation picks the
+/// handle; this is the value nouveau uses for the same object.
 const DISPLAY_COMMON_HANDLE: u32 = 0x0073_0000;
 
 /// A display, i.e. a display output path of the display engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DisplayId(u32);
 
-/// The display engine, through the RM objects allocated to query and control it.
+/// The display engine, through the RM object allocated to query and control it.
 ///
-/// The objects must be released with [`Display::free`] while the GSP is running.
+/// The object must be released with [`Display::free`] while the GSP is running.
 pub(crate) struct Display {
     client: Handle<Client>,
     device: Handle<Device>,
-    subdevice: Handle<Subdevice>,
     common: Handle<DisplayCommon>,
 }
 
 impl Display {
-    /// Allocates the RM objects needed to query and control the display engine.
-    pub(crate) fn new(dev: &device::Device, cmdq: &Cmdq<'_>) -> Result<Self> {
-        let client = Handle::<Client>::new(CLIENT_HANDLE);
+    /// Allocates the RM object needed to query and control the display engine, under the device
+    /// of `rm`.
+    pub(crate) fn new(dev: &device::Device, cmdq: &Cmdq<'_>, rm: &RmDevice) -> Result<Self> {
+        let common = RmAlloc::new(
+            rm.client(),
+            rm.device(),
+            Handle::<DisplayCommon>::new(DISPLAY_COMMON_HANDLE),
+            AllocDisplayCommon,
+        )
+        .send(dev, cmdq)?;
 
-        // A client is its own parent.
-        RmAlloc::new(client, client, client, AllocRoot::new(client)).send(dev, cmdq)?;
-
-        let alloc_children =
-            || -> Result<(Handle<Device>, Handle<Subdevice>, Handle<DisplayCommon>)> {
-                let device = RmAlloc::new(
-                    client,
-                    client,
-                    Handle::<Device>::new(DEVICE_HANDLE),
-                    AllocDevice::new(client),
-                )
-                .send(dev, cmdq)?;
-
-                let subdevice = RmAlloc::new(
-                    client,
-                    device,
-                    Handle::<Subdevice>::new(SUBDEVICE_HANDLE),
-                    AllocSubdevice::new(),
-                )
-                .send(dev, cmdq)?;
-
-                let common = RmAlloc::new(
-                    client,
-                    device,
-                    Handle::<DisplayCommon>::new(DISPLAY_COMMON_HANDLE),
-                    AllocDisplayCommon,
-                )
-                .send(dev, cmdq)?;
-
-                Ok((device, subdevice, common))
-            };
-
-        match alloc_children() {
-            Ok((device, subdevice, common)) => Ok(Self {
-                client,
-                device,
-                subdevice,
-                common,
-            }),
-            Err(err) => {
-                // Freeing the client frees whatever was allocated under it.
-                let _ = RmFree::new(client, client).send(dev, cmdq);
-                Err(err)
-            }
-        }
+        Ok(Self {
+            client: rm.client(),
+            device: rm.device(),
+            common,
+        })
     }
 
     /// Returns the client the RM objects of the display engine are allocated under.
@@ -142,14 +98,9 @@ impl Display {
         self.device
     }
 
-    /// Returns the subdevice the display engine's objects are allocated under.
-    pub(crate) fn subdevice(&self) -> Handle<Subdevice> {
-        self.subdevice
-    }
-
-    /// Frees the RM objects. GSP-RM frees all the objects of the client along with it.
+    /// Frees the RM object.
     pub(crate) fn free(self, dev: &device::Device, cmdq: &Cmdq<'_>) -> Result {
-        Ok(RmFree::new(self.client, self.client).send(dev, cmdq)?)
+        Ok(RmFree::new(self.client, self.common).send(dev, cmdq)?)
     }
 
     /// Returns the first display that is active on a head, such as the one the system firmware

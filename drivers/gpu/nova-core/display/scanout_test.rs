@@ -77,7 +77,13 @@ pub(crate) fn run(
 
     let gpu_filled = match channel {
         Some(channel) => gpu_fill(bar, mm, channel, fb.range(), &test, GREEN)
-            .inspect_err(|e| dev_err!(dev, "display: the GPU can't fill the test surface: {:?}\n", e))
+            .inspect_err(|e| {
+                dev_err!(
+                    dev,
+                    "display: the GPU can't fill the test surface: {:?}\n",
+                    e
+                )
+            })
             .is_ok(),
         None => false,
     };

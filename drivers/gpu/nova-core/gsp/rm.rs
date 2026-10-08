@@ -1,3 +1,4 @@
 // SPDX-License-Identifier: GPL-2.0
 
 pub(crate) mod commands;
+pub(crate) mod device;

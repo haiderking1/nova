@@ -47,6 +47,7 @@ use crate::{
         self,
         cmdq::Cmdq,
         commands::GetGspStaticInfoReply,
+        rm::device::RmDevice,
         ConnectorType,
         Gsp,
         GspBootContext, //
@@ -411,6 +412,10 @@ pub(crate) struct Gpu<'gpu> {
     _gsp_subtree: GspSubtree<'gpu>,
     /// Static GPU information as provided by the GSP.
     pub(crate) gsp_static_info: GetGspStaticInfoReply,
+    /// Nova's RM client, which its other RM objects are allocated under, if it could be allocated.
+    ///
+    /// Freed in [`Gpu`]'s `PinnedDrop`, while the GSP is still running.
+    rm: Option<RmDevice>,
     /// RM objects for the display engine, if they could be allocated.
     ///
     /// Freed in [`Gpu`]'s `PinnedDrop`, while the GSP is still running.
@@ -606,10 +611,17 @@ impl<'gpu> Gpu<'gpu> {
                 info
             },
 
-            // Not fatal: the display engine is only needed to describe the boot display.
-            display: Display::new(dev, &gsp_resources.gsp.cmdq)
-                .inspect_err(|e| dev_warn!(dev, "can't access the display engine: {:?}\n", e))
+            // Not fatal: the RM client is only needed for the display engine and channels.
+            rm: RmDevice::new(dev, &gsp_resources.gsp.cmdq)
+                .inspect_err(|e| dev_warn!(dev, "can't allocate an RM client: {:?}\n", e))
                 .ok(),
+
+            // Not fatal: the display engine is only needed to describe the boot display.
+            display: rm.as_ref().and_then(|rm| {
+                Display::new(dev, &gsp_resources.gsp.cmdq, rm)
+                    .inspect_err(|e| dev_warn!(dev, "can't access the display engine: {:?}\n", e))
+                    .ok()
+            }),
 
             boot_output: display.as_ref().and_then(|display| {
                 let output = display
@@ -766,9 +778,7 @@ impl<'gpu> Gpu<'gpu> {
                 &gsp_resources.gsp.cmdq,
                 this.mm,
                 this.spec.chipset,
-                display.client(),
-                display.device(),
-                display.subdevice(),
+                this.rm.as_ref().ok_or(ENODEV)?,
             )
             .inspect_err(|e| dev_err!(pdev, "channel: can't set up a copy channel: {:?}\n", e))
             .ok();
@@ -945,6 +955,13 @@ impl PinnedDrop for Gpu<'_> {
             let _ = display
                 .free(dev, &gsp_resources.gsp.cmdq)
                 .inspect_err(|e| dev_err!(dev, "failed to free the display objects: {:?}\n", e));
+        }
+
+        // Last, as every other RM object is allocated under it.
+        if let Some(rm) = this.rm.take() {
+            let _ = rm
+                .free(dev, &gsp_resources.gsp.cmdq)
+                .inspect_err(|e| dev_err!(dev, "failed to free the RM client: {:?}\n", e));
         }
     }
 }

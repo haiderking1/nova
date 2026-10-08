@@ -28,13 +28,10 @@ use crate::{
     gpu::Chipset,
     gsp::{
         cmdq::Cmdq,
-        ChannelMemory,
-        EngineInfo,
         commands::{
             Channel,
             Client,
             CopyEngine,
-            Device,
             Handle,
             Subdevice, //
         },
@@ -42,17 +39,21 @@ use crate::{
             copy_c7b5,
             host_c56f, //
         },
-        rm::commands::{
-            AllocChannelGpfifoAmpere,
-            AllocCopyEngineAmpereB,
-            CeGetFaultMethodBufferSize,
-            FifoGetDeviceInfoTable,
-            GpfifoBind,
-            GpfifoSchedule,
-            RmAlloc,
-            RmControl,
-            RmFree, //
+        rm::{
+            commands::{
+                AllocChannelGpfifoAmpere,
+                AllocCopyEngineAmpereB,
+                CeGetFaultMethodBufferSize,
+                FifoGetDeviceInfoTable,
+                GpfifoBind,
+                GpfifoSchedule,
+                RmAlloc,
+                RmControl,
+                RmFree, //
+            },
+            device::RmDevice,
         },
+        ChannelMemory, EngineInfo,
     },
     mm::{
         vmm::MappedRange,
@@ -123,28 +124,23 @@ pub(crate) struct CopyChannel<'a> {
 
 impl<'a> CopyChannel<'a> {
     /// Allocates a channel on a copy engine that doesn't share its runlist with the graphics
-    /// engine, under `device` of `client`.
-    #[expect(clippy::too_many_arguments)]
+    /// engine, under the device of `rm`.
     pub(crate) fn new(
         dev: &'a device::Device<device::Bound>,
         cmdq: &Cmdq<'_>,
         mm: &mut GpuMm<'_>,
         chipset: Chipset,
-        client: Handle<Client>,
-        device: Handle<Device>,
-        subdevice: Handle<Subdevice>,
+        rm: &RmDevice,
     ) -> Result<Self> {
+        let (client, device, subdevice) = (rm.client(), rm.device(), rm.subdevice());
         let engine = Self::find_engine(dev, cmdq, client, subdevice)?;
         let copy_engine_index = engine.copy_engine_index().ok_or(ENODEV)?;
         dev_dbg!(dev, "channel: copy engine {:?}\n", engine);
 
-        let method_buffer_size = RmControl::new(client, subdevice, CeGetFaultMethodBufferSize::new())
-            .send(dev, cmdq)?;
-        let method_buffer = Coherent::<u8>::zeroed_slice(
-            dev,
-            num::u32_as_usize(method_buffer_size),
-            GFP_KERNEL,
-        )?;
+        let method_buffer_size =
+            RmControl::new(client, subdevice, CeGetFaultMethodBufferSize::new()).send(dev, cmdq)?;
+        let method_buffer =
+            Coherent::<u8>::zeroed_slice(dev, num::u32_as_usize(method_buffer_size), GFP_KERNEL)?;
 
         let alloc_cleared = |mm: &mut GpuMm<'_>, size: usize| -> Result<ContiguousVram> {
             let vram = mm.alloc_contiguous(size, Alignment::new::<SZ_4K>())?;
@@ -243,9 +239,8 @@ impl<'a> CopyChannel<'a> {
         let mut engines = KVec::new();
         let mut base = 0;
         loop {
-            let (page, more) =
-                RmControl::new(client, subdevice, FifoGetDeviceInfoTable::new(base))
-                    .send(dev, cmdq)?;
+            let (page, more) = RmControl::new(client, subdevice, FifoGetDeviceInfoTable::new(base))
+                .send(dev, cmdq)?;
             engines.extend_from_slice(&page, GFP_KERNEL)?;
             if !more {
                 break;
@@ -348,7 +343,8 @@ impl<'a> CopyChannel<'a> {
 
         mm.write_vram(control + num::usize_as_u64(PUSH_BUFFER), push)?;
 
-        let entry = host_c56f::gp_entry(self.control_va()? + num::usize_as_u64(PUSH_BUFFER), words)?;
+        let entry =
+            host_c56f::gp_entry(self.control_va()? + num::usize_as_u64(PUSH_BUFFER), words)?;
         let entry_offset = GPFIFO + num::u32_as_usize(self.put) * host_c56f::GP_ENTRY_SIZE;
         mm.write_vram(control + num::usize_as_u64(entry_offset), &entry)?;
 
