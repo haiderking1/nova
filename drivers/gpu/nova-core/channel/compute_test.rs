@@ -29,22 +29,22 @@ use super::{
     COMPUTE_CHID,
 };
 
-/// Value the storing shaders store.
+/// Value the storing shader stores.
 const VALUE: u32 = 0x600d_cafe;
-/// Value the compute engine writes once the last shader is done, without running instructions:
+/// Value the compute engine writes once the storing shader is done, without running instructions:
 /// tells a wrong shader from writes not reaching memory.
 const RELEASED: u32 = 0x0d07_e000;
 
 // Layout of the test's memory page. Programs are 128-byte aligned, work descriptors 256-byte
 // aligned.
 
-/// Offset of the program that only exits; the storing programs follow, 128 bytes apart.
+/// Offset of the program that only exits; the storing program follows, 128 bytes after.
 const EXIT_PROGRAM: u64 = 0x000;
-/// Offset of the work descriptor running the program that only exits; those running the storing
-/// programs follow, 256 bytes apart.
+/// Offset of the work descriptor running the program that only exits; that running the storing
+/// program follows, 256 bytes after.
 const EXIT_QMD: u64 = 0x400;
-/// Offset of the word the first storing program stores to; the others follow, 16 bytes apart.
-const RESULTS: u64 = 0xa00;
+/// Offset of the word the storing program stores [`VALUE`] to.
+const RESULT: u64 = 0xa00;
 /// Offset of the word [`RELEASED`] is written to.
 const RELEASE: u64 = 0xb00;
 
@@ -72,102 +72,25 @@ const fn stg(data: u32, deps: u32) -> [u32; 4] {
     [0x0200_7986, data, 0x0c10_093f, deps]
 }
 
-/// Encodes `NOP`: does nothing.
-const fn nop(deps: u32) -> [u32; 4] {
-    [0x0000_7918, 0, 0, deps]
-}
-
 /// `EXIT`: ends the thread.
 const EXIT: [u32; 4] = [0x0000_794d, 0, 0x0380_0000, 0x000f_ea00];
 /// `BRA .`: loops on itself, after `EXIT`, as compilers end programs.
 const BRA_SELF: [u32; 4] = [0x0000_7947, 0xffff_fff0, 0x0383_ffff, 0x000f_c000];
 
-/// Scheduling bits of the first programs: the longest stall, yielding, as nvcc's control words.
-const FIRST_DEPS: u32 = deps(15, true);
-
-/// A storing program the test runs.
-struct Variant {
-    /// What the variant tells.
-    name: &'static str,
-    /// The instructions storing, given the address to store to; `EXIT` and `BRA .` follow.
-    instructions: fn(u64) -> [[u32; 4]; 6],
-    /// Value the program stores, given the address it stores to.
-    expected: fn(u64) -> u32,
+/// The program storing [`VALUE`] at `addr`, scheduled like Mesa's NAK compiler does: the store
+/// waits 5 cycles for the `MOV` setting its value, without yielding, which would make the store
+/// not wait for it.
+// CAST: the address is split into its low and high 32 bits.
+fn store_program(addr: u64) -> [[u32; 4]; 6] {
+    [
+        mov(2, addr as u32, deps(1, false)),
+        mov(3, (addr >> 32) as u32, deps(1, false)),
+        mov(5, VALUE, deps(5, false)),
+        stg(5, deps(1, false)),
+        EXIT,
+        BRA_SELF,
+    ]
 }
-
-// CAST: addresses are split into their low and high 32 bits.
-const VARIANTS: [Variant; 5] = [
-    Variant {
-        name: "store R5, as first",
-        instructions: |addr| {
-            [
-                mov(2, addr as u32, FIRST_DEPS),
-                mov(3, (addr >> 32) as u32, FIRST_DEPS),
-                mov(5, VALUE, FIRST_DEPS),
-                stg(5, FIRST_DEPS),
-                nop(deps(1, false)),
-                nop(deps(1, false)),
-            ]
-        },
-        expected: |_| VALUE,
-    },
-    Variant {
-        name: "store R5, stalling 5 cycles without yielding (NAK)",
-        instructions: |addr| {
-            [
-                mov(2, addr as u32, deps(1, false)),
-                mov(3, (addr >> 32) as u32, deps(1, false)),
-                mov(5, VALUE, deps(5, false)),
-                stg(5, deps(1, false)),
-                nop(deps(1, false)),
-                nop(deps(1, false)),
-            ]
-        },
-        expected: |_| VALUE,
-    },
-    Variant {
-        name: "store R5, 2 NOPs before the store",
-        instructions: |addr| {
-            [
-                mov(2, addr as u32, FIRST_DEPS),
-                mov(3, (addr >> 32) as u32, FIRST_DEPS),
-                mov(5, VALUE, FIRST_DEPS),
-                nop(FIRST_DEPS),
-                nop(FIRST_DEPS),
-                stg(5, FIRST_DEPS),
-            ]
-        },
-        expected: |_| VALUE,
-    },
-    Variant {
-        name: "store R5, a NOP first",
-        instructions: |addr| {
-            [
-                nop(FIRST_DEPS),
-                mov(2, addr as u32, FIRST_DEPS),
-                mov(3, (addr >> 32) as u32, FIRST_DEPS),
-                mov(5, VALUE, FIRST_DEPS),
-                stg(5, FIRST_DEPS),
-                nop(deps(1, false)),
-            ]
-        },
-        expected: |_| VALUE,
-    },
-    Variant {
-        name: "store R5, stalling 15 cycles without yielding",
-        instructions: |addr| {
-            [
-                mov(2, addr as u32, deps(15, false)),
-                mov(3, (addr >> 32) as u32, deps(15, false)),
-                mov(5, VALUE, deps(15, false)),
-                stg(5, deps(1, false)),
-                nop(deps(1, false)),
-                nop(deps(1, false)),
-            ]
-        },
-        expected: |_| VALUE,
-    },
-];
 
 /// Runs the self-test on a compute channel on the graphics engine of `gr`.
 pub(crate) fn run(
@@ -222,46 +145,38 @@ fn run_on(
         channel.launch(bar, mm, va + EXIT_QMD)?;
         dev_info!(dev, "compute test: a shader ran\n");
 
-        let mut passed = true;
-        for (i, variant) in (1u64..).zip(VARIANTS.iter()) {
-            let program_offset = EXIT_PROGRAM + 0x80 * i;
-            let qmd_offset = EXIT_QMD + 0x100 * i;
-            let result = RESULTS + 0x10 * (i - 1);
-
-            program.clear();
-            for instruction in (variant.instructions)(va + result) {
-                program.extend_from_slice(&instruction, GFP_KERNEL)?;
-            }
-            program.extend_from_slice(&EXIT, GFP_KERNEL)?;
-            program.extend_from_slice(&BRA_SELF, GFP_KERNEL)?;
-            write(mm, program_offset, &program)?;
-            write(
-                mm,
-                qmd_offset,
-                qmd(program_offset, REGISTERS)
-                    .release(va + RELEASE, RELEASED + u32::try_from(i)?)?
-                    .words(),
-            )?;
-
-            channel.launch(bar, mm, va + qmd_offset)?;
-            let stored = mm.read_vram(base + result)?;
-            let released = mm.read_vram(base + RELEASE)?;
-            let expected = (variant.expected)(va + result);
-            dev_info!(
-                dev,
-                "compute test: {}: stored {:#010x} (expected {:#010x}), released {:#010x} (expected {:#010x})\n",
-                variant.name,
-                stored,
-                expected,
-                released,
-                RELEASED + u32::try_from(i)?
-            );
-            passed &= stored == expected;
+        // Store `VALUE`, then have the engine release `RELEASED` once done.
+        let program_offset = EXIT_PROGRAM + 0x80;
+        let qmd_offset = EXIT_QMD + 0x100;
+        program.clear();
+        for instruction in store_program(va + RESULT) {
+            program.extend_from_slice(&instruction, GFP_KERNEL)?;
         }
+        write(mm, program_offset, &program)?;
+        write(
+            mm,
+            qmd_offset,
+            qmd(program_offset, REGISTERS)
+                .release(va + RELEASE, RELEASED)?
+                .words(),
+        )?;
 
-        if !passed {
+        channel.launch(bar, mm, va + qmd_offset)?;
+        let stored = mm.read_vram(base + RESULT)?;
+        let released = mm.read_vram(base + RELEASE)?;
+        if stored != VALUE || released != RELEASED {
+            dev_err!(
+                dev,
+                "compute test: the shader stored {:#010x} (expected {:#010x}), the engine released {:#010x} (expected {:#010x})\n",
+                stored,
+                VALUE,
+                released,
+                RELEASED
+            );
             return Err(EIO);
         }
+        dev_info!(dev, "compute test: a shader stored {:#010x}\n", stored);
+
         Ok(())
     })();
 
