@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 pub(crate) mod commands;
+pub(crate) mod disp;
 mod r570_144;
 pub(crate) mod rm;
 
@@ -33,6 +34,7 @@ use kernel::{
         SizeConstants,
         SZ_128K, //
     },
+    str::BStr,
     transmute::{
         AsBytes,
         FromBytes, //
@@ -1559,3 +1561,30 @@ impl GspFmcBootParams {
         init
     }
 }
+
+/// Payload of the `OsErrorLog` event: an error GSP-RM ran into (`rpc_os_error_log_v17_00`).
+#[repr(transparent)]
+pub(crate) struct OsErrorLog(bindings::rpc_os_error_log_v17_00);
+
+impl OsErrorLog {
+    /// Returns the type of the exception, one of RM's `ROBUST_CHANNEL_*` codes.
+    pub(crate) fn exception_type(&self) -> u32 {
+        self.0.exceptType
+    }
+
+    /// Returns the channel the error happened on.
+    pub(crate) fn channel(&self) -> u32 {
+        self.0.chid
+    }
+
+    /// Returns GSP-RM's description of the error.
+    pub(crate) fn message(&self) -> &BStr {
+        let bytes = AsBytes::as_bytes(&self.0.errString);
+        let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+
+        BStr::from_bytes(&bytes[..len])
+    }
+}
+
+// SAFETY: This struct only contains integer types for which all bit patterns are valid.
+unsafe impl FromBytes for OsErrorLog {}

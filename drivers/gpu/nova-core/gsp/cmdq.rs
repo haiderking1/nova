@@ -55,6 +55,7 @@ use crate::{
             MsgFunction,
             MsgqRxHeader,
             MsgqTxHeader,
+            OsErrorLog,
             GSP_MSG_QUEUE_ELEMENT_SIZE_MAX, //
         },
         PteArray,
@@ -887,14 +888,13 @@ impl CmdqInner<'_> {
     {
         let message = self.wait_for_msg(timeout).map_err(GspRpcError::Transport)?;
         let function = message.header.function();
-        let seq = message.header.sequence();
 
         // An early return here would leave the read pointer on this message.
         let result = (|| -> Result<M, GspRpcError> {
             let function = match function {
                 Ok(f) if f == M::FUNCTION => f,
                 _ => {
-                    self.log_event(function, seq);
+                    self.log_event(&message);
                     return Err(GspRpcError::Transport(ENOMSG));
                 }
             };
@@ -972,11 +972,21 @@ impl CmdqInner<'_> {
     /// An OS error or robust-channel record is logged at error level and an unknown function code
     /// at warning level. Every other event is recorded only by the receive trace in
     /// [`Self::wait_for_msg`].
-    fn log_event(&self, function: Result<MsgFunction, u32>, seq: u32) {
-        match function {
-            Ok(MsgFunction::OsErrorLog) => {
-                dev_err!(&self.dev, "GSP reported an OS error (seq {})\n", seq);
-            }
+    fn log_event(&self, message: &GspMessage<'_>) {
+        let seq = message.header.sequence();
+
+        match message.header.function() {
+            Ok(MsgFunction::OsErrorLog) => match Self::os_error_log(message) {
+                Some(log) => dev_err!(
+                    &self.dev,
+                    "GSP reported an OS error (seq {}): exception {} on channel {}: {}\n",
+                    seq,
+                    log.exception_type(),
+                    log.channel(),
+                    log.message()
+                ),
+                None => dev_err!(&self.dev, "GSP reported an OS error (seq {})\n", seq),
+            },
             Ok(MsgFunction::RcTriggered) => {
                 dev_err!(
                     &self.dev,
@@ -997,6 +1007,16 @@ impl CmdqInner<'_> {
         }
     }
 
+    /// Decodes the payload of an `OsErrorLog` event, if it is complete.
+    fn os_error_log(message: &GspMessage<'_>) -> Option<OsErrorLog> {
+        let mut bytes = [0u8; size_of::<OsErrorLog>()];
+        SBufferIter::new_reader([message.contents.0, message.contents.1])
+            .read_exact(&mut bytes)
+            .ok()?;
+
+        OsErrorLog::from_bytes_copy(&bytes)
+    }
+
     /// Logs and consumes every message the queue holds.
     ///
     /// # Errors
@@ -1013,11 +1033,9 @@ impl CmdqInner<'_> {
                     dev_err!(&self.dev, "GSP drain: message length overflow\n");
                     EIO
                 })?;
-            let function = msg.header.function();
-            let seq = msg.header.sequence();
-
+            // Log before advancing, which hands the message's room back to the GSP.
+            self.log_event(&msg);
             self.gsp_mem.advance_cpu_read_ptr(pages);
-            self.log_event(function, seq);
         }
 
         Ok(())
