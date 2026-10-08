@@ -35,6 +35,9 @@ pub const NV2080_CTRL_GPU_SET_POWER_STATE_GPU_LEVEL_3: u32 = 3;
 pub const NV2080_CTRL_GPU_SET_POWER_STATE_GPU_LEVEL_7: u32 = 7;
 pub const NV0073_CTRL_CMD_SYSTEM_GET_NUM_HEADS: u32 = 7536898;
 pub const NV0073_CTRL_CMD_SYSTEM_GET_ACTIVE: u32 = 7536908;
+pub const NV2080_CTRL_CMD_INTERNAL_DISPLAY_GET_STATIC_INFO: u32 = 545262081;
+pub const NV2080_CTRL_CMD_INTERNAL_DISPLAY_WRITE_INST_MEM: u32 = 545262153;
+pub const NV2080_CTRL_CMD_INTERNAL_DISPLAY_CHANNEL_PUSHBUFFER: u32 = 545262168;
 pub const NV20_SUBDEVICE_0: u32 = 8320;
 pub const NV01_ROOT: u32 = 0;
 pub const NV_VGPU_MSG_SIGNATURE_VALID: u32 = 1129337430;
@@ -51,10 +54,14 @@ pub const GSP_FW_HEAP_SIZE_OVERRIDE_LIBOS3_BAREMETAL_MIN_MB: u32 = 88;
 pub const GSP_FW_HEAP_SIZE_OVERRIDE_LIBOS3_BAREMETAL_MAX_MB: u32 = 280;
 pub const GSP_FW_WPR_META_REVISION: u32 = 1;
 pub const GSP_FW_WPR_META_MAGIC: i64 = -2577556379034558285;
+pub const NV_MEMORY_WRITECOMBINED: u32 = 2;
 pub const REGISTRY_TABLE_ENTRY_TYPE_DWORD: u32 = 1;
 pub const GSP_MSG_QUEUE_ELEMENT_SIZE_MAX: u32 = 65536;
 pub const NV2080_CTRL_CMD_CE_GET_FAULT_METHOD_BUFFER_SIZE: u32 = 545270280;
 pub const NV04_DISPLAY_COMMON: u32 = 115;
+pub const NVC670_DISPLAY: u32 = 50800;
+pub const NVC67D_CORE_CHANNEL_DMA: u32 = 50813;
+pub const NVC67D_SET_CONTEXT_DMA_NOTIFIER: u32 = 520;
 pub const NV01_DEVICE_0: u32 = 128;
 pub const NV0073_CTRL_CMD_SPECIFIC_GET_EDID_V2: u32 = 7537221;
 pub const NV0073_CTRL_SPECIFIC_GET_EDID_FLAGS_COPY_CACHE_NO: u32 = 0;
@@ -610,8 +617,77 @@ pub struct NV0073_CTRL_SYSTEM_GET_ACTIVE_PARAMS {
 }
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV2080_CTRL_INTERNAL_DISPLAY_GET_STATIC_INFO_PARAMS {
+    pub feHwSysCap: u32_,
+    pub windowPresentMask: u32_,
+    pub bFbRemapperEnabled: u8_,
+    pub __bindgen_padding_0: [u8; 3usize],
+    pub numHeads: u32_,
+    pub i2cPort: u32_,
+    pub internalDispActiveMask: u32_,
+    pub embeddedDisplayPortMask: u32_,
+    pub bExternalMuxSupported: u8_,
+    pub bInternalMuxSupported: u8_,
+    pub __bindgen_padding_1: [u8; 2usize],
+    pub numDispChannels: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV2080_CTRL_INTERNAL_DISPLAY_WRITE_INST_MEM_PARAMS {
+    pub instMemPhysAddr: u64_,
+    pub instMemSize: u64_,
+    pub instMemAddrSpace: u32_,
+    pub instMemCpuCacheAttr: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV2080_CTRL_INTERNAL_DISPLAY_CHANNEL_PUSHBUFFER_PARAMS {
+    pub addressSpace: u32_,
+    pub __bindgen_padding_0: [u8; 4usize],
+    pub physicalAddr: u64_,
+    pub limit: u64_,
+    pub cacheSnoop: u32_,
+    pub hclass: u32_,
+    pub channelInstance: u32_,
+    pub valid: u8_,
+    pub __bindgen_padding_1: [u8; 3usize],
+    pub pbTargetAperture: u32_,
+    pub channelPBSize: u32_,
+    pub subDeviceId: u32_,
+    pub __bindgen_padding_2: [u8; 4usize],
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
 pub struct NV2080_ALLOC_PARAMETERS {
     pub subDeviceId: u32_,
+}
+pub const ChannelPBSize_PB_SIZE_4KB: ChannelPBSize = 0;
+pub const ChannelPBSize_PB_SIZE_8KB: ChannelPBSize = 1;
+pub const ChannelPBSize_PB_SIZE_16KB: ChannelPBSize = 2;
+pub const ChannelPBSize_PB_SIZE_32KB: ChannelPBSize = 3;
+pub const ChannelPBSize_PB_SIZE_64KB: ChannelPBSize = 4;
+pub type ChannelPBSize = ffi::c_uint;
+#[repr(C)]
+#[derive(Debug, Copy, Clone, MaybeZeroable)]
+pub struct NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS {
+    pub channelInstance: u32_,
+    pub hObjectBuffer: u32_,
+    pub hObjectNotify: u32_,
+    pub offset: u32_,
+    pub pControl: *mut ffi::c_void,
+    pub flags: u32_,
+    pub channelPBSize: ChannelPBSize,
+    pub subDeviceId: u32_,
+    pub __bindgen_padding_0: [u8; 4usize],
+}
+impl Default for NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS {
+    fn default() -> Self {
+        let mut s = ::core::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::core::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone, MaybeZeroable)]
