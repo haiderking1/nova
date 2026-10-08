@@ -14,6 +14,10 @@ use crate::{
         Normal,
         kms::{
             atomic::*,
+            modes::{
+                DisplayMode,
+                ModeStatus, //
+            },
             KmsDriver,
             KmsProbe,
             KmsRef,
@@ -121,7 +125,11 @@ pub trait DriverCrtc: Send + Sync + Sized {
             prepare: None,
             disable: None,
             mode_set: None,
-            mode_valid: None,
+            mode_valid: if Self::HAS_MODE_VALID {
+                Some(mode_valid_callback::<Self>)
+            } else {
+                None
+            },
             mode_fixup: None,
             atomic_begin: if Self::HAS_ATOMIC_BEGIN {
                 Some(atomic_begin_callback::<Self>)
@@ -172,6 +180,16 @@ pub trait DriverCrtc: Send + Sync + Sized {
     ///
     /// [`drm_crtc_helper_funcs.atomic_check`]: srctree/include/drm/drm_modeset_helper_vtables.h
     fn atomic_check(_check: CrtcAtomicCheck<'_, Self>) -> Result {
+        build_error::build_error("This should not be reachable")
+    }
+
+    /// The optional [`drm_crtc_helper_funcs.mode_valid`] hook for this crtc.
+    ///
+    /// Drivers may use this to reject modes the [`Crtc`] can't drive, e.g. anything but the fixed
+    /// mode of a display it can't reprogram, see [`Crtc::mode_valid_fixed()`].
+    ///
+    /// [`drm_crtc_helper_funcs.mode_valid`]: srctree/include/drm/drm_modeset_helper_vtables.h
+    fn mode_valid(_crtc: &Crtc<Self>, _mode: &DisplayMode) -> ModeStatus {
         build_error::build_error("This should not be reachable")
     }
 
@@ -399,6 +417,24 @@ impl<T: DriverCrtc, C: DeviceContext> Crtc<T, C> {
     pub(crate) fn get_vblank_ptr(&self) -> *mut bindings::drm_vblank_crtc {
         // SAFETY: FFI Call with no special requirements
         unsafe { bindings::drm_crtc_vblank_crtc(self.as_raw()) }
+    }
+
+    /// Check `mode` against `fixed_mode`, the only mode this CRTC can drive.
+    ///
+    /// For use in [`DriverCrtc::mode_valid()`]. This is the equivalent of
+    /// [`drm_crtc_helper_mode_valid_fixed()`].
+    ///
+    /// [`drm_crtc_helper_mode_valid_fixed()`]: srctree/drivers/gpu/drm/drm_probe_helper.c
+    pub fn mode_valid_fixed(&self, mode: &DisplayMode, fixed_mode: &DisplayMode) -> ModeStatus {
+        // SAFETY: `self.as_raw()` is a valid `struct drm_crtc` via our type invariants, and both
+        // modes are valid `struct drm_display_mode`s, which the helper only reads.
+        ModeStatus::from_raw(unsafe {
+            bindings::drm_crtc_helper_mode_valid_fixed(
+                self.as_raw(),
+                mode.as_raw(),
+                fixed_mode.as_raw(),
+            )
+        })
     }
 }
 
@@ -1061,6 +1097,22 @@ unsafe extern "C" fn atomic_create_state_callback<T: DriverCrtcState>(
 }
 
 #[allow(clippy::missing_safety_doc)]
+unsafe extern "C" fn mode_valid_callback<T: DriverCrtc>(
+    crtc: *mut bindings::drm_crtc,
+    mode: *const bindings::drm_display_mode,
+) -> bindings::drm_mode_status {
+    // SAFETY:
+    // - We're guaranteed `crtc` is of type `Crtc<T>` via type invariants.
+    // - We're guaranteed by DRM that `crtc` is pointing to a valid initialized state.
+    let crtc = unsafe { Crtc::from_raw(crtc) };
+
+    // SAFETY: DRM guarantees `mode` points to a valid `struct drm_display_mode`, which it doesn't
+    // modify while the callback runs.
+    let mode = unsafe { DisplayMode::as_ref(mode) };
+
+    T::mode_valid(crtc, mode).into_raw()
+}
+
 unsafe extern "C" fn atomic_check_callback<T: DriverCrtc>(
     crtc: *mut bindings::drm_crtc,
     commit: *mut bindings::drm_atomic_commit,

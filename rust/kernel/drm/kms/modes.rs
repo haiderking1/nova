@@ -78,4 +78,86 @@ impl DisplayMode {
         // SAFETY: Reading these fields is safe via our type invariants.
         unsafe { (*self.as_raw()).crtc_vtotal }
     }
+
+    /// Retrieve the width of the visible area of this display mode, in pixels.
+    #[inline]
+    pub fn hdisplay(&self) -> u16 {
+        // SAFETY: Reading these fields is safe via our type invariants.
+        unsafe { (*self.as_raw()).hdisplay }
+    }
+
+    /// Retrieve the height of the visible area of this display mode, in pixels.
+    #[inline]
+    pub fn vdisplay(&self) -> u16 {
+        // SAFETY: Reading these fields is safe via our type invariants.
+        unsafe { (*self.as_raw()).vdisplay }
+    }
+}
+
+/// Whether a display pipeline can drive a [`DisplayMode`], see [`enum drm_mode_status`].
+///
+/// [`enum drm_mode_status`]: srctree/include/drm/drm_modes.h
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModeStatus(bindings::drm_mode_status);
+
+impl ModeStatus {
+    /// The mode can be driven.
+    pub const OK: Self = Self(bindings::drm_mode_status_MODE_OK);
+
+    /// Wrap a status returned by C.
+    pub(crate) fn from_raw(status: bindings::drm_mode_status) -> Self {
+        Self(status)
+    }
+
+    /// Return the status for C.
+    pub(crate) fn into_raw(self) -> bindings::drm_mode_status {
+        self.0
+    }
+}
+
+/// A display mode built by a driver, e.g. the fixed mode of a display it can't reprogram.
+///
+/// Dereferences to [`DisplayMode`].
+pub struct OwnedDisplayMode(bindings::drm_display_mode);
+
+// SAFETY: `OwnedDisplayMode` is plain data that is never shared with C while mutable.
+unsafe impl Send for OwnedDisplayMode {}
+// SAFETY: `OwnedDisplayMode` is only read through shared references.
+unsafe impl Sync for OwnedDisplayMode {}
+
+impl OwnedDisplayMode {
+    /// Create a mode with only a size, for a display whose timings the driver doesn't control.
+    ///
+    /// This is the equivalent of [`DRM_SIMPLE_MODE()`]. `width_mm` and `height_mm` are the
+    /// physical size of the display, 0 if unknown.
+    ///
+    /// [`DRM_SIMPLE_MODE()`]: srctree/include/drm/drm_modes.h
+    pub fn simple(width: u16, height: u16, width_mm: u16, height_mm: u16) -> Self {
+        Self(bindings::drm_display_mode {
+            type_: bindings::DRM_MODE_TYPE_DRIVER as u8,
+            // Nonzero to pass validation; the timings are not real.
+            clock: 1,
+            hdisplay: width,
+            hsync_start: width,
+            hsync_end: width,
+            htotal: width,
+            vdisplay: height,
+            vsync_start: height,
+            vsync_end: height,
+            vtotal: height,
+            width_mm,
+            height_mm,
+            ..pin_init::zeroed()
+        })
+    }
+}
+
+impl core::ops::Deref for OwnedDisplayMode {
+    type Target = DisplayMode;
+
+    fn deref(&self) -> &DisplayMode {
+        // SAFETY: `self.0` is a valid, initialized `struct drm_display_mode`, which is only
+        // mutated through `&mut self`, so no mutable references exist while `&self` is borrowed.
+        unsafe { DisplayMode::as_ref(&self.0) }
+    }
 }

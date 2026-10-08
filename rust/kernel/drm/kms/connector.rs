@@ -543,6 +543,19 @@ impl<'a, T: DriverConnector> ConnectorGuard<'a, T> {
         // SAFETY: We hold the locks required to call this via our type invariants.
         unsafe { bindings::drm_set_preferred_mode(self.as_raw(), h_pref, w_pref) }
     }
+
+    /// Add `mode` as the only, preferred mode of the underlying [`Connector`], for a display with
+    /// a fixed mode.
+    ///
+    /// This is the equivalent of [`drm_connector_helper_get_modes_fixed()`]. Returns how many
+    /// modes were added: 1, or 0 if allocating the mode failed.
+    ///
+    /// [`drm_connector_helper_get_modes_fixed()`]: srctree/drivers/gpu/drm/drm_probe_helper.c
+    pub fn add_fixed_mode(&self, mode: &super::modes::DisplayMode) -> i32 {
+        // SAFETY: We hold the locks required to call this via our type invariants, and `mode` is
+        // a valid `struct drm_display_mode`, which the helper only reads and copies.
+        unsafe { bindings::drm_connector_helper_get_modes_fixed(self.as_raw(), mode.as_raw()) }
+    }
 }
 
 /// A trait implemented by any type which can produce a reference to a
