@@ -19,7 +19,6 @@ use core::marker::{
 use kernel::{
     auxiliary,
     drm::{
-        edid::Edid,
         fourcc::XRGB888,
         kms::{
             connector::{
@@ -352,48 +351,65 @@ impl connector::DriverConnector for NovaConnector {
             return 0;
         };
 
-        // The CRTC rejects the EDID's modes that differ from the boot display's.
-        match read_edid(drm) {
-            Ok(edid) => match connector.update_edid(Some(&edid)) {
-                Ok(()) => {
-                    let count = connector.add_edid_modes();
-                    if count > 0 {
-                        return count;
-                    }
-                    dev_warn!(dev, "the EDID of the boot display has no modes\n");
+        let edid = match read_edid_data(drm) {
+            Ok(data) => {
+                let edid = connector.read_edid(|block, buf| copy_edid_block(&data, block, buf));
+                if edid.is_none() {
+                    dev_warn!(
+                        dev,
+                        "the EDID of the boot display is invalid ({} bytes, starting {:02x?})\n",
+                        data.len(),
+                        data.get(..16).unwrap_or(&data)
+                    );
                 }
-                Err(err) => dev_warn!(dev, "can't use the EDID of the boot display: {:?}\n", err),
-            },
+                edid
+            }
             Err(err) => {
                 dev_warn!(dev, "can't read the EDID of the boot display: {:?}\n", err);
-                // Don't keep showing the EDID of a monitor that may have been unplugged.
-                let _ = connector.update_edid(None);
+                None
             }
+        };
+
+        // Without an EDID, this resets the connector's, so that the EDID of a monitor that may
+        // have been unplugged isn't kept.
+        match connector.update_edid(edid.as_ref()) {
+            Ok(()) if edid.is_some() => {
+                // The CRTC rejects the modes that differ from the boot display's.
+                let count = connector.add_edid_modes();
+                if count > 0 {
+                    return count;
+                }
+                dev_warn!(dev, "the EDID of the boot display has no modes\n");
+            }
+            Ok(()) => {}
+            Err(err) => dev_warn!(dev, "can't use the EDID of the boot display: {:?}\n", err),
         }
 
         connector.add_fixed_mode(&display.mode)
     }
 }
 
-/// Reads the EDID of the monitor the boot display is shown on, through nova-core.
-fn read_edid(drm: &NovaDevice) -> Result<Edid> {
+/// Reads the raw EDID of the monitor the boot display is shown on, through nova-core.
+fn read_edid_data(drm: &NovaDevice) -> Result<KVec<u8>> {
     // The connector is probed for modes once the device is registered.
     let registered = drm.registration_guard().ok_or(ENODEV)?;
-    let data = registered.registration_data_with(|reg| reg.api.with(|api| api.boot_display_edid()))?;
 
-    let edid = Edid::new(&data)?;
-    if !edid.is_valid() {
-        let dev: &auxiliary::Device = drm.as_ref();
-        dev_warn!(
-            dev,
-            "the EDID of the boot display is invalid ({} bytes, starting {:02x?})\n",
-            data.len(),
-            data.get(..16).unwrap_or(&data)
-        );
-        return Err(EBADMSG);
-    }
+    registered.registration_data_with(|reg| reg.api.with(|api| api.boot_display_edid()))
+}
 
-    Ok(edid)
+/// Copies EDID block number `block` out of the raw EDID `data` into `buf`.
+///
+/// GSP-RM may return more data than the EDID announces, which DRM leaves out by only reading the
+/// blocks the EDID announces.
+fn copy_edid_block(data: &[u8], block: usize, buf: &mut [u8]) -> Result {
+    let start = block.checked_mul(buf.len()).ok_or(EINVAL)?;
+    let src = data
+        .get(start..)
+        .and_then(|rest| rest.get(..buf.len()))
+        .ok_or(EIO)?;
+
+    buf.copy_from_slice(src);
+    Ok(())
 }
 
 /// Returns the DRM connector and encoder types of an output shown through a connector of type
