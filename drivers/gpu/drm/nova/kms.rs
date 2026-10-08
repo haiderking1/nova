@@ -6,6 +6,10 @@
 //! output (primary plane, CRTC, encoder and connector) offering only the firmware's mode, which
 //! the display engine keeps scanning out after nova-core boots the GSP. Frames are copied by the
 //! CPU from shadow-plane framebuffers into the firmware's framebuffer through nova-core.
+//!
+//! The connector reports what GSP-RM knows about the display: the type of connector it is shown
+//! through, and the EDID of the monitor (its name, physical size and modes, of which only those
+//! of the firmware's resolution are kept).
 
 use core::marker::{
     PhantomData,
@@ -13,7 +17,9 @@ use core::marker::{
 };
 
 use kernel::{
+    auxiliary,
     drm::{
+        edid::Edid,
         fourcc::XRGB888,
         kms::{
             connector::{
@@ -53,6 +59,8 @@ use kernel::{
         PixelFormat, //
     },
 };
+
+use nova_core::api::ConnectorType;
 
 use crate::driver::{
     BootDisplay,
@@ -140,10 +148,12 @@ impl KmsDriver for NovaDriver {
             None,
             (),
         )?;
+        // Only the damaged parts of a frame are copied to the display.
+        primary.enable_fb_damage_clips();
         let _crtc = Crtc::new(drm, primary, Option::<&Plane<KmsProbe>>::None, None, ())?;
-        let encoder = Encoder::new(drm, encoder::Type::None, possible_crtcs, 0, None, ())?;
-        // The firmware doesn't say what the display is connected through.
-        let connector = Connector::new(drm, connector::Type::Unknown, ())?;
+        let (connector_type, encoder_type) = output_types(display.connector);
+        let encoder = Encoder::new(drm, encoder_type, possible_crtcs, 0, None, ())?;
+        let connector = Connector::new(drm, connector_type, ())?;
 
         connector.attach_encoder(encoder)
     }
@@ -297,7 +307,7 @@ impl DriverCrtcState for NovaCrtcState {
     type Crtc = NovaCrtc;
 }
 
-/// The encoder of the boot display; the firmware doesn't tell which kind it is.
+/// The encoder of the boot display.
 #[pin_data]
 pub(crate) struct NovaEncoder {
     #[pin]
@@ -335,10 +345,63 @@ impl connector::DriverConnector for NovaConnector {
     }
 
     fn get_modes(connector: ConnectorGuard<'_, Self>, _guard: &ModeConfigGuard<'_, NovaDriver>) -> i32 {
+        let drm = connector.drm_dev();
+        let dev: &auxiliary::Device = drm.as_ref();
         // Only created with a boot display, whose mode is the only one that works.
-        let display: Option<&BootDisplay> = connector.drm_dev().boot_display.as_ref();
+        let Some(display): Option<&BootDisplay> = drm.boot_display.as_ref() else {
+            return 0;
+        };
 
-        display.map_or(0, |display| connector.add_fixed_mode(&display.mode))
+        // The CRTC rejects the EDID's modes that differ from the boot display's.
+        match read_edid(drm) {
+            Ok(edid) => match connector.update_edid(Some(&edid)) {
+                Ok(()) => {
+                    let count = connector.add_edid_modes();
+                    if count > 0 {
+                        return count;
+                    }
+                    dev_warn!(dev, "the EDID of the boot display has no modes\n");
+                }
+                Err(err) => dev_warn!(dev, "can't use the EDID of the boot display: {:?}\n", err),
+            },
+            Err(err) => {
+                dev_warn!(dev, "can't read the EDID of the boot display: {:?}\n", err);
+                // Don't keep showing the EDID of a monitor that may have been unplugged.
+                let _ = connector.update_edid(None);
+            }
+        }
+
+        connector.add_fixed_mode(&display.mode)
+    }
+}
+
+/// Reads the EDID of the monitor the boot display is shown on, through nova-core.
+fn read_edid(drm: &NovaDevice) -> Result<Edid> {
+    // The connector is probed for modes once the device is registered.
+    let registered = drm.registration_guard().ok_or(ENODEV)?;
+    let data = registered.registration_data_with(|reg| reg.api.with(|api| api.boot_display_edid()))?;
+
+    let edid = Edid::new(&data)?;
+    if !edid.is_valid() {
+        return Err(EINVAL);
+    }
+
+    Ok(edid)
+}
+
+/// Returns the DRM connector and encoder types of an output shown through a connector of type
+/// `connector`.
+fn output_types(connector: ConnectorType) -> (connector::Type, encoder::Type) {
+    match connector {
+        ConnectorType::Vga => (connector::Type::Vga, encoder::Type::Dac),
+        ConnectorType::DviI => (connector::Type::DviI, encoder::Type::Tmds),
+        ConnectorType::DviD => (connector::Type::DviD, encoder::Type::Tmds),
+        ConnectorType::DisplayPort => (connector::Type::DisplayPort, encoder::Type::Tmds),
+        ConnectorType::EmbeddedDisplayPort => (connector::Type::Edp, encoder::Type::Tmds),
+        ConnectorType::HdmiA | ConnectorType::HdmiC => (connector::Type::HdmiA, encoder::Type::Tmds),
+        ConnectorType::UsbC => (connector::Type::Usb, encoder::Type::Tmds),
+        ConnectorType::Dsi => (connector::Type::Dsi, encoder::Type::Dsi),
+        ConnectorType::Unknown => (connector::Type::Unknown, encoder::Type::None),
     }
 }
 

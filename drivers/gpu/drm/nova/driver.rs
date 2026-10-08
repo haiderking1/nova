@@ -20,6 +20,7 @@ use crate::file::File;
 use crate::gem::NovaGemObject;
 
 use nova_core::api::{
+    ConnectorType,
     NovaCoreApi,
     NovaCoreApiHandle, //
 };
@@ -34,6 +35,8 @@ pub(crate) struct BootDisplay {
     pub(crate) stride: u32,
     /// Pixel layout of its framebuffer.
     pub(crate) format: PixelFormat,
+    /// Type of connector it is shown through.
+    pub(crate) connector: ConnectorType,
 }
 
 /// Data of the DRM device.
@@ -86,6 +89,12 @@ impl auxiliary::Driver for NovaDriver {
         _info: &'bound Self::IdInfo,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let api = NovaCoreApi::of(adev)?;
+        let connector = api
+            .with(|api| api.boot_display_connector())
+            .unwrap_or_else(|err| {
+                dev_warn!(adev, "can't tell what the boot display is connected to: {:?}\n", err);
+                ConnectorType::Unknown
+            });
         let boot_display = api
             .with(|api| api.boot_display_mode())
             .map(|mode| -> Result<_> {
@@ -98,6 +107,7 @@ impl auxiliary::Driver for NovaDriver {
                     ),
                     stride: mode.stride,
                     format: mode.format,
+                    connector,
                 })
             })
             .transpose()?;
