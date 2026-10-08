@@ -33,13 +33,19 @@ impl<T> ::core::fmt::Debug for __IncompleteArrayField<T> {
 pub const NV2080_CTRL_GPU_SET_POWER_STATE_GPU_LEVEL_0: u32 = 0;
 pub const NV2080_CTRL_GPU_SET_POWER_STATE_GPU_LEVEL_3: u32 = 3;
 pub const NV2080_CTRL_GPU_SET_POWER_STATE_GPU_LEVEL_7: u32 = 7;
+pub const NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE: u32 = 545263890;
+pub const NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_MAX_ENTRIES: u32 = 32;
 pub const NV0073_CTRL_CMD_SYSTEM_GET_NUM_HEADS: u32 = 7536898;
 pub const NV0073_CTRL_CMD_SYSTEM_GET_ACTIVE: u32 = 7536908;
 pub const NV2080_CTRL_CMD_INTERNAL_DISPLAY_GET_STATIC_INFO: u32 = 545262081;
 pub const NV2080_CTRL_CMD_INTERNAL_DISPLAY_WRITE_INST_MEM: u32 = 545262153;
 pub const NV2080_CTRL_CMD_INTERNAL_DISPLAY_CHANNEL_PUSHBUFFER: u32 = 545262168;
+pub const NV2080_ENGINE_TYPE_GRAPHICS: u32 = 1;
+pub const NV2080_ENGINE_TYPE_COPY0: u32 = 9;
+pub const NV2080_ENGINE_TYPE_COPY9: u32 = 18;
 pub const NV20_SUBDEVICE_0: u32 = 8320;
 pub const NV01_ROOT: u32 = 0;
+pub const NV_VASPACE_ALLOCATION_INDEX_GPU_NEW: u32 = 0;
 pub const NV_VGPU_MSG_SIGNATURE_VALID: u32 = 1129337430;
 pub const GSP_FW_HEAP_PARAM_OS_SIZE_LIBOS2: u32 = 0;
 pub const GSP_FW_HEAP_PARAM_OS_SIZE_LIBOS3_BAREMETAL: u32 = 23068672;
@@ -54,9 +60,16 @@ pub const GSP_FW_HEAP_SIZE_OVERRIDE_LIBOS3_BAREMETAL_MIN_MB: u32 = 88;
 pub const GSP_FW_HEAP_SIZE_OVERRIDE_LIBOS3_BAREMETAL_MAX_MB: u32 = 280;
 pub const GSP_FW_WPR_META_REVISION: u32 = 1;
 pub const GSP_FW_WPR_META_MAGIC: i64 = -2577556379034558285;
+pub const NV_MEMORY_CACHED: u32 = 0;
+pub const NV_MEMORY_UNCACHED: u32 = 1;
 pub const NV_MEMORY_WRITECOMBINED: u32 = 2;
 pub const REGISTRY_TABLE_ENTRY_TYPE_DWORD: u32 = 1;
 pub const GSP_MSG_QUEUE_ELEMENT_SIZE_MAX: u32 = 65536;
+pub const NVA06F_CTRL_CMD_GPFIFO_SCHEDULE: u32 = 2691629315;
+pub const NVA06F_CTRL_CMD_BIND: u32 = 2691629316;
+pub const NV0080_CTRL_CMD_DMA_SET_PAGE_DIRECTORY: u32 = 8394771;
+pub const NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_FLAGS_APERTURE_VIDMEM: u32 = 0;
+pub const NV0080_CTRL_CMD_DMA_UNSET_PAGE_DIRECTORY: u32 = 8394772;
 pub const NV2080_CTRL_CMD_CE_GET_FAULT_METHOD_BUFFER_SIZE: u32 = 545270280;
 pub const NV04_DISPLAY_COMMON: u32 = 115;
 pub const NVC670_DISPLAY: u32 = 50800;
@@ -126,6 +139,36 @@ pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_DSI: u32 = 114;
 pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_STEREO_3PIN_DIN: u32 = 115;
 pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_USB_C_UHBR: u32 = 116;
 pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_UNKNOWN: u32 = 4294967295;
+pub const AMPERE_CHANNEL_GPFIFO_A: u32 = 50543;
+pub const NVC56F_SET_OBJECT: u32 = 0;
+pub const NVC56F_GP_ENTRY__SIZE: u32 = 8;
+pub const NVC56F_GP_ENTRY1_LEVEL_MAIN: u32 = 0;
+pub const NVC56F_DMA_SEC_OP_INC_METHOD: u32 = 1;
+pub const AMPERE_DMA_COPY_B: u32 = 51125;
+pub const NVC7B5_SET_SEMAPHORE_A: u32 = 576;
+pub const NVC7B5_SET_SEMAPHORE_B: u32 = 580;
+pub const NVC7B5_SET_SEMAPHORE_PAYLOAD: u32 = 584;
+pub const NVC7B5_LAUNCH_DMA: u32 = 768;
+pub const NVC7B5_LAUNCH_DMA_DATA_TRANSFER_TYPE_NON_PIPELINED: u32 = 2;
+pub const NVC7B5_LAUNCH_DMA_FLUSH_ENABLE_TRUE: u32 = 1;
+pub const NVC7B5_LAUNCH_DMA_SEMAPHORE_TYPE_RELEASE_ONE_WORD_SEMAPHORE: u32 = 1;
+pub const NVC7B5_LAUNCH_DMA_SRC_MEMORY_LAYOUT_PITCH: u32 = 1;
+pub const NVC7B5_LAUNCH_DMA_DST_MEMORY_LAYOUT_PITCH: u32 = 1;
+pub const NVC7B5_LAUNCH_DMA_MULTI_LINE_ENABLE_TRUE: u32 = 1;
+pub const NVC7B5_LAUNCH_DMA_REMAP_ENABLE_TRUE: u32 = 1;
+pub const NVC7B5_LAUNCH_DMA_DST_TYPE_PHYSICAL: u32 = 1;
+pub const NVC7B5_LAUNCH_DMA_DISABLE_PLC_TRUE: u32 = 1;
+pub const NVC7B5_OFFSET_IN_UPPER: u32 = 1024;
+pub const NVC7B5_OFFSET_OUT_UPPER: u32 = 1032;
+pub const NVC7B5_PITCH_IN: u32 = 1040;
+pub const NVC7B5_LINE_LENGTH_IN: u32 = 1048;
+pub const NVC7B5_SET_REMAP_CONST_A: u32 = 1792;
+pub const NVC7B5_SET_REMAP_COMPONENTS: u32 = 1800;
+pub const NVC7B5_SET_REMAP_COMPONENTS_DST_X_CONST_A: u32 = 4;
+pub const NVC7B5_SET_REMAP_COMPONENTS_COMPONENT_SIZE_FOUR: u32 = 3;
+pub const NVC7B5_SET_REMAP_COMPONENTS_NUM_DST_COMPONENTS_ONE: u32 = 0;
+pub const FERMI_VASPACE_A: u32 = 37105;
+pub const NVC0B5_ALLOCATION_PARAMETERS_VERSION_1: u32 = 1;
 pub type __u8 = ffi::c_uchar;
 pub type __u16 = ffi::c_ushort;
 pub type __u32 = ffi::c_uint;
@@ -624,6 +667,24 @@ impl Default for NV2080_CTRL_GPU_GET_GID_INFO_PARAMS {
 }
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV2080_CTRL_FIFO_DEVICE_ENTRY {
+    pub engineData: [u32_; 16usize],
+    pub pbdmaIds: [u32_; 2usize],
+    pub pbdmaFaultIds: [u32_; 2usize],
+    pub numPbdmas: u32_,
+    pub engineName: [ffi::c_char; 16usize],
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_PARAMS {
+    pub baseIndex: u32_,
+    pub numEntries: u32_,
+    pub bMore: u8_,
+    pub __bindgen_padding_0: [u8; 3usize],
+    pub entries: [NV2080_CTRL_FIFO_DEVICE_ENTRY; 32usize],
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
 pub struct NV0073_CTRL_SYSTEM_GET_NUM_HEADS_PARAMS {
     pub subDeviceInstance: u32_,
     pub flags: u32_,
@@ -683,6 +744,47 @@ pub struct NV2080_CTRL_INTERNAL_DISPLAY_CHANNEL_PUSHBUFFER_PARAMS {
 pub struct NV2080_ALLOC_PARAMETERS {
     pub subDeviceId: u32_,
 }
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV_MEMORY_DESC_PARAMS {
+    pub base: u64_,
+    pub size: u64_,
+    pub addressSpace: u32_,
+    pub cacheAttrib: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV_CHANNEL_ALLOC_PARAMS {
+    pub hObjectError: u32_,
+    pub hObjectBuffer: u32_,
+    pub gpFifoOffset: u64_,
+    pub gpFifoEntries: u32_,
+    pub flags: u32_,
+    pub hContextShare: u32_,
+    pub hVASpace: u32_,
+    pub hUserdMemory: [u32_; 8usize],
+    pub userdOffset: [u64_; 8usize],
+    pub engineType: u32_,
+    pub cid: u32_,
+    pub subDeviceId: u32_,
+    pub hObjectEccError: u32_,
+    pub instanceMem: NV_MEMORY_DESC_PARAMS,
+    pub userdMem: NV_MEMORY_DESC_PARAMS,
+    pub ramfcMem: NV_MEMORY_DESC_PARAMS,
+    pub mthdbufMem: NV_MEMORY_DESC_PARAMS,
+    pub hPhysChannelGroup: u32_,
+    pub internalFlags: u32_,
+    pub errorNotifierMem: NV_MEMORY_DESC_PARAMS,
+    pub eccErrorNotifierMem: NV_MEMORY_DESC_PARAMS,
+    pub ProcessID: u32_,
+    pub SubProcessID: u32_,
+    pub encryptIv: [u32_; 3usize],
+    pub decryptIv: [u32_; 3usize],
+    pub hmacNonce: [u32_; 8usize],
+    pub tpcConfigID: u32_,
+    pub __bindgen_padding_0: [u8; 4usize],
+}
+pub type NV_CHANNELGPFIFO_ALLOCATION_PARAMETERS = NV_CHANNEL_ALLOC_PARAMS;
 pub const ChannelPBSize_PB_SIZE_4KB: ChannelPBSize = 0;
 pub const ChannelPBSize_PB_SIZE_8KB: ChannelPBSize = 1;
 pub const ChannelPBSize_PB_SIZE_16KB: ChannelPBSize = 2;
@@ -710,6 +812,18 @@ impl Default for NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS {
             s.assume_init()
         }
     }
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV_VASPACE_ALLOCATION_PARAMETERS {
+    pub index: u32_,
+    pub flags: u32_,
+    pub vaSize: u64_,
+    pub vaStartInternal: u64_,
+    pub vaLimitInternal: u64_,
+    pub bigPageSize: u32_,
+    pub __bindgen_padding_0: [u8; 4usize],
+    pub vaBase: u64_,
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone, MaybeZeroable)]
@@ -1296,6 +1410,39 @@ impl Default for GSP_FMC_BOOT_PARAMS {
 }
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS {
+    pub bEnable: u8_,
+    pub bSkipSubmit: u8_,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NVA06F_CTRL_BIND_PARAMS {
+    pub engineType: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_PARAMS {
+    pub physAddress: u64_,
+    pub numEntries: u32_,
+    pub flags: u32_,
+    pub hVASpace: u32_,
+    pub chId: u32_,
+    pub subDeviceId: u32_,
+    pub pasid: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV0080_CTRL_DMA_UNSET_PAGE_DIRECTORY_PARAMS {
+    pub hVASpace: u32_,
+    pub subDeviceId: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV2080_CTRL_CE_GET_FAULT_METHOD_BUFFER_SIZE_PARAMS {
+    pub size: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
 pub struct NVOS00_PARAMETERS_v03_00 {
     pub hRoot: u32_,
     pub hObjectParent: u32_,
@@ -1492,3 +1639,58 @@ pub struct NV0073_CTRL_SPECIFIC_GET_CONNECTOR_DATA_PARAMS__bindgen_ty_1 {
     pub type_: u32_,
     pub location: u32_,
 }
+#[repr(C)]
+#[derive(Debug, Copy, Clone, MaybeZeroable)]
+pub struct Nvc56fControl_struct {
+    pub Ignored00: [u32_; 16usize],
+    pub Put: u32_,
+    pub Get: u32_,
+    pub Reference: u32_,
+    pub PutHi: u32_,
+    pub Ignored01: [u32_; 2usize],
+    pub TopLevelGet: u32_,
+    pub TopLevelGetHi: u32_,
+    pub GetHi: u32_,
+    pub Ignored02: [u32_; 7usize],
+    pub Ignored03: u32_,
+    pub Ignored04: [u32_; 1usize],
+    pub GPGet: u32_,
+    pub GPPut: u32_,
+    pub Ignored05: [u32_; 92usize],
+}
+impl Default for Nvc56fControl_struct {
+    fn default() -> Self {
+        let mut s = ::core::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::core::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+pub type Nvc56fControl = Nvc56fControl_struct;
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NVC0B5_ALLOCATION_PARAMETERS {
+    pub version: u32_,
+    pub engineType: u32_,
+}
+pub const ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_ENG_DESC: ENGINE_INFO_TYPE = 0;
+pub const ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_FIFO_TAG: ENGINE_INFO_TYPE = 1;
+pub const ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_RM_ENGINE_TYPE: ENGINE_INFO_TYPE = 2;
+pub const ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_RUNLIST: ENGINE_INFO_TYPE = 3;
+pub const ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_MMU_FAULT_ID: ENGINE_INFO_TYPE = 4;
+pub const ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_RC_MASK: ENGINE_INFO_TYPE = 5;
+pub const ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_RESET: ENGINE_INFO_TYPE = 6;
+pub const ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_INTR: ENGINE_INFO_TYPE = 7;
+pub const ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_MC: ENGINE_INFO_TYPE = 8;
+pub const ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_DEV_TYPE_ENUM: ENGINE_INFO_TYPE = 9;
+pub const ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_INSTANCE_ID: ENGINE_INFO_TYPE = 10;
+pub const ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_RUNLIST_PRI_BASE: ENGINE_INFO_TYPE = 11;
+pub const ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_IS_HOST_DRIVEN_ENGINE: ENGINE_INFO_TYPE = 12;
+pub const ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_RUNLIST_ENGINE_ID: ENGINE_INFO_TYPE = 13;
+pub const ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_CHRAM_PRI_BASE: ENGINE_INFO_TYPE = 14;
+pub const ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_KERNEL_RM_MAX: ENGINE_INFO_TYPE = 15;
+pub const ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_INVALID: ENGINE_INFO_TYPE = 15;
+pub const ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_ENGINE_DATA_ARRAY_SIZE: ENGINE_INFO_TYPE = 15;
+pub const ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_PBDMA_ID: ENGINE_INFO_TYPE = 16;
+pub type ENGINE_INFO_TYPE = ffi::c_uint;
