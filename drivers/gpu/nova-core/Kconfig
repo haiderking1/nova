@@ -4,6 +4,7 @@ config NOVA_CORE
 	depends on PCI
 	depends on RUST
 	depends on !CPU_BIG_ENDIAN
+	select APERTURE_HELPERS
 	select AUXILIARY_BUS
 	select GPU_BUDDY
 	select RUST_FW_LOADER_ABSTRACTIONS
