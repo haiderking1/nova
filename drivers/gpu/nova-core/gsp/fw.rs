@@ -14,8 +14,7 @@ use core::{
 };
 
 use kernel::{
-    bitfield,
-    device,
+    bitfield, device,
     dma::{
         Coherent,
         CoherentView, //

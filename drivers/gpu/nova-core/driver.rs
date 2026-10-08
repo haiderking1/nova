@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 
 use kernel::{
-    aperture,
-    auxiliary,
+    aperture, auxiliary,
     device::{
         Bound,
         Core, //
@@ -147,8 +146,13 @@ impl pci::Driver for NovaCoreDriver {
                 gpu.as_mut().run_selftests(pdev);
 
                 // Not fatal: without it the display just isn't usable.
-                if let Err(err) = gpu.map_boot_display(pdev) {
+                if let Err(err) = gpu.as_mut().map_boot_display(pdev) {
                     dev_warn!(pdev, "can't map the boot display: {:?}\n", err);
+                }
+
+                // Not fatal either: the boot display keeps working without it.
+                if let Err(err) = gpu.as_mut().init_display_engine() {
+                    dev_warn!(pdev, "can't take over the display engine: {:?}\n", err);
                 }
                 Ok(())
             }),

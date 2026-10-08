@@ -26,7 +26,9 @@ use crate::{
     bounded_enum,
     display::{
         Display,
-        DisplayId, //
+        DisplayEngine,
+        DisplayId,
+        InternalHandles, //
     },
     driver::{
         Bar0,
@@ -413,6 +415,10 @@ pub(crate) struct Gpu<'gpu> {
     display: Option<Display>,
     /// The display the boot display is shown on, if the display engine reports one as active.
     boot_output: Option<DisplayId>,
+    /// The display engine, once taken over from GSP-RM by [`Gpu::init_display_engine()`].
+    ///
+    /// Its RM objects are freed in [`Gpu`]'s `PinnedDrop`, while the GSP is still running.
+    display_engine: Option<DisplayEngine<'gpu>>,
     /// GPU memory manager owning memory management resources.
     ///
     /// Must be kept declared *before* `gsp_resources`, so that its components are dropped while
@@ -610,6 +616,9 @@ impl<'gpu> Gpu<'gpu> {
                 output
             }),
 
+            // Set up by `Gpu::init_display_engine()`, which needs to allocate VRAM.
+            display_engine: None,
+
             // Create GPU memory manager owning memory management resources.
             mm: {
                 let usable_vram = gsp_static_info.usable_fb_regions.first().ok_or(ENODEV)?;
@@ -713,6 +722,38 @@ impl<'gpu> Gpu<'gpu> {
         self.bar_user.write(mapped, offset, data)
     }
 
+    /// Takes over the display engine from GSP-RM, so that Nova can drive displays itself.
+    ///
+    /// Fails with `ENOTSUPP` on GPUs whose display engine isn't supported yet.
+    pub(crate) fn init_display_engine(self: Pin<&mut Self>) -> Result {
+        let this = self.project();
+        let gsp_resources = this.gsp_resources.as_ref().get_ref();
+        let pdev = gsp_resources.device;
+        let display = this.display.as_ref().ok_or(ENODEV)?;
+        let internal = InternalHandles {
+            client: this.gsp_static_info.client(),
+            subdevice: this.gsp_static_info.subdevice(),
+        };
+
+        let engine = DisplayEngine::new(
+            pdev.as_ref(),
+            gsp_resources.bar,
+            &gsp_resources.gsp.cmdq,
+            this.mm,
+            this.spec.chipset,
+            display,
+            &internal,
+        )?;
+        dev_dbg!(
+            pdev,
+            "display engine taken over, windows {:#x}\n",
+            engine.windows()
+        );
+        *this.display_engine = Some(engine);
+
+        Ok(())
+    }
+
     /// Returns the display engine and the display the boot display is shown on.
     fn boot_output(&self) -> Result<(&Display, DisplayId)> {
         let display = self.display.as_ref().ok_or(ENODEV)?;
@@ -784,10 +825,17 @@ impl PinnedDrop for Gpu<'_> {
         }
 
         // Before `gsp_resources` is dropped: freeing RM objects needs a running GSP.
-        if let Some(display) = this.display.take() {
-            let gsp_resources = this.gsp_resources.as_ref().get_ref();
-            let dev = gsp_resources.device.as_ref();
+        let gsp_resources = this.gsp_resources.as_ref().get_ref();
+        let dev = gsp_resources.device.as_ref();
 
+        // The display engine's objects first, as they live under those of `display`.
+        if let (Some(mut engine), Some(display)) =
+            (this.display_engine.take(), this.display.as_ref())
+        {
+            engine.free(dev, &gsp_resources.gsp.cmdq, display);
+        }
+
+        if let Some(display) = this.display.take() {
             let _ = display
                 .free(dev, &gsp_resources.gsp.cmdq)
                 .inspect_err(|e| dev_err!(dev, "failed to free the display objects: {:?}\n", e));

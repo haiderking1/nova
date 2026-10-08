@@ -5,6 +5,17 @@
 //! GSP-RM owns the display hardware. Nova queries and controls it through RM control commands sent
 //! to an `NV04_DISPLAY_COMMON` object, which lives in an RM object tree that Nova allocates for
 //! itself: client -> device -> subdevice, and the display common object under the device.
+//!
+//! To drive the display engine itself, Nova takes it over from GSP-RM: see [`DisplayEngine`].
+
+mod channel;
+mod engine;
+mod regs;
+
+pub(crate) use engine::{
+    DisplayEngine,
+    InternalHandles, //
+};
 
 use kernel::{
     device,
@@ -57,6 +68,7 @@ pub(crate) struct DisplayId(u32);
 /// The objects must be released with [`Display::free`] while the GSP is running.
 pub(crate) struct Display {
     client: Handle<Client>,
+    device: Handle<Device>,
     common: Handle<DisplayCommon>,
 }
 
@@ -68,7 +80,7 @@ impl Display {
         // A client is its own parent.
         RmAlloc::new(client, client, client, AllocRoot::new(client)).send(dev, cmdq)?;
 
-        let alloc_children = || -> Result<Handle<DisplayCommon>> {
+        let alloc_children = || -> Result<(Handle<Device>, Handle<DisplayCommon>)> {
             let device = RmAlloc::new(
                 client,
                 client,
@@ -85,23 +97,39 @@ impl Display {
             )
             .send(dev, cmdq)?;
 
-            Ok(RmAlloc::new(
+            let common = RmAlloc::new(
                 client,
                 device,
                 Handle::<DisplayCommon>::new(DISPLAY_COMMON_HANDLE),
                 AllocDisplayCommon,
             )
-            .send(dev, cmdq)?)
+            .send(dev, cmdq)?;
+
+            Ok((device, common))
         };
 
         match alloc_children() {
-            Ok(common) => Ok(Self { client, common }),
+            Ok((device, common)) => Ok(Self {
+                client,
+                device,
+                common,
+            }),
             Err(err) => {
                 // Freeing the client frees whatever was allocated under it.
                 let _ = RmFree::new(client, client).send(dev, cmdq);
                 Err(err)
             }
         }
+    }
+
+    /// Returns the client the RM objects of the display engine are allocated under.
+    pub(crate) fn client(&self) -> Handle<Client> {
+        self.client
+    }
+
+    /// Returns the device the display engine's objects are allocated under.
+    pub(crate) fn device(&self) -> Handle<Device> {
+        self.device
     }
 
     /// Frees the RM objects. GSP-RM frees all the objects of the client along with it.
@@ -120,9 +148,14 @@ impl Display {
             RmControl::new(self.client, self.common, DispGetNumHeads::new()).send(dev, cmdq)?;
 
         for head in 0..num_heads {
-            let display =
-                RmControl::new(self.client, self.common, DispGetActive::new(head)).send(dev, cmdq)?;
-            dev_dbg!(dev, "display head {}: active display {:#x}\n", head, display);
+            let display = RmControl::new(self.client, self.common, DispGetActive::new(head))
+                .send(dev, cmdq)?;
+            dev_dbg!(
+                dev,
+                "display head {}: active display {:#x}\n",
+                head,
+                display
+            );
 
             if display != 0 {
                 return Ok(Some(DisplayId(display)));
@@ -139,10 +172,12 @@ impl Display {
         cmdq: &Cmdq<'_>,
         display: DisplayId,
     ) -> Result<ConnectorType> {
-        Ok(
-            RmControl::new(self.client, self.common, DispGetConnectorType::new(display.0))
-                .send(dev, cmdq)?,
+        Ok(RmControl::new(
+            self.client,
+            self.common,
+            DispGetConnectorType::new(display.0),
         )
+        .send(dev, cmdq)?)
     }
 
     /// Reads the EDID of `display` from the connected monitor, or returns the copy GSP-RM cached
@@ -154,27 +189,31 @@ impl Display {
         display: DisplayId,
     ) -> Result<KVec<u8>> {
         let read = |cached| -> Result<KVec<u8>> {
-            RmControl::new(self.client, self.common, DispGetEdid::new(display.0, cached)?)
-                .send(dev, cmdq)
-                .inspect(|edid| {
-                    dev_dbg!(
-                        dev,
-                        "EDID of display {:#x} (cached: {}): {} bytes\n",
-                        display.0,
-                        cached,
-                        edid.len()
-                    );
-                })
-                .inspect_err(|e| {
-                    dev_warn!(
-                        dev,
-                        "reading the EDID of display {:#x} (cached: {}) failed: {:?}\n",
-                        display.0,
-                        cached,
-                        e
-                    );
-                })
-                .map_err(Error::from)
+            RmControl::new(
+                self.client,
+                self.common,
+                DispGetEdid::new(display.0, cached)?,
+            )
+            .send(dev, cmdq)
+            .inspect(|edid| {
+                dev_dbg!(
+                    dev,
+                    "EDID of display {:#x} (cached: {}): {} bytes\n",
+                    display.0,
+                    cached,
+                    edid.len()
+                );
+            })
+            .inspect_err(|e| {
+                dev_warn!(
+                    dev,
+                    "reading the EDID of display {:#x} (cached: {}) failed: {:?}\n",
+                    display.0,
+                    cached,
+                    e
+                );
+            })
+            .map_err(Error::from)
         };
 
         read(false).or_else(|_| read(true))
