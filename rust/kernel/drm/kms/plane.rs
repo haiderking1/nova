@@ -1239,6 +1239,33 @@ impl<'a, T: DriverPlaneState> PlaneStateMutator<'a, PlaneState<T>> {
     pub fn damage<'b>(&'b self, old_state: &'b PlaneState<T>) -> DamageIter<'b> {
         self.state.damage(old_state)
     }
+
+    /// The area of the framebuffer the plane shows, in whole pixels.
+    ///
+    /// Set by the atomic check, e.g. [`RawPlaneState::atomic_helper_check()`].
+    pub fn src(&self) -> Rect {
+        // `src` is in 16.16 fixed point.
+        let src = &self.state.state.base().src;
+        Rect {
+            x1: src.x1 >> 16,
+            y1: src.y1 >> 16,
+            x2: src.x2 >> 16,
+            y2: src.y2 >> 16,
+        }
+    }
+
+    /// Where the plane shows on the CRTC, in pixels.
+    ///
+    /// Set by the atomic check, e.g. [`RawPlaneState::atomic_helper_check()`].
+    pub fn dst(&self) -> Rect {
+        let dst = &self.state.state.base().dst;
+        Rect {
+            x1: dst.x1,
+            y1: dst.y1,
+            x2: dst.x2,
+            y2: dst.y2,
+        }
+    }
 }
 
 impl<'a, T: DriverPlaneState<Kind = Shadow>> PlaneStateMutator<'a, PlaneState<T>> {
