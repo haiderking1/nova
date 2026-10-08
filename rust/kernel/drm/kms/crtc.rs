@@ -775,6 +775,16 @@ pub trait RawCrtcState: AsRawCrtcState {
         // this access is serialized
         unsafe { (*self.as_raw()).active }
     }
+
+    /// Returns the mode the CRTC scans out in this atomic state, as adjusted for the hardware.
+    fn adjusted_mode(&self) -> &DisplayMode {
+        // SAFETY:
+        // - `adjusted_mode` is a valid, initialized `struct drm_display_mode` embedded in the
+        //   state, which outlives the reference.
+        // - It can only be modified from the atomic check context, and is invariant beyond that
+        //   point, so our interface ensures this access follows rust's data-aliasing rules.
+        unsafe { DisplayMode::as_ref(&raw const (*self.as_raw()).adjusted_mode) }
+    }
 }
 impl<T: AsRawCrtcState> RawCrtcState for T {}
 

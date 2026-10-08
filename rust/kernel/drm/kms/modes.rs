@@ -92,6 +92,91 @@ impl DisplayMode {
         // SAFETY: Reading these fields is safe via our type invariants.
         unsafe { (*self.as_raw()).vdisplay }
     }
+
+    /// Retrieve the pixel clock of this display mode, in kHz.
+    #[inline]
+    pub fn clock(&self) -> i32 {
+        // SAFETY: Reading these fields is safe via our type invariants.
+        unsafe { (*self.as_raw()).clock }
+    }
+
+    /// Retrieve the first pixel of the horizontal sync pulse of this display mode.
+    #[inline]
+    pub fn hsync_start(&self) -> u16 {
+        // SAFETY: Reading these fields is safe via our type invariants.
+        unsafe { (*self.as_raw()).hsync_start }
+    }
+
+    /// Retrieve the pixel after the horizontal sync pulse of this display mode.
+    #[inline]
+    pub fn hsync_end(&self) -> u16 {
+        // SAFETY: Reading these fields is safe via our type invariants.
+        unsafe { (*self.as_raw()).hsync_end }
+    }
+
+    /// Retrieve the total width of a line of this display mode, in pixels.
+    #[inline]
+    pub fn htotal(&self) -> u16 {
+        // SAFETY: Reading these fields is safe via our type invariants.
+        unsafe { (*self.as_raw()).htotal }
+    }
+
+    /// Retrieve the first line of the vertical sync pulse of this display mode.
+    #[inline]
+    pub fn vsync_start(&self) -> u16 {
+        // SAFETY: Reading these fields is safe via our type invariants.
+        unsafe { (*self.as_raw()).vsync_start }
+    }
+
+    /// Retrieve the line after the vertical sync pulse of this display mode.
+    #[inline]
+    pub fn vsync_end(&self) -> u16 {
+        // SAFETY: Reading these fields is safe via our type invariants.
+        unsafe { (*self.as_raw()).vsync_end }
+    }
+
+    /// Retrieve the total number of lines of a frame of this display mode.
+    #[inline]
+    pub fn vtotal(&self) -> u16 {
+        // SAFETY: Reading these fields is safe via our type invariants.
+        unsafe { (*self.as_raw()).vtotal }
+    }
+
+    /// Return whether the horizontal sync pulse of this display mode is negative.
+    #[inline]
+    pub fn negative_hsync(&self) -> bool {
+        // SAFETY: Reading these fields is safe via our type invariants.
+        let flags = unsafe { (*self.as_raw()).flags };
+
+        flags & bindings::DRM_MODE_FLAG_NHSYNC != 0
+    }
+
+    /// Return whether the vertical sync pulse of this display mode is negative.
+    #[inline]
+    pub fn negative_vsync(&self) -> bool {
+        // SAFETY: Reading these fields is safe via our type invariants.
+        let flags = unsafe { (*self.as_raw()).flags };
+
+        flags & bindings::DRM_MODE_FLAG_NVSYNC != 0
+    }
+
+    /// Return whether this display mode is progressive: neither interlaced nor doublescan.
+    #[inline]
+    pub fn is_progressive(&self) -> bool {
+        // SAFETY: Reading these fields is safe via our type invariants.
+        let flags = unsafe { (*self.as_raw()).flags };
+
+        flags & (bindings::DRM_MODE_FLAG_INTERLACE | bindings::DRM_MODE_FLAG_DBLSCAN) == 0
+    }
+
+    /// Return the refresh rate of this display mode in Hz, rounded, like [`drm_mode_vrefresh()`].
+    ///
+    /// [`drm_mode_vrefresh()`]: srctree/drivers/gpu/drm/drm_modes.c
+    #[inline]
+    pub fn vrefresh(&self) -> i32 {
+        // SAFETY: `self.as_raw()` points to a valid mode, which `drm_mode_vrefresh()` only reads.
+        unsafe { bindings::drm_mode_vrefresh(self.as_raw()) }
+    }
 }
 
 /// Whether a display pipeline can drive a [`DisplayMode`], see [`enum drm_mode_status`].
