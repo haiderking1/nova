@@ -11,6 +11,7 @@
 mod channel;
 mod engine;
 mod instmem;
+mod lut;
 mod regs;
 #[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
 pub(crate) mod scanout_test;
