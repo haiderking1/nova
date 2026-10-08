@@ -312,9 +312,11 @@ impl<'a> Channels<'a> {
         Ok(())
     }
 
-    /// Points the window at `surface`, shown 1:1 and opaque, and updates it.
+    /// Points the window at `surface`, shown 1:1, and updates it.
     ///
-    /// The head keeps the mode and output it has; the update is not interlocked with any other
+    /// The window bypasses composition, as NVIDIA's driver does to show a console: it is shown as
+    /// it is, which needs neither an input LUT on the window nor an output LUT on the head. The
+    /// head keeps the mode and output it has; the update is not interlocked with any other
     /// channel, so it only changes the window.
     fn show(&mut self, bar: Bar0<'_>, surface: &Surface) -> Result {
         use window_c67e::*;
@@ -329,8 +331,6 @@ impl<'a> Channels<'a> {
             0, 0x10000, 0, 0, //
             0, 0, 0x10000, 0,
         ];
-        /// Color keys never match: the full range of each channel.
-        const KEY_FULL_RANGE: u32 = 0xffff << 16;
 
         let methods = [
             // At most one new surface per frame, switching between frames.
@@ -345,20 +345,9 @@ impl<'a> Channels<'a> {
             (set_point_in(0), 0),
             (SET_SIZE_IN, size),
             (SET_SIZE_OUT, size),
-            // No input LUT.
+            // Shown as it is, without the input LUT that composition would need.
             (SET_CONTEXT_DMA_ILUT, 0),
-            // Topmost and opaque: the window's color times K1 (255), plus what's below times
-            // 1 - K1. Color keys never match.
-            (SET_COMPOSITION_CONTROL, 255 << 4),
-            (SET_COMPOSITION_CONSTANT_ALPHA, 0xff),
-            (
-                SET_COMPOSITION_FACTOR_SELECT,
-                FACTOR_K1 | FACTOR_K1 << 4 | FACTOR_NEG_K1 << 8 | FACTOR_NEG_K1 << 12,
-            ),
-            (SET_KEY_ALPHA, KEY_FULL_RANGE),
-            (SET_KEY_RED_CR, KEY_FULL_RANGE),
-            (SET_KEY_GREEN_Y, KEY_FULL_RANGE),
-            (SET_KEY_BLUE_CB, KEY_FULL_RANGE),
+            (SET_COMPOSITION_CONTROL, COMPOSITION_BYPASS),
             // The update doesn't wait for any other channel.
             (SET_INTERLOCK_FLAGS, 0),
             (SET_WINDOW_INTERLOCK_FLAGS, 0),
@@ -433,6 +422,12 @@ fn log_armed_state(dev: &device::Device, bar: Bar0<'_>) {
     for window in 0..8 {
         log("WINDOW_SET_CONTROL", 0x1000 + window * 0x80);
     }
+    // What the window Nova uses is allowed to do.
+    let window = WINDOW * 0x80;
+    log("WINDOW_SET_WINDOW_FORMAT_USAGE_BOUNDS", 0x1004 + window);
+    log("WINDOW_SET_WINDOW_ROTATED_FORMAT_USAGE_BOUNDS", 0x1008 + window);
+    log("WINDOW_SET_MAX_INPUT_SCALE_FACTOR", 0x100c + window);
+    log("WINDOW_SET_WINDOW_USAGE_BOUNDS", 0x1010 + window);
     for (name, method) in LOGGED_HEAD_METHODS {
         log(name, method);
     }

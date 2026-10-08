@@ -33,29 +33,13 @@ pub(crate) mod window_c67e {
     pub(crate) const SET_SIZE_IN: u32 = bindings::NVC67E_SET_SIZE_IN;
     /// Size the window is shown at, in the same layout as [`SET_SIZE`].
     pub(crate) const SET_SIZE_OUT: u32 = bindings::NVC67E_SET_SIZE_OUT;
-    /// Composition: depth of the window in bits 11:4, color key selection in bits 1:0.
+    /// Composition: color key selection in bits 1:0, depth of the window in bits 11:4, bypass in
+    /// bit 16.
     pub(crate) const SET_COMPOSITION_CONTROL: u32 = bindings::NVC67E_SET_COMPOSITION_CONTROL;
-    /// Constant alpha K1 in bits 7:0, K2 in bits 15:8.
-    pub(crate) const SET_COMPOSITION_CONSTANT_ALPHA: u32 =
-        bindings::NVC67E_SET_COMPOSITION_CONSTANT_ALPHA;
-    /// Blend factors: source color in bits 3:0 (key match) and 7:4 (no match), destination color
-    /// in bits 11:8 and 15:12.
-    pub(crate) const SET_COMPOSITION_FACTOR_SELECT: u32 =
-        bindings::NVC67E_SET_COMPOSITION_FACTOR_SELECT;
-    /// Blend factor K1, the constant alpha.
-    pub(crate) const FACTOR_K1: u32 =
-        bindings::NVC67E_SET_COMPOSITION_FACTOR_SELECT_SRC_COLOR_FACTOR_MATCH_SELECT_K1;
-    /// Blend factor 1 - K1.
-    pub(crate) const FACTOR_NEG_K1: u32 =
-        bindings::NVC67E_SET_COMPOSITION_FACTOR_SELECT_DST_COLOR_FACTOR_MATCH_SELECT_NEG_K1;
-    /// Color key range of the alpha channel: minimum in bits 15:0, maximum in bits 31:16.
-    pub(crate) const SET_KEY_ALPHA: u32 = bindings::NVC67E_SET_KEY_ALPHA;
-    /// Color key range of the red channel.
-    pub(crate) const SET_KEY_RED_CR: u32 = bindings::NVC67E_SET_KEY_RED_CR;
-    /// Color key range of the green channel.
-    pub(crate) const SET_KEY_GREEN_Y: u32 = bindings::NVC67E_SET_KEY_GREEN_Y;
-    /// Color key range of the blue channel.
-    pub(crate) const SET_KEY_BLUE_CB: u32 = bindings::NVC67E_SET_KEY_BLUE_CB;
+    /// Bypass of composition for [`SET_COMPOSITION_CONTROL`]: the window is shown as it is,
+    /// without blending, keying or input LUT.
+    pub(crate) const COMPOSITION_BYPASS: u32 =
+        bindings::NVC67E_SET_COMPOSITION_CONTROL_BYPASS_ENABLE << 16;
     /// Presentation: minimum interval in bits 3:0, begin mode (0: without tearing) in bits 6:4.
     pub(crate) const SET_PRESENT_CONTROL: u32 = bindings::NVC67E_SET_PRESENT_CONTROL;
     /// Channels and cursors this window's updates wait for.
