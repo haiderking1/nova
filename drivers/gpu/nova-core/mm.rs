@@ -385,6 +385,25 @@ pub(crate) mod boot_display_test {
             num_pages.min(fb_pages) - bad,
             num_pages.min(fb_pages)
         );
+
+        // Where the page tables say each 2 MiB chunk goes.
+        for page in (0..num_pages).step_by(512).flat_map(|p| [p, (p + 511).min(num_pages - 1)]) {
+            let (vfn, pte) = bar_user.walk_mapped(mm, mapped, page)?;
+            match pte {
+                Some((pte_addr, pfn)) => dev_info!(
+                    dev,
+                    "boot display: page {page}: VFN {:#x}, PTE at {:#x}, maps PFN {:?}\n",
+                    vfn.raw(),
+                    pte_addr.into_raw(),
+                    pfn.map(|p| p.raw())
+                ),
+                None => dev_info!(
+                    dev,
+                    "boot display: page {page}: VFN {:#x}, no page table\n",
+                    vfn.raw()
+                ),
+            }
+        }
         Ok(())
     }
 

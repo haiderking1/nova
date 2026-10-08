@@ -203,6 +203,12 @@ impl Vmm {
         }
     }
 
+    /// Walk the page tables to the PTE of `vfn`.
+    #[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
+    pub(super) fn walk(&self, mm: &mut GpuMm<'_>, vfn: Vfn) -> Result<WalkResult> {
+        self.pt_walk.walk_to_pte(mm, vfn)
+    }
+
     /// Read the [`Pfn`] for a mapped [`Vfn`] if one is mapped.
     pub(super) fn read_mapping(&self, mm: &mut GpuMm<'_>, vfn: Vfn) -> Result<Option<Pfn>> {
         match self.pt_walk.walk_to_pte(mm, vfn)? {

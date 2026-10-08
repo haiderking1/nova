@@ -124,6 +124,27 @@ impl<'a> BarUser<'a> {
             .ok_or(EOVERFLOW)
     }
 
+    /// For debugging: walk the page tables for page `page` of `mapped`. Returns its VFN, and the
+    /// address of its PTE and the PFN it maps, if the walk gets that far.
+    #[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
+    pub(crate) fn walk_mapped(
+        &self,
+        mm: &mut GpuMm<'_>,
+        mapped: &MappedRange,
+        page: usize,
+    ) -> Result<(Vfn, Option<(VramAddress, Option<Pfn>)>)> {
+        use crate::mm::pagetable::walk::WalkResult;
+
+        let vfn = Vfn::new(mapped.vfn_start.raw() + u64::try_from(page)?);
+        let pte = match self.vmm.lock().walk(mm, vfn)? {
+            WalkResult::Mapped { pte_addr, pfn } => Some((pte_addr, Some(pfn))),
+            WalkResult::Unmapped { pte_addr } => Some((pte_addr, None)),
+            WalkResult::PageTableMissing => None,
+        };
+
+        Ok((vfn, pte))
+    }
+
     /// Read the 32-bit value at `offset` in the region `mapped` maps.
     pub(crate) fn read32(&self, mapped: &MappedRange, offset: usize) -> Result<u32> {
         let base = Self::mapped_offset(mapped, offset, 4)?;
@@ -299,8 +320,10 @@ pub(crate) fn run_self_test(
     let test_vram = VramAddress::from_raw(test_vram_offset);
     let test_pfn = Pfn::from(test_vram);
 
-    // Create a VMM of size 64K to track virtual memory mappings.
-    let mut vmm = Vmm::new(pdb_addr, chipset.mmu_version(), SZ_64K.into_safe_cast())?;
+    // Use the BarUser's VMM: a second VMM on the same PDB would install PDEs pointing to page
+    // table pages it frees when dropped, which later mappings then allocate again for other PDEs,
+    // aliasing their page tables.
+    let mut vmm = bar_user.vmm.lock();
 
     // Create a test mapping.
     let mapped = vmm.map_pages(mm, &[test_pfn], None, true)?;
@@ -452,7 +475,7 @@ pub(crate) fn run_self_test(
         test3_passed = false;
     }
 
-    // Release Tests 1-3's Vmm before Test 4 uses the GPU's BarUser on the same PDB.
+    // Unlock the VMM before Test 4 maps through the BarUser.
     drop(vmm);
 
     // Test 4: Exercise `BarUser::map()` end-to-end.
