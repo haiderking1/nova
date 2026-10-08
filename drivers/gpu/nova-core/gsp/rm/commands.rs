@@ -3,7 +3,8 @@
 use core::{
     array,
     convert::Infallible,
-    mem::size_of, //
+    mem::size_of,
+    ops::Range, //
 };
 
 use kernel::{
@@ -27,6 +28,8 @@ use crate::{
             Client,
             Device,
             DisplayCommon,
+            DisplayCoreChannel,
+            DisplayRoot,
             Handle,
             Subdevice, //
         },
@@ -36,6 +39,7 @@ use crate::{
             MsgFunction, //
         },
     },
+    mm::VramAddress,
     sbuffer::SBufferIter, //
 };
 
@@ -426,15 +430,15 @@ impl MessageFromGsp for RmFreeReply {
     }
 }
 
-/// Implements [`RmControlCommand`] for a display control whose parameters are both sent and
-/// returned as `$params`.
+/// Implements [`RmControlCommand`] for a display control sent to an object of type `$target`, whose
+/// parameters are both sent and returned as `$params`.
 macro_rules! disp_control {
-    ($cmd:ty, $function:ident, $params:ty, $reply:ty, |$p:ident| $parse:expr) => {
+    ($cmd:ty, $target:ty, $function:ident, $params:ty, $reply:ty, |$p:ident| $parse:expr) => {
         impl RmControlCommand for $cmd {
             const FUNCTION: RmControlMsgFunction = RmControlMsgFunction::$function;
             const LEN: usize = size_of::<$params>();
             type Reply = $reply;
-            type Target = DisplayCommon;
+            type Target = $target;
 
             fn write_payload(
                 &self,
@@ -463,6 +467,7 @@ impl DispGetNumHeads {
 
 disp_control!(
     DispGetNumHeads,
+    DisplayCommon,
     DispSystemGetNumHeads,
     DispGetNumHeadsParams,
     u32,
@@ -484,6 +489,7 @@ impl DispGetActive {
 
 disp_control!(
     DispGetActive,
+    DisplayCommon,
     DispSystemGetActive,
     DispGetActiveParams,
     u32,
@@ -502,6 +508,7 @@ impl DispGetConnectorType {
 
 disp_control!(
     DispGetConnectorType,
+    DisplayCommon,
     DispSpecificGetConnectorData,
     DispGetConnectorDataParams,
     ConnectorType,
@@ -524,6 +531,7 @@ impl DispGetEdid {
 
 disp_control!(
     DispGetEdid,
+    DisplayCommon,
     DispSpecificGetEdidV2,
     DispGetEdidParams,
     KVec<u8>,
@@ -533,3 +541,117 @@ disp_control!(
         edid
     }
 );
+
+/// RM control command for querying the static configuration of the display engine.
+///
+/// The reply is the mask of the windows the display engine has. Sent to GSP-RM's internal
+/// subdevice.
+pub(crate) struct DispGetStaticInfo(DispGetStaticInfoParams);
+
+impl DispGetStaticInfo {
+    /// Creates the command.
+    pub(crate) fn new() -> Self {
+        Self(DispGetStaticInfoParams::new())
+    }
+}
+
+disp_control!(
+    DispGetStaticInfo,
+    Subdevice,
+    InternalDisplayGetStaticInfo,
+    DispGetStaticInfoParams,
+    u32,
+    |p| p.window_present_mask()
+);
+
+/// RM control command for setting the instance memory of the display engine, which holds its
+/// hash table and the context DMA objects of its channels.
+///
+/// Sent to GSP-RM's internal subdevice.
+pub(crate) struct DispWriteInstMem(DispWriteInstMemParams);
+
+impl DispWriteInstMem {
+    /// Creates the command for the instance memory at `range`.
+    pub(crate) fn new(range: Range<VramAddress>) -> Self {
+        Self(DispWriteInstMemParams::new(
+            range.start.into_raw(),
+            range.end - range.start,
+        ))
+    }
+}
+
+disp_control!(
+    DispWriteInstMem,
+    Subdevice,
+    InternalDisplayWriteInstMem,
+    DispWriteInstMemParams,
+    (),
+    |_p| ()
+);
+
+/// RM control command for setting the push buffer of a display channel, which must precede the
+/// allocation of the channel.
+///
+/// Sent to GSP-RM's internal subdevice.
+pub(crate) struct DispChannelPushbuffer(DispChannelPushbufferParams);
+
+impl DispChannelPushbuffer {
+    /// Creates the command for the core channel of a GA10x display engine, whose push buffer is
+    /// at DMA address `dma_addr`.
+    pub(crate) fn core_ga102(dma_addr: u64) -> Self {
+        // There is a single core channel.
+        Self(DispChannelPushbufferParams::new(
+            RmObjectClass::CoreChannelGa102,
+            0,
+            dma_addr,
+        ))
+    }
+}
+
+disp_control!(
+    DispChannelPushbuffer,
+    Subdevice,
+    InternalDisplayChannelPushbuffer,
+    DispChannelPushbufferParams,
+    (),
+    |_p| ()
+);
+
+/// Allocation of the display object of a GA10x display engine under a device.
+pub(crate) struct AllocDisplayGa102;
+
+impl RmAllocCommand for AllocDisplayGa102 {
+    const CLASS: RmObjectClass = RmObjectClass::DisplayGa102;
+    type Parent = Device;
+    type Object = DisplayRoot;
+    // The class takes no parameters.
+    type Params = [u8; 0];
+
+    fn params(&self) -> &Self::Params {
+        &[]
+    }
+}
+
+/// Allocation of the core channel of a GA10x display engine under its display object.
+///
+/// The push buffer of the channel must have been set with [`DispChannelPushbuffer`] first.
+pub(crate) struct AllocCoreChannelGa102(DmaChannelAllocParams);
+
+impl AllocCoreChannelGa102 {
+    /// Creates the command, for a push buffer whose commands start at byte offset `put`.
+    pub(crate) fn new(put: u32) -> Self {
+        // There is a single core channel.
+        Self(DmaChannelAllocParams::new(0, put))
+    }
+}
+
+impl RmAllocCommand for AllocCoreChannelGa102 {
+    const CLASS: RmObjectClass = RmObjectClass::CoreChannelGa102;
+    type Parent = DisplayRoot;
+    type Object = DisplayCoreChannel;
+    type Params = DmaChannelAllocParams;
+
+    fn params(&self) -> &Self::Params {
+        &self.0
+    }
+}

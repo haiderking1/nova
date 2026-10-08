@@ -29,6 +29,10 @@ pub(crate) mod rm;
 mod sequencer;
 
 pub use fw::rm::ConnectorType;
+pub(crate) use fw::rm::{
+    DISP_CORE_SET_CONTEXT_DMA_NOTIFIER,
+    DISP_PUSHBUFFER_SIZE, //
+};
 pub(crate) use fw::{
     GspFmcBootParams,
     GspFwWprMeta,

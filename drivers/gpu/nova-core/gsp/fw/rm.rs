@@ -35,6 +35,13 @@ pub(crate) enum RmControlMsgFunction {
     DispSpecificGetConnectorData = bindings::NV0073_CTRL_CMD_SPECIFIC_GET_CONNECTOR_DATA,
     /// Get the EDID of a display.
     DispSpecificGetEdidV2 = bindings::NV0073_CTRL_CMD_SPECIFIC_GET_EDID_V2,
+    /// Get the static configuration of the display engine.
+    InternalDisplayGetStaticInfo = bindings::NV2080_CTRL_CMD_INTERNAL_DISPLAY_GET_STATIC_INFO,
+    /// Set the instance memory of the display engine.
+    InternalDisplayWriteInstMem = bindings::NV2080_CTRL_CMD_INTERNAL_DISPLAY_WRITE_INST_MEM,
+    /// Set the push buffer of a display channel, before allocating the channel.
+    InternalDisplayChannelPushbuffer =
+        bindings::NV2080_CTRL_CMD_INTERNAL_DISPLAY_CHANNEL_PUSHBUFFER,
 }
 
 // TODO[FPRI]: This is a temporary solution to be replaced with the corresponding derive macros
@@ -53,6 +60,15 @@ impl TryFrom<u32> for RmControlMsgFunction {
                 Ok(Self::DispSpecificGetConnectorData)
             }
             bindings::NV0073_CTRL_CMD_SPECIFIC_GET_EDID_V2 => Ok(Self::DispSpecificGetEdidV2),
+            bindings::NV2080_CTRL_CMD_INTERNAL_DISPLAY_GET_STATIC_INFO => {
+                Ok(Self::InternalDisplayGetStaticInfo)
+            }
+            bindings::NV2080_CTRL_CMD_INTERNAL_DISPLAY_WRITE_INST_MEM => {
+                Ok(Self::InternalDisplayWriteInstMem)
+            }
+            bindings::NV2080_CTRL_CMD_INTERNAL_DISPLAY_CHANNEL_PUSHBUFFER => {
+                Ok(Self::InternalDisplayChannelPushbuffer)
+            }
             _ => Err(EINVAL),
         }
     }
@@ -120,6 +136,11 @@ pub(crate) enum RmObjectClass {
     Subdevice = bindings::NV20_SUBDEVICE_0,
     /// The display engine's common object, child of a device.
     DisplayCommon = bindings::NV04_DISPLAY_COMMON,
+    /// The display object of GA10x display engines, child of a device and parent of the display
+    /// channels.
+    DisplayGa102 = bindings::NVC670_DISPLAY,
+    /// The core channel of GA10x display engines, child of the display object.
+    CoreChannelGa102 = bindings::NVC67D_CORE_CHANNEL_DMA,
 }
 
 impl From<RmObjectClass> for u32 {
@@ -414,7 +435,9 @@ impl DispGetEdidParams {
 
     /// Returns the EDID, or `None` if GSP-RM reported a size larger than the buffer.
     pub(crate) fn edid(&self) -> Option<&[u8]> {
-        self.0.edidBuffer.get(..num::u32_as_usize(self.0.bufferSize))
+        self.0
+            .edidBuffer
+            .get(..num::u32_as_usize(self.0.bufferSize))
     }
 }
 
@@ -423,3 +446,131 @@ unsafe impl FromBytes for DispGetEdidParams {}
 
 // SAFETY: This struct contains no padding.
 unsafe impl AsBytes for DispGetEdidParams {}
+
+// The following values come from internal RM headers, which aren't part of NVIDIA's SDK headers
+// the bindings are generated from.
+
+/// System memory address space (`ADDR_SYSMEM` in RM's `mem_desc.h`).
+const ADDR_SYSMEM: u32 = 1;
+/// VRAM address space (`ADDR_FBMEM` in RM's `mem_desc.h`).
+const ADDR_FBMEM: u32 = 2;
+/// Push buffer in cache-coherent system memory (`PHYS_PCI_COHERENT` of `PBTARGETAPERTURE` in RM's
+/// `kern_disp.h`).
+const PB_TARGET_APERTURE_PHYS_PCI_COHERENT: u32 = 3;
+
+/// Wrapper for [`bindings::NV2080_CTRL_INTERNAL_DISPLAY_GET_STATIC_INFO_PARAMS`].
+#[repr(transparent)]
+pub(crate) struct DispGetStaticInfoParams(
+    bindings::NV2080_CTRL_INTERNAL_DISPLAY_GET_STATIC_INFO_PARAMS,
+);
+
+impl DispGetStaticInfoParams {
+    /// Creates the parameters to query the static configuration of the display engine.
+    pub(crate) fn new() -> Self {
+        Self(Default::default())
+    }
+
+    /// Returns the mask of the windows the display engine has.
+    pub(crate) fn window_present_mask(&self) -> u32 {
+        self.0.windowPresentMask
+    }
+}
+
+// SAFETY: This struct only contains integer types for which all bit patterns are valid.
+unsafe impl FromBytes for DispGetStaticInfoParams {}
+
+// SAFETY: Padding is explicit and will not contain uninitialized data.
+unsafe impl AsBytes for DispGetStaticInfoParams {}
+
+/// Wrapper for [`bindings::NV2080_CTRL_INTERNAL_DISPLAY_WRITE_INST_MEM_PARAMS`].
+#[repr(transparent)]
+pub(crate) struct DispWriteInstMemParams(
+    bindings::NV2080_CTRL_INTERNAL_DISPLAY_WRITE_INST_MEM_PARAMS,
+);
+
+impl DispWriteInstMemParams {
+    /// Creates the parameters to make the `size` bytes of VRAM at `addr` the instance memory of
+    /// the display engine, which the CPU writes write-combined.
+    pub(crate) fn new(addr: u64, size: u64) -> Self {
+        Self(
+            bindings::NV2080_CTRL_INTERNAL_DISPLAY_WRITE_INST_MEM_PARAMS {
+                instMemPhysAddr: addr,
+                instMemSize: size,
+                instMemAddrSpace: ADDR_FBMEM,
+                instMemCpuCacheAttr: bindings::NV_MEMORY_WRITECOMBINED,
+            },
+        )
+    }
+}
+
+// SAFETY: This struct only contains integer types for which all bit patterns are valid.
+unsafe impl FromBytes for DispWriteInstMemParams {}
+
+// SAFETY: This struct contains no padding.
+unsafe impl AsBytes for DispWriteInstMemParams {}
+
+/// Wrapper for [`bindings::NV2080_CTRL_INTERNAL_DISPLAY_CHANNEL_PUSHBUFFER_PARAMS`].
+#[repr(transparent)]
+pub(crate) struct DispChannelPushbufferParams(
+    bindings::NV2080_CTRL_INTERNAL_DISPLAY_CHANNEL_PUSHBUFFER_PARAMS,
+);
+
+impl DispChannelPushbufferParams {
+    /// Creates the parameters to give instance `instance` of display channel class `class` a
+    /// 4 KiB push buffer at DMA address `dma_addr`, in cache-coherent system memory.
+    pub(crate) fn new(class: RmObjectClass, instance: u32, dma_addr: u64) -> Self {
+        Self(
+            bindings::NV2080_CTRL_INTERNAL_DISPLAY_CHANNEL_PUSHBUFFER_PARAMS {
+                addressSpace: ADDR_SYSMEM,
+                physicalAddr: dma_addr,
+                limit: DISP_PUSHBUFFER_SIZE - 1,
+                cacheSnoop: 1,
+                hclass: u32::from(class),
+                channelInstance: instance,
+                valid: 1,
+                pbTargetAperture: PB_TARGET_APERTURE_PHYS_PCI_COHERENT,
+                channelPBSize: bindings::ChannelPBSize_PB_SIZE_4KB,
+                // The channel addresses subdevice 0 in its push buffer.
+                subDeviceId: 1 << 0,
+                ..Default::default()
+            },
+        )
+    }
+}
+
+/// Size of the push buffer of a display channel, in bytes.
+pub(crate) const DISP_PUSHBUFFER_SIZE: u64 = 4096;
+
+/// Method of GA10x display core channels setting the context DMA of the notifier of the next
+/// update.
+pub(crate) const DISP_CORE_SET_CONTEXT_DMA_NOTIFIER: u32 =
+    bindings::NVC67D_SET_CONTEXT_DMA_NOTIFIER;
+
+// SAFETY: This struct only contains integer types for which all bit patterns are valid.
+unsafe impl FromBytes for DispChannelPushbufferParams {}
+
+// SAFETY: Padding is explicit and will not contain uninitialized data.
+unsafe impl AsBytes for DispChannelPushbufferParams {}
+
+/// Wrapper for [`bindings::NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS`], the parameters to allocate
+/// a display channel driven through a push buffer.
+#[repr(transparent)]
+pub(crate) struct DmaChannelAllocParams(bindings::NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS);
+
+impl DmaChannelAllocParams {
+    /// Creates the parameters to allocate channel instance `instance`, whose push buffer was set
+    /// with [`DispChannelPushbufferParams`] and starts at byte offset `put`.
+    pub(crate) fn new(instance: u32, put: u32) -> Self {
+        Self(bindings::NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS {
+            channelInstance: instance,
+            offset: put,
+            channelPBSize: bindings::ChannelPBSize_PB_SIZE_4KB,
+            subDeviceId: 1 << 0,
+            ..Default::default()
+        })
+    }
+}
+
+// SAFETY: Padding is explicit and will not contain uninitialized data, and the only non-integer
+// field, `pControl`, is always null.
+unsafe impl AsBytes for DmaChannelAllocParams {}

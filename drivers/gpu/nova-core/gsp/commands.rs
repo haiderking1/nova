@@ -62,6 +62,17 @@ pub(crate) struct Subdevice;
 /// that are not specific to a display channel.
 pub(crate) struct DisplayCommon;
 
+/// Marker type for the GSP-RM handle of a display object.
+///
+/// This object, a child of a device, owns the display engine's channels.
+pub(crate) struct DisplayRoot;
+
+/// Marker type for the GSP-RM handle of a display core channel.
+///
+/// The core channel, a child of the display object, carries the methods that configure heads and
+/// outputs.
+pub(crate) struct DisplayCoreChannel;
+
 /// A typed GSP-RM object handle.
 ///
 /// These handles form a tree structure with different types of RM objects, with client at the root.
@@ -241,7 +252,9 @@ impl MessageFromGsp for GspInitDone {
 
 /// Waits for GSP initialization to complete.
 pub(crate) fn wait_gsp_init_done(cmdq: &Cmdq<'_>) -> Result {
-    cmdq.await_msg::<GspInitDone>().map(|_| ()).map_err(Into::into)
+    cmdq.await_msg::<GspInitDone>()
+        .map(|_| ())
+        .map_err(Into::into)
 }
 
 /// The `GetGspStaticInfo` command.
@@ -344,13 +357,11 @@ impl GetGspStaticInfoReply {
     }
 
     /// Returns the client handle allocated by GSP-RM.
-    #[expect(dead_code)]
     pub(crate) fn client(&self) -> Handle<Client> {
         self.client
     }
 
     /// Returns the subdevice handle allocated by GSP-RM.
-    #[expect(dead_code)]
     pub(crate) fn subdevice(&self) -> Handle<Subdevice> {
         self.subdevice
     }
