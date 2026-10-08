@@ -12,6 +12,7 @@ use kernel::{
         kms::modes::OwnedDisplayMode, //
     },
     prelude::*,
+    screen_info::PixelFormat,
     sync::aref::ARef, //
 };
 
@@ -25,10 +26,20 @@ use nova_core::api::{
 
 pub(crate) struct NovaDriver;
 
+/// The display the system firmware set up, the only one nova-drm can drive yet.
+pub(crate) struct BootDisplay {
+    /// Its mode, the only one that works.
+    pub(crate) mode: OwnedDisplayMode,
+    /// Distance between the starts of two lines of its framebuffer, in bytes.
+    pub(crate) stride: u32,
+    /// Pixel layout of its framebuffer.
+    pub(crate) format: PixelFormat,
+}
+
 /// Data of the DRM device.
 pub(crate) struct NovaData {
-    /// Mode of the display the system firmware set up, the only one nova-drm can drive yet.
-    pub(crate) boot_display: Option<OwnedDisplayMode>,
+    /// The display the system firmware set up, if any.
+    pub(crate) boot_display: Option<BootDisplay>,
 }
 
 pub(crate) struct Nova<'bound> {
@@ -78,12 +89,16 @@ impl auxiliary::Driver for NovaDriver {
         let boot_display = api
             .with(|api| api.boot_display_mode())
             .map(|mode| -> Result<_> {
-                Ok(OwnedDisplayMode::simple(
-                    mode.width.try_into()?,
-                    mode.height.try_into()?,
-                    0,
-                    0,
-                ))
+                Ok(BootDisplay {
+                    mode: OwnedDisplayMode::simple(
+                        mode.width.try_into()?,
+                        mode.height.try_into()?,
+                        0,
+                        0,
+                    ),
+                    stride: mode.stride,
+                    format: mode.format,
+                })
             })
             .transpose()?;
 
