@@ -94,6 +94,8 @@ const UPDATE_TIMEOUT: Delta = Delta::from_millis(500);
 
 /// The window Nova shows surfaces on: window 0, which belongs to head 0.
 const WINDOW: usize = 0;
+/// The head the window Nova shows surfaces on belongs to.
+pub(crate) const HEAD: u32 = 0;
 
 /// GSP-RM's own client and subdevice, the targets of its internal controls.
 pub(crate) struct InternalHandles {

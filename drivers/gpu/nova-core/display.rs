@@ -9,12 +9,13 @@
 
 mod channel;
 mod engine;
-mod hal;
+pub(crate) mod hal;
 mod instmem;
 mod regs;
 mod scanout;
 #[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
 pub(crate) mod scanout_test;
+mod vblank;
 
 pub(crate) use engine::{
     DisplayEngine,
@@ -23,6 +24,8 @@ pub(crate) use engine::{
 };
 pub(crate) use scanout::Scanout;
 pub use scanout::ScanoutMode;
+pub(crate) use vblank::VblankHandlerSlot;
+pub use vblank::VblankHandler;
 
 use kernel::{
     device,

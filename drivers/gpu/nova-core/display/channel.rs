@@ -71,7 +71,7 @@ impl DmaChannel {
 }
 
 /// The push buffer of a display channel, and the channel's PUT and GET pointers.
-pub(super) struct PushBuffer<'a> {
+pub(crate) struct PushBuffer<'a> {
     channel: DmaChannel,
     buffer: Coherent<'a, [u32; PUSHBUFFER_WORDS]>,
     /// Word up to which methods were written.

@@ -48,6 +48,8 @@ pub struct ScanoutMode {
     pub height: u32,
     /// Distance between the starts of two lines, in bytes.
     pub stride: u32,
+    /// The head that shows the scanout, whose vblanks pace it.
+    pub head: u32,
 }
 
 /// Two framebuffers that the window shows in turns.
@@ -79,6 +81,7 @@ impl Scanout {
             width,
             height,
             stride,
+            head: super::engine::HEAD,
         };
 
         let first = Self::alloc_framebuffer(mm, bar_user, mode)?;

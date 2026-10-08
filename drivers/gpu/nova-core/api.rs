@@ -11,11 +11,15 @@ use kernel::{
     pci,
     prelude::*,
     screen_info::PixelFormat,
+    sync::Arc,
     types::ForLt, //
 };
 
 pub use crate::{
-    display::ScanoutMode,
+    display::{
+        ScanoutMode,
+        VblankHandler, //
+    },
     gpu::Spec,
     gsp::ConnectorType, //
 };
@@ -65,12 +69,15 @@ impl NovaCoreApi<'_> {
 
     /// Returns the mode of the display the system firmware set up on the GPU, if it set one up.
     pub fn boot_display_mode(&self) -> Option<BootDisplayMode> {
-        self.gpu.boot_display.as_ref().map(|display| BootDisplayMode {
-            width: display.width,
-            height: display.height,
-            stride: display.stride,
-            format: display.format,
-        })
+        self.gpu
+            .boot_display
+            .as_ref()
+            .map(|display| BootDisplayMode {
+                width: display.width,
+                height: display.height,
+                stride: display.stride,
+                format: display.format,
+            })
     }
 
     /// Writes `data` at `offset` into the framebuffer of the boot display, which shows on screen.
@@ -108,6 +115,23 @@ impl NovaCoreApi<'_> {
     /// Fails with `ENODEV` if the scanout isn't set up.
     pub fn flip_scanout(&self) -> Result {
         self.gpu.flip_scanout()
+    }
+
+    /// Enables the vblank interrupt of head `head` if `enable`, or disables it. Doesn't sleep, so
+    /// it may be called in atomic context.
+    ///
+    /// The vblanks of the heads whose interrupt is enabled are passed to the handler set with
+    /// [`NovaCoreApi::set_vblank_handler()`]. Fails with `ENODEV` if Nova can't service the display
+    /// interrupt.
+    pub fn set_vblank_interrupt(&self, head: u32, enable: bool) -> Result {
+        self.gpu.set_vblank_interrupt(head, enable)
+    }
+
+    /// Sets the handler of vblanks, replacing any, or removes it with `None`.
+    ///
+    /// The handler must be removed before the client unbinds.
+    pub fn set_vblank_handler(&self, handler: Option<Arc<dyn VblankHandler>>) {
+        self.gpu.set_vblank_handler(handler)
     }
 
     /// Returns the type of connector the boot display is shown through.

@@ -35,7 +35,7 @@ use super::{
 mod ga102;
 
 /// What a window update shows, and where it reports its progress.
-pub(super) struct WindowImage<'a> {
+pub(crate) struct WindowImage<'a> {
     /// The surface shown, 1:1.
     pub(super) surface: &'a Surface,
     /// Handle of the context DMA the surface is in.
@@ -46,7 +46,7 @@ pub(super) struct WindowImage<'a> {
     pub(super) notifier_offset: u32,
 }
 
-pub(super) trait DisplayHal: Sync {
+pub(crate) trait DisplayHal: Sync {
     /// Allocates the display object `handle` under `device`, the parent of the display channels.
     fn alloc_display(
         &self,
@@ -102,13 +102,21 @@ pub(super) trait DisplayHal: Sync {
         image: &WindowImage<'_>,
     ) -> Result;
 
+    /// Enables the vblank interrupt of head `head` if `enable`, or disables it, dropping any
+    /// pending vblank of the head.
+    fn set_vblank_interrupt(&self, bar: Bar0<'_>, head: usize, enable: bool) -> Result;
+
+    /// Acknowledges the vblank interrupts pending, and returns the heads they are of, one bit per
+    /// head.
+    fn take_vblanks(&self, bar: Bar0<'_>) -> u32;
+
     /// Logs the parts of the armed state of the core channel that taking over head 0 and window
     /// `window` depends on.
     fn log_armed_state(&self, dev: &device::Device, bar: Bar0<'_>, window: usize);
 }
 
 /// Returns the HAL of the display engine of `chipset`, if Nova supports it.
-pub(super) fn display_hal(chipset: Chipset) -> Option<&'static dyn DisplayHal> {
+pub(crate) fn display_hal(chipset: Chipset) -> Option<&'static dyn DisplayHal> {
     match chipset {
         Chipset::GA102 | Chipset::GA103 | Chipset::GA104 | Chipset::GA106 | Chipset::GA107 => {
             Some(ga102::GA102_HAL)

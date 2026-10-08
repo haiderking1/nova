@@ -5,6 +5,10 @@
 
 use kernel::{
     device,
+    io::{
+        register::Array,
+        Io, //
+    },
     prelude::*, //
 };
 
@@ -42,6 +46,7 @@ use super::{
             armed,
             InternalHandles, //
         },
+        regs,
     },
     DisplayHal,
     WindowImage, //
@@ -173,6 +178,56 @@ impl DisplayHal for Ga102 {
         }
         push.push(bar, SET_FMT_COEFFICIENT_C00, &IDENTITY)?;
         push.push(bar, UPDATE, &[1])
+    }
+
+    fn set_vblank_interrupt(&self, bar: Bar0<'_>, head: usize, enable: bool) -> Result {
+        let enables = regs::NV_PDISP_FE_RM_INTR_EN_HEAD_TIMING::try_at(head).ok_or(EINVAL)?;
+        let drop_pending = || -> Result {
+            bar.write(
+                regs::NV_PDISP_FE_EVT_STAT_HEAD_TIMING::try_at(head).ok_or(EINVAL)?,
+                regs::NV_PDISP_FE_EVT_STAT_HEAD_TIMING::zeroed().with_last_data(true),
+            );
+            Ok(())
+        };
+
+        // Like RM, drop the vblank the head may have had pending before enabling its interrupt,
+        // and after disabling it.
+        if enable {
+            drop_pending()?;
+        }
+        bar.update(enables, |reg| reg.with_last_data(enable));
+        if !enable {
+            drop_pending()?;
+        }
+
+        Ok(())
+    }
+
+    fn take_vblanks(&self, bar: Bar0<'_>) -> u32 {
+        let dispatch = bar
+            .read(regs::NV_PDISP_FE_RM_INTR_DISPATCH)
+            .head_timing()
+            .get();
+        let mut heads = 0;
+
+        for head in (0..8).filter(|head| dispatch & 1 << head != 0) {
+            let (Some(stat), Some(events)) = (
+                regs::NV_PDISP_FE_RM_INTR_STAT_HEAD_TIMING::try_at(head),
+                regs::NV_PDISP_FE_EVT_STAT_HEAD_TIMING::try_at(head),
+            ) else {
+                continue;
+            };
+
+            if bar.read(stat).last_data() {
+                bar.write(
+                    events,
+                    regs::NV_PDISP_FE_EVT_STAT_HEAD_TIMING::zeroed().with_last_data(true),
+                );
+                heads |= 1 << head;
+            }
+        }
+
+        heads
     }
 
     fn log_armed_state(&self, dev: &device::Device, bar: Bar0<'_>, window: usize) {

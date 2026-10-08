@@ -245,6 +245,11 @@ impl GinVector {
         Self(Bounded::<u32, VECTOR_BITS>::new::<VECTOR>())
     }
 
+    /// Returns vector number `vector`, or `None` if it is beyond the widest supported tree.
+    pub(super) fn try_new(vector: u32) -> Option<Self> {
+        Bounded::<u32, VECTOR_BITS>::try_new(vector).map(Self)
+    }
+
     #[cfg_attr(not(CONFIG_NOVA_CORE_SELFTESTS), expect(dead_code))]
     pub(super) const fn into_raw(self) -> u32 {
         self.0.get()

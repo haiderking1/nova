@@ -48,3 +48,31 @@ register! {
         31:0    value;
     }
 }
+
+// Head timing interrupts (`NV_PDISP_FE_*_HEAD_TIMING` in `dev_disp.h`, v03_00, and v04_00 for the
+// enables). A head's LAST_DATA event fires once it read the last pixel of a frame: at the start of
+// vertical blanking.
+
+register! {
+    base: NovaRegisters;
+
+    /// Heads with a head timing interrupt pending, one bit per head.
+    pub(super) NV_PDISP_FE_RM_INTR_DISPATCH(u32) @ 0x00611ec0 {
+        7:0     head_timing;
+    }
+
+    /// Head timing interrupts pending for the CPU, per head.
+    pub(super) NV_PDISP_FE_RM_INTR_STAT_HEAD_TIMING(u32)[8, stride = 4] @ 0x00611c00 {
+        1:1     last_data => bool;
+    }
+
+    /// Head timing events, per head: writing 1 to an event clears it.
+    pub(super) NV_PDISP_FE_EVT_STAT_HEAD_TIMING(u32)[8, stride = 4] @ 0x00611800 {
+        1:1     last_data => bool;
+    }
+
+    /// Enables of the head timing interrupts for the CPU, per head.
+    pub(super) NV_PDISP_FE_RM_INTR_EN_HEAD_TIMING(u32)[8, stride = 4] @ 0x00611d80 {
+        1:1     last_data => bool;
+    }
+}

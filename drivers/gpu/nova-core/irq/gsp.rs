@@ -181,7 +181,8 @@ impl<'a> GspIrq<'a> {
             reg <- unsafe {
                 irq::ThreadedRegistration::new(
                     tree.request_for(GSP_SUBTREE)?,
-                    irq::Flags::TRIGGER_NONE,
+                    // Shared with the display vector, in the same subtree.
+                    irq::Flags::SHARED,
                     c"nova-core",
                     Ok(GspInterrupt { falcon, cmdq, tree, dev }),
                 )
