@@ -629,6 +629,11 @@ impl<'gpu> Gpu<'gpu> {
         ) {
             dev_err!(dev, "self-tests failed: {:?}\n", err);
         }
+
+        // soka/experiments: put pixels on screen through the UEFI framebuffer.
+        if let Err(err) = crate::mm::efifb::draw_test_pattern(dev, this.mm, regions) {
+            dev_err!(dev, "efifb: test pattern failed: {:?}\n", err);
+        }
     }
 }
 
