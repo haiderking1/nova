@@ -31,6 +31,9 @@ use super::{
 
 /// Value the second shader stores.
 const VALUE: u32 = 0x600d_cafe;
+/// Value the compute engine writes once the second shader is done, without running instructions:
+/// tells a wrong shader from writes not reaching memory.
+const RELEASED: u32 = 0x0d07_e000;
 
 // Layout of the test's memory page. Programs are 128-byte aligned, work descriptors 256-byte
 // aligned.
@@ -45,6 +48,8 @@ const EXIT_QMD: u64 = 0x100;
 const STORE_QMD: u64 = 0x200;
 /// Offset of the word [`VALUE`] is stored to.
 const RESULT: u64 = 0x300;
+/// Offset of the word [`RELEASED`] is written to.
+const RELEASE: u64 = 0x310;
 
 /// Registers the programs use: up to R5, plus 2 the hardware reserves.
 const REGISTERS: u8 = 8;
@@ -122,23 +127,29 @@ fn run_on(
         // A single thread.
         let qmd = |program| Qmd::new(va + program, [1, 1, 1], [1, 1, 1], REGISTERS);
         write(mm, EXIT_QMD, qmd(EXIT_PROGRAM).words())?;
-        write(mm, STORE_QMD, qmd(STORE_PROGRAM).words())?;
+        write(
+            mm,
+            STORE_QMD,
+            qmd(STORE_PROGRAM).release(va + RELEASE, RELEASED)?.words(),
+        )?;
 
         channel.launch(bar, mm, va + EXIT_QMD)?;
         dev_info!(dev, "compute test: a shader ran\n");
 
         channel.launch(bar, mm, va + STORE_QMD)?;
         let stored = mm.read_vram(base + RESULT)?;
-        if stored != VALUE {
-            dev_err!(
-                dev,
-                "compute test: the shader stored {:#010x}, not {:#010x}\n",
-                stored,
-                VALUE
-            );
+        let released = mm.read_vram(base + RELEASE)?;
+        dev_info!(
+            dev,
+            "compute test: the shader stored {:#010x} (expected {:#010x}), the engine released {:#010x} (expected {:#010x})\n",
+            stored,
+            VALUE,
+            released,
+            RELEASED
+        );
+        if stored != VALUE || released != RELEASED {
             return Err(EIO);
         }
-        dev_info!(dev, "compute test: a shader stored {:#010x}\n", stored);
 
         Ok(())
     })();

@@ -24,6 +24,23 @@ pub(crate) mod host_c56f {
     /// Sets the class of the object a subchannel runs the methods of.
     pub(crate) const SET_OBJECT: u32 = bindings::NVC56F_SET_OBJECT;
 
+    /// Returns the methods waiting for the channel's engine to be idle, then for the memory it
+    /// wrote to be visible to the rest of the system, CPU included.
+    pub(crate) fn wait_idle_and_flush() -> Result<[u32; 7]> {
+        Ok([
+            // Any subchannel runs the channel's own methods.
+            methods(0, bindings::NVC56F_WFI, 1)?,
+            bindings::NVC56F_WFI_SCOPE_ALL,
+            methods(0, bindings::NVC56F_MEM_OP_A, 4)?,
+            0,
+            0,
+            // `NVC56F_MEM_OP_C_MEMBAR_TYPE`, bits 2:0.
+            bindings::NVC56F_MEM_OP_C_MEMBAR_TYPE_SYS_MEMBAR,
+            // `NVC56F_MEM_OP_D_OPERATION`, bits 31:27.
+            bindings::NVC56F_MEM_OP_D_OPERATION_MEMBAR << 27,
+        ])
+    }
+
     /// Returns the methods releasing the 32-bit semaphore at GPU virtual address `addr`, 4-byte
     /// aligned, with `payload`, once the channel's engine is idle: once the work sent before is
     /// done.
@@ -187,6 +204,27 @@ pub(crate) mod compute_c7c0 {
             dw[49] = (program >> 32) as u32 & 0x1_ffff;
 
             Self(dw)
+        }
+
+        /// Has the work, once done and its memory writes visible to the system, write `payload` to
+        /// the 32-bit word at GPU virtual address `addr`, 4-byte aligned.
+        pub(crate) fn release(mut self, addr: u64, payload: u32) -> Result<Self> {
+            if addr % 4 != 0 || addr >> 40 != 0 {
+                return Err(EINVAL);
+            }
+
+            // CAST: the address is split in its low 32 bits and the 8 bits above, checked above
+            // to be all there is.
+            // `RELEASE0_ADDRESS_LOWER`: bits 799:768.
+            self.0[24] = addr as u32;
+            // `RELEASE0_ADDRESS_UPPER` (bits 807:800), `RELEASE0_MEMBAR_TYPE` `FE_SYSMEMBAR` (bit
+            // 819), `RELEASE0_ENABLE` (bit 823) and `RELEASE0_STRUCTURE_SIZE`
+            // `SEMAPHORE_ONE_WORD` (bits 831:830).
+            self.0[25] = (addr >> 32) as u32 | 1 << 19 | 1 << 23 | 1 << 30;
+            // `RELEASE0_PAYLOAD_LOWER`: bits 863:832.
+            self.0[26] = payload;
+
+            Ok(self)
         }
 
         /// Returns the words of the descriptor.

@@ -298,20 +298,21 @@ impl<'a> Channel<'a> {
     pub(crate) fn run(&mut self, bar: Bar0<'_>, mm: &mut GpuMm<'_>, push: &[u32]) -> Result {
         let control_va = self.control_va()?;
         let sequence = self.sequence.wrapping_add(1);
+        // Once the work is done and its memory writes are visible, release the semaphore.
+        let flush = host_c56f::wait_idle_and_flush()?;
         let release =
             host_c56f::semaphore_release(control_va + num::usize_as_u64(SEMAPHORE), sequence)?;
 
-        let words = push.len() + release.len();
+        let words = push.len() + flush.len() + release.len();
         if words * size_of::<u32>() > PUSH_BUFFER_SIZE {
             return Err(EINVAL);
         }
         let control = self.control.range().start;
-        let push_buffer = control + num::usize_as_u64(PUSH_BUFFER);
-        mm.write_vram(push_buffer, push)?;
-        mm.write_vram(
-            push_buffer + num::usize_as_u64(push.len() * size_of::<u32>()),
-            &release,
-        )?;
+        let mut offset = num::usize_as_u64(PUSH_BUFFER);
+        for part in [push, &flush, &release] {
+            mm.write_vram(control + offset, part)?;
+            offset += num::usize_as_u64(part.len() * size_of::<u32>());
+        }
 
         let entry = host_c56f::gp_entry(
             control_va + num::usize_as_u64(PUSH_BUFFER),
