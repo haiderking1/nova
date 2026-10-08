@@ -55,6 +55,7 @@ use crate::{
             MsgFunction,
             MsgqRxHeader,
             MsgqTxHeader,
+            NocatRecord,
             OsErrorLog,
             GSP_MSG_QUEUE_ELEMENT_SIZE_MAX, //
         },
@@ -987,6 +988,30 @@ impl CmdqInner<'_> {
                 ),
                 None => dev_err!(&self.dev, "GSP reported an OS error (seq {})\n", seq),
             },
+            Ok(MsgFunction::GspPostNoCat) => match Self::payload::<NocatRecord>(message) {
+                Some(record) => {
+                    dev_err!(
+                        &self.dev,
+                        "GSP reported an error (seq {}): {}, type {}, bugcheck {:#x}, subsystem {}, code {:#x}, engine {}\n",
+                        seq,
+                        record.source(),
+                        record.record_type(),
+                        record.bugcheck(),
+                        record.subsystem(),
+                        record.error_code(),
+                        record.faulting_engine()
+                    );
+                    for (i, chunk) in record.diagnostics().chunks(32).enumerate() {
+                        dev_err!(
+                            &self.dev,
+                            "GSP error diagnostics +{:#05x}: {:02x?}\n",
+                            i * 32,
+                            chunk
+                        );
+                    }
+                }
+                None => dev_err!(&self.dev, "GSP reported an error (seq {})\n", seq),
+            },
             Ok(MsgFunction::RcTriggered) => {
                 dev_err!(
                     &self.dev,
@@ -1015,6 +1040,16 @@ impl CmdqInner<'_> {
             .ok()?;
 
         OsErrorLog::from_bytes_copy(&bytes)
+    }
+
+    /// Decodes the payload of an event as a `T`, if it is complete.
+    fn payload<T: FromBytes>(message: &GspMessage<'_>) -> Option<KBox<T>> {
+        let mut bytes = KVec::from_elem(0u8, size_of::<T>(), GFP_ATOMIC).ok()?;
+        SBufferIter::new_reader([message.contents.0, message.contents.1])
+            .read_exact(&mut bytes)
+            .ok()?;
+
+        KBox::new(T::from_bytes_copy(&bytes)?, GFP_ATOMIC).ok()
     }
 
     /// Logs and consumes every message the queue holds.

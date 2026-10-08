@@ -1563,6 +1563,59 @@ impl GspFmcBootParams {
     }
 }
 
+/// Payload of the `GspPostNoCat` event: a record GSP-RM adds to its NOCAT journal of errors
+/// (`NV2080CtrlNocatJournalInsertRecord`, the data of `rpc_gsp_post_nocat_record_v01_00`).
+#[repr(transparent)]
+pub(crate) struct NocatRecord(bindings::NV2080CtrlNocatJournalInsertRecord);
+
+impl NocatRecord {
+    /// Returns the type of the record, one of RM's `NV2080_NOCAT_JOURNAL_REC_TYPE_*`.
+    pub(crate) fn record_type(&self) -> u8 {
+        self.0.recType
+    }
+
+    /// Returns the bugcheck code of the record.
+    pub(crate) fn bugcheck(&self) -> u32 {
+        self.0.bugcheck
+    }
+
+    /// Returns where the error was found.
+    pub(crate) fn source(&self) -> &BStr {
+        c_string(AsBytes::as_bytes(&self.0.source))
+    }
+
+    /// Returns the subsystem the error is in.
+    pub(crate) fn subsystem(&self) -> u32 {
+        self.0.subsystem
+    }
+
+    /// Returns the error code.
+    pub(crate) fn error_code(&self) -> u64 {
+        self.0.errorCode
+    }
+
+    /// Returns the engine that faulted, if any.
+    pub(crate) fn faulting_engine(&self) -> &BStr {
+        c_string(AsBytes::as_bytes(&self.0.faultingEngine))
+    }
+
+    /// Returns the diagnostic data of the record.
+    pub(crate) fn diagnostics(&self) -> &[u8] {
+        let len = usize::try_from(self.0.diagBufferLen).unwrap_or(0);
+        &self.0.diagBuffer[..len.min(self.0.diagBuffer.len())]
+    }
+}
+
+/// Returns the C string at the start of `bytes`.
+fn c_string(bytes: &[u8]) -> &BStr {
+    let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+
+    BStr::from_bytes(&bytes[..len])
+}
+
+// SAFETY: This struct only contains integer types for which all bit patterns are valid.
+unsafe impl FromBytes for NocatRecord {}
+
 /// Payload of the `OsErrorLog` event: an error GSP-RM ran into (`rpc_os_error_log_v17_00`).
 #[repr(transparent)]
 pub(crate) struct OsErrorLog(bindings::rpc_os_error_log_v17_00);

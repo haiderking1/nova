@@ -104,7 +104,14 @@ pub const NV_DISP_NOTIFIER_SIZEOF: u32 = 16;
 pub const NV_DISP_NOTIFIER__0_STATUS_NOT_BEGUN: u32 = 0;
 pub const NV_DISP_NOTIFIER__0_STATUS_BEGUN: u32 = 1;
 pub const NV_DISP_NOTIFIER__0_STATUS_FINISHED: u32 = 2;
+pub const NVC67D_UPDATE: u32 = 512;
+pub const NVC67D_UPDATE_RELEASE_ELV_TRUE: u32 = 1;
 pub const NVC67D_SET_CONTEXT_DMA_NOTIFIER: u32 = 520;
+pub const NVC67D_SET_NOTIFIER_CONTROL: u32 = 524;
+pub const NVC67D_SET_NOTIFIER_CONTROL_MODE_WRITE: u32 = 0;
+pub const NVC67D_SET_NOTIFIER_CONTROL_NOTIFY_ENABLE: u32 = 1;
+pub const NVC67D_SET_INTERLOCK_FLAGS: u32 = 536;
+pub const NVC67D_SET_WINDOW_INTERLOCK_FLAGS: u32 = 540;
 pub const NVC67E_WINDOW_CHANNEL_DMA: u32 = 50814;
 pub const NVC67E_UPDATE: u32 = 512;
 pub const NVC67E_SET_CONTEXT_DMA_NOTIFIER: u32 = 540;
@@ -216,6 +223,9 @@ pub const NVC7C0_SET_REPORT_SEMAPHORE_A: u32 = 6912;
 pub const NVC7C0_SET_REPORT_SEMAPHORE_D_OPERATION_RELEASE: u32 = 0;
 pub const NVC7C0_SET_REPORT_SEMAPHORE_D_STRUCTURE_SIZE_ONE_WORD: u32 = 1;
 pub const MC_ENGINE_IDX_DISP: u32 = 2;
+pub const NV0073_CTRL_CMD_DP_GET_LINK_CONFIG: u32 = 7541600;
+pub const NV0073_CTRL_CMD_DP_CONFIG_STREAM: u32 = 7541602;
+pub const NV0073_CTRL_CMD_DP_SET_MANUAL_DISPLAYPORT: u32 = 7541605;
 pub type __u8 = ffi::c_uchar;
 pub type __u16 = ffi::c_ushort;
 pub type __u32 = ffi::c_uint;
@@ -873,6 +883,35 @@ pub struct NV2080_CTRL_INTERNAL_INTR_GET_KERNEL_TABLE_PARAMS {
     pub __bindgen_padding_0: [u8; 2usize],
 }
 impl Default for NV2080_CTRL_INTERNAL_INTR_GET_KERNEL_TABLE_PARAMS {
+    fn default() -> Self {
+        let mut s = ::core::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::core::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone, MaybeZeroable)]
+pub struct NV2080CtrlNocatJournalInsertRecord {
+    pub flags: u32_,
+    pub __bindgen_padding_0: [u8; 4usize],
+    pub timestamp: u64_,
+    pub recType: u8_,
+    pub __bindgen_padding_1: [u8; 3usize],
+    pub bugcheck: u32_,
+    pub source: [ffi::c_char; 65usize],
+    pub __bindgen_padding_2: [u8; 3usize],
+    pub subsystem: u32_,
+    pub errorCode: u64_,
+    pub faultingEngine: [ffi::c_char; 65usize],
+    pub __bindgen_padding_3: [u8; 3usize],
+    pub tdrReason: u32_,
+    pub diagBufferLen: u32_,
+    pub diagBuffer: [u8_; 1024usize],
+    pub __bindgen_padding_4: [u8; 4usize],
+}
+impl Default for NV2080CtrlNocatJournalInsertRecord {
     fn default() -> Self {
         let mut s = ::core::mem::MaybeUninit::<Self>::uninit();
         unsafe {
@@ -1843,3 +1882,59 @@ pub const GMMU_APERTURE_GMMU_APERTURE_SYS_NONCOH: GMMU_APERTURE = 3;
 pub const GMMU_APERTURE_GMMU_APERTURE_SYS_COH: GMMU_APERTURE = 4;
 pub const GMMU_APERTURE_GMMU_APERTURE__COUNT: GMMU_APERTURE = 5;
 pub type GMMU_APERTURE = ffi::c_uint;
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV0073_CTRL_DP_GET_LINK_CONFIG_PARAMS {
+    pub subDeviceInstance: u32_,
+    pub displayId: u32_,
+    pub laneCount: u32_,
+    pub linkBW: u32_,
+    pub dp2LinkBW: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV0073_CTRL_CMD_DP_CONFIG_STREAM_PARAMS {
+    pub subDeviceInstance: u32_,
+    pub head: u32_,
+    pub sorIndex: u32_,
+    pub dpLink: u32_,
+    pub bEnableOverride: u8_,
+    pub bMST: u8_,
+    pub __bindgen_padding_0: [u8; 2usize],
+    pub singleHeadMultistreamMode: u32_,
+    pub hBlankSym: u32_,
+    pub vBlankSym: u32_,
+    pub colorFormat: u32_,
+    pub bEnableTwoHeadOneOr: u8_,
+    pub __bindgen_padding_1: [u8; 3usize],
+    pub MST: NV0073_CTRL_CMD_DP_CONFIG_STREAM_PARAMS__bindgen_ty_1,
+    pub SST: NV0073_CTRL_CMD_DP_CONFIG_STREAM_PARAMS__bindgen_ty_2,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV0073_CTRL_CMD_DP_CONFIG_STREAM_PARAMS__bindgen_ty_1 {
+    pub slotStart: u32_,
+    pub slotEnd: u32_,
+    pub PBN: u32_,
+    pub Timeslice: u32_,
+    pub sendACT: u8_,
+    pub __bindgen_padding_0: [u8; 3usize],
+    pub singleHeadMSTPipeline: u32_,
+    pub bEnableAudioOverRightPanel: u8_,
+    pub __bindgen_padding_1: [u8; 3usize],
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV0073_CTRL_CMD_DP_CONFIG_STREAM_PARAMS__bindgen_ty_2 {
+    pub bEnhancedFraming: u8_,
+    pub __bindgen_padding_0: [u8; 3usize],
+    pub tuSize: u32_,
+    pub waterMark: u32_,
+    pub bEnableAudioOverRightPanel: u8_,
+    pub __bindgen_padding_1: [u8; 3usize],
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV0073_CTRL_CMD_DP_SET_MANUAL_DISPLAYPORT_PARAMS {
+    pub subDeviceInstance: u32_,
+}
