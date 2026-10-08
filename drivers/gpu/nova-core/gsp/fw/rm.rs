@@ -141,6 +141,8 @@ pub(crate) enum RmObjectClass {
     DisplayGa102 = bindings::NVC670_DISPLAY,
     /// The core channel of GA10x display engines, child of the display object.
     CoreChannelGa102 = bindings::NVC67D_CORE_CHANNEL_DMA,
+    /// A window channel of GA10x display engines, child of the display object.
+    WindowChannelGa102 = bindings::NVC67E_WINDOW_CHANNEL_DMA,
 }
 
 impl From<RmObjectClass> for u32 {
@@ -540,11 +542,6 @@ impl DispChannelPushbufferParams {
 
 /// Size of the push buffer of a display channel, in bytes.
 pub(crate) const DISP_PUSHBUFFER_SIZE: u64 = 4096;
-
-/// Method of GA10x display core channels setting the context DMA of the notifier of the next
-/// update.
-pub(crate) const DISP_CORE_SET_CONTEXT_DMA_NOTIFIER: u32 =
-    bindings::NVC67D_SET_CONTEXT_DMA_NOTIFIER;
 
 // SAFETY: This struct only contains integer types for which all bit patterns are valid.
 unsafe impl FromBytes for DispChannelPushbufferParams {}

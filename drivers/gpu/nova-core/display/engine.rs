@@ -6,15 +6,15 @@
 //! instance memory and the push buffers of its channels, has GSP-RM allocate the channels, and
 //! then drives them directly.
 
+use core::ops::Range;
+
 use kernel::{
     device,
     io::{
         register::Array,
         Io, //
     },
-    prelude::*,
-    ptr::Alignment,
-    sizes::SZ_64K, //
+    prelude::*, //
 };
 
 use crate::{
@@ -26,12 +26,18 @@ use crate::{
             Client,
             DisplayCoreChannel,
             DisplayRoot,
+            DisplayWindowChannel,
             Handle,
             Subdevice, //
+        },
+        disp::{
+            core_c67d,
+            window_c67e, //
         },
         rm::commands::{
             AllocCoreChannelGa102,
             AllocDisplayGa102,
+            AllocWindowChannelGa102,
             DispChannelPushbuffer,
             DispGetStaticInfo,
             DispWriteInstMem,
@@ -41,20 +47,20 @@ use crate::{
         },
     },
     mm::{
-        ContiguousVram,
-        GpuMm, //
+        GpuMm,
+        VramAddress, //
     },
 };
 
 use super::{
-    channel::PushBuffer,
+    channel::{
+        DmaChannel,
+        PushBuffer, //
+    },
+    instmem::InstMem,
     regs,
     Display, //
 };
-
-/// Size of the display engine's instance memory: a hash table of the context DMA objects of its
-/// channels, followed by the objects (`NV_UDISP_HASH_*` and `NV_UDISP_OBJ_MEM_*` in `dev_disp.h`).
-const INSTMEM_SIZE: usize = SZ_64K;
 
 // Handles of the RM objects of the display engine, picked like nouveau's.
 
@@ -62,6 +68,14 @@ const INSTMEM_SIZE: usize = SZ_64K;
 const DISPLAY_HANDLE: u32 = 0xc670_0000;
 /// Handle of the core channel.
 const CORE_CHANNEL_HANDLE: u32 = 0xc67d_0000;
+/// Handle of the channel of window 0; those of the other windows follow.
+const WINDOW_CHANNEL_HANDLE: u32 = 0xc67e_0000;
+
+/// Handle of the context DMA giving the window channels access to all of VRAM, for surfaces.
+const VRAM_CTXDMA: u32 = 0xfb00_0000;
+
+/// The window Nova shows surfaces on: window 0, which belongs to head 0.
+const WINDOW: usize = 0;
 
 /// GSP-RM's own client and subdevice, the targets of its internal controls.
 pub(crate) struct InternalHandles {
@@ -69,11 +83,41 @@ pub(crate) struct InternalHandles {
     pub(crate) subdevice: Handle<Subdevice>,
 }
 
+/// A pitch-linear XRGB8888 surface in VRAM, for a window to show.
+#[derive(Clone, Debug)]
+pub(crate) struct Surface {
+    /// Address of the first pixel, which must be 256-byte aligned.
+    pub(crate) addr: VramAddress,
+    /// Width in pixels.
+    pub(crate) width: u32,
+    /// Height in pixels.
+    pub(crate) height: u32,
+    /// Distance between the starts of two lines, in bytes: a multiple of 64.
+    pub(crate) pitch: u32,
+}
+
+impl Surface {
+    /// Checks that a window can show the surface.
+    pub(crate) fn check(&self) -> Result {
+        let fits = |len: u32| len > 0 && len <= 0xffff;
+        if self.addr.into_raw() % 256 != 0
+            || self.pitch % 64 != 0
+            || self.pitch / 4 < self.width
+            || !fits(self.width)
+            || !fits(self.height)
+        {
+            return Err(EINVAL);
+        }
+
+        Ok(())
+    }
+}
+
 /// The display engine, taken over from GSP-RM.
 pub(crate) struct DisplayEngine<'a> {
     /// Instance memory. GSP-RM uses it from when it's set on, so it must outlive the channels and
     /// stay allocated as long as the GSP runs.
-    _instmem: ContiguousVram,
+    _instmem: InstMem,
     /// Mask of the windows of the display engine.
     windows: u32,
     /// The display object and its channels, if they could be allocated.
@@ -85,12 +129,16 @@ struct Channels<'a> {
     root: Handle<DisplayRoot>,
     _core: Handle<DisplayCoreChannel>,
     core_push: PushBuffer<'a>,
+    _window: Handle<DisplayWindowChannel>,
+    window_push: PushBuffer<'a>,
 }
 
 impl<'a> DisplayEngine<'a> {
-    /// Takes over the display engine, whose RM objects are allocated under `display`.
+    /// Takes over the display engine, whose RM objects are allocated under `display`. `vram` is
+    /// all of VRAM, which surfaces are taken from.
     ///
     /// Only GA10x display engines are supported so far.
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         dev: &'a device::Device<device::Bound>,
         bar: Bar0<'_>,
@@ -99,6 +147,7 @@ impl<'a> DisplayEngine<'a> {
         chipset: Chipset,
         display: &Display,
         internal: &InternalHandles,
+        vram: Range<VramAddress>,
     ) -> Result<Self> {
         if !matches!(
             chipset,
@@ -107,9 +156,7 @@ impl<'a> DisplayEngine<'a> {
             return Err(ENOTSUPP);
         }
 
-        let instmem = mm.alloc_contiguous(INSTMEM_SIZE, Alignment::new::<SZ_64K>())?;
-        // The hash table must start out empty.
-        mm.clear_vram(instmem.range())?;
+        let mut instmem = InstMem::new(mm)?;
         RmControl::new(
             internal.client,
             internal.subdevice,
@@ -124,12 +171,15 @@ impl<'a> DisplayEngine<'a> {
         )
         .send(dev, cmdq)?;
         dev_dbg!(dev, "display: windows {:#x}\n", windows);
+        if windows & (1 << WINDOW) == 0 {
+            return Err(ENODEV);
+        }
 
         log_armed_state(dev, bar);
 
         // From here on GSP-RM may use the instance memory, which must thus not be freed before the
         // GSP is unloaded, even if the channels can't be set up.
-        let channels = Channels::new(dev, bar, cmdq, display, internal)
+        let channels = Channels::new(dev, bar, cmdq, mm, &mut instmem, display, internal, vram)
             .inspect_err(|e| dev_err!(dev, "display: can't set up the channels: {:?}\n", e))
             .ok();
 
@@ -156,15 +206,27 @@ impl<'a> DisplayEngine<'a> {
     pub(crate) fn windows(&self) -> u32 {
         self.windows
     }
+
+    /// Shows `surface` on head 0, at the head's current mode, from the next frame on.
+    ///
+    /// Fails with `ENODEV` if the channels couldn't be set up.
+    pub(crate) fn show(&mut self, bar: Bar0<'_>, surface: &Surface) -> Result {
+        let channels = self.channels.as_mut().ok_or(ENODEV)?;
+        channels.show(bar, surface)
+    }
 }
 
 impl<'a> Channels<'a> {
+    #[expect(clippy::too_many_arguments)]
     fn new(
         dev: &'a device::Device<device::Bound>,
         bar: Bar0<'_>,
         cmdq: &Cmdq<'_>,
+        mm: &mut GpuMm<'_>,
+        instmem: &mut InstMem,
         display: &Display,
         internal: &InternalHandles,
+        vram: Range<VramAddress>,
     ) -> Result<Self> {
         let client = display.client();
         let root = RmAlloc::new(
@@ -175,16 +237,15 @@ impl<'a> Channels<'a> {
         )
         .send(dev, cmdq)?;
 
-        let setup_core = || -> Result<(Handle<DisplayCoreChannel>, PushBuffer<'a>)> {
-            let push = PushBuffer::new(dev)?;
+        let setup = || -> Result<Self> {
+            let core_push = PushBuffer::new(dev, DmaChannel::Core)?;
             // The push buffer of a channel is set before the channel is allocated.
             RmControl::new(
                 internal.client,
                 internal.subdevice,
-                DispChannelPushbuffer::core_ga102(push.dma_address()),
+                DispChannelPushbuffer::core_ga102(core_push.dma_address()),
             )
             .send(dev, cmdq)?;
-
             let core = RmAlloc::new(
                 client,
                 root,
@@ -193,31 +254,45 @@ impl<'a> Channels<'a> {
             )
             .send(dev, cmdq)?;
 
-            Ok((core, push))
+            // CAST: `WINDOW` is a window index, below 32.
+            let window_index = WINDOW as u32;
+            let window_push = PushBuffer::new(dev, DmaChannel::Window(WINDOW))?;
+            RmControl::new(
+                internal.client,
+                internal.subdevice,
+                DispChannelPushbuffer::window_ga102(window_index, window_push.dma_address()),
+            )
+            .send(dev, cmdq)?;
+            let window = RmAlloc::new(
+                client,
+                root,
+                Handle::new(WINDOW_CHANNEL_HANDLE | window_index),
+                AllocWindowChannelGa102::new(window_index, 0),
+            )
+            .send(dev, cmdq)?;
+
+            // Surfaces are taken from anywhere in VRAM.
+            instmem.bind_vram(mm, client, DmaChannel::Window(WINDOW), VRAM_CTXDMA, vram)?;
+
+            let mut channels = Self {
+                root,
+                _core: core,
+                core_push,
+                _window: window,
+                window_push,
+            };
+            channels.check_core(dev, bar)?;
+            Ok(channels)
         };
 
-        match setup_core() {
-            Ok((core, core_push)) => {
-                let mut channels = Self {
-                    root,
-                    _core: core,
-                    core_push,
-                };
-                if let Err(err) = channels.check_core(dev, bar) {
-                    let _ = RmFree::new(client, root).send(dev, cmdq);
-                    return Err(err);
-                }
-                Ok(channels)
-            }
-            Err(err) => {
-                let _ = RmFree::new(client, root).send(dev, cmdq);
-                Err(err)
-            }
-        }
+        setup().inspect_err(|_| {
+            // Freeing the display object frees the channels allocated under it.
+            let _ = RmFree::new(client, root).send(dev, cmdq);
+        })
     }
 
     /// Checks that the core channel reads its push buffer, with a method that changes nothing on
-    /// screen: it only takes effect on the next update, which is never sent.
+    /// screen: it only takes effect on the next update of the core channel, which isn't sent.
     fn check_core(&mut self, dev: &device::Device, bar: Bar0<'_>) -> Result {
         dev_dbg!(
             dev,
@@ -227,7 +302,7 @@ impl<'a> Channels<'a> {
 
         // No notifier for the next update.
         self.core_push
-            .push(bar, crate::gsp::DISP_CORE_SET_CONTEXT_DMA_NOTIFIER, &[0])?;
+            .push(bar, core_c67d::SET_CONTEXT_DMA_NOTIFIER, &[0])?;
         self.core_push.kick(bar)?;
         self.core_push
             .wait_idle(bar)
@@ -235,6 +310,69 @@ impl<'a> Channels<'a> {
 
         dev_info!(dev, "display: core channel up\n");
         Ok(())
+    }
+
+    /// Points the window at `surface`, shown 1:1 and opaque, and updates it.
+    ///
+    /// The head keeps the mode and output it has; the update is not interlocked with any other
+    /// channel, so it only changes the window.
+    fn show(&mut self, bar: Bar0<'_>, surface: &Surface) -> Result {
+        use window_c67e::*;
+
+        surface.check()?;
+        let size = surface.width | surface.height << 16;
+        let offset = u32::try_from(surface.addr.into_raw() >> 8)?;
+
+        /// Format conversion matrix leaving colors as they are, in S5.16 fixed point.
+        const IDENTITY: [u32; 12] = [
+            0x10000, 0, 0, 0, //
+            0, 0x10000, 0, 0, //
+            0, 0, 0x10000, 0,
+        ];
+        /// Color keys never match: the full range of each channel.
+        const KEY_FULL_RANGE: u32 = 0xffff << 16;
+
+        let methods = [
+            // At most one new surface per frame, switching between frames.
+            (SET_PRESENT_CONTROL, 1),
+            (SET_SIZE, size),
+            // Pitch-linear.
+            (SET_STORAGE, 0),
+            (SET_PARAMS, FORMAT_X8R8G8B8),
+            (set_planar_storage(0), surface.pitch >> 6),
+            (set_context_dma_iso(0), VRAM_CTXDMA),
+            (set_offset(0), offset),
+            (set_point_in(0), 0),
+            (SET_SIZE_IN, size),
+            (SET_SIZE_OUT, size),
+            // No input LUT.
+            (SET_CONTEXT_DMA_ILUT, 0),
+            // Topmost and opaque: the window's color times K1 (255), plus what's below times
+            // 1 - K1. Color keys never match.
+            (SET_COMPOSITION_CONTROL, 255 << 4),
+            (SET_COMPOSITION_CONSTANT_ALPHA, 0xff),
+            (
+                SET_COMPOSITION_FACTOR_SELECT,
+                FACTOR_K1 | FACTOR_K1 << 4 | FACTOR_NEG_K1 << 8 | FACTOR_NEG_K1 << 12,
+            ),
+            (SET_KEY_ALPHA, KEY_FULL_RANGE),
+            (SET_KEY_RED_CR, KEY_FULL_RANGE),
+            (SET_KEY_GREEN_Y, KEY_FULL_RANGE),
+            (SET_KEY_BLUE_CB, KEY_FULL_RANGE),
+            // The update doesn't wait for any other channel.
+            (SET_INTERLOCK_FLAGS, 0),
+            (SET_WINDOW_INTERLOCK_FLAGS, 0),
+        ];
+
+        let push = &mut self.window_push;
+        for (method, value) in methods {
+            push.push(bar, method, &[value])?;
+        }
+        push.push(bar, SET_FMT_COEFFICIENT_C00, &IDENTITY)?;
+        push.push(bar, UPDATE, &[1])?;
+        push.kick(bar)?;
+
+        push.wait_idle(bar)
     }
 }
 

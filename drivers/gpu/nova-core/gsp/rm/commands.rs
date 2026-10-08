@@ -30,6 +30,7 @@ use crate::{
             DisplayCommon,
             DisplayCoreChannel,
             DisplayRoot,
+            DisplayWindowChannel,
             Handle,
             Subdevice, //
         },
@@ -606,6 +607,16 @@ impl DispChannelPushbuffer {
             dma_addr,
         ))
     }
+
+    /// Creates the command for the channel of window `window` of a GA10x display engine, whose
+    /// push buffer is at DMA address `dma_addr`.
+    pub(crate) fn window_ga102(window: u32, dma_addr: u64) -> Self {
+        Self(DispChannelPushbufferParams::new(
+            RmObjectClass::WindowChannelGa102,
+            window,
+            dma_addr,
+        ))
+    }
 }
 
 disp_control!(
@@ -649,6 +660,30 @@ impl RmAllocCommand for AllocCoreChannelGa102 {
     const CLASS: RmObjectClass = RmObjectClass::CoreChannelGa102;
     type Parent = DisplayRoot;
     type Object = DisplayCoreChannel;
+    type Params = DmaChannelAllocParams;
+
+    fn params(&self) -> &Self::Params {
+        &self.0
+    }
+}
+
+/// Allocation of the channel of a window of a GA10x display engine under its display object.
+///
+/// The push buffer of the channel must have been set with [`DispChannelPushbuffer`] first.
+pub(crate) struct AllocWindowChannelGa102(DmaChannelAllocParams);
+
+impl AllocWindowChannelGa102 {
+    /// Creates the command for the channel of window `window`, for a push buffer whose commands
+    /// start at byte offset `put`.
+    pub(crate) fn new(window: u32, put: u32) -> Self {
+        Self(DmaChannelAllocParams::new(window, put))
+    }
+}
+
+impl RmAllocCommand for AllocWindowChannelGa102 {
+    const CLASS: RmObjectClass = RmObjectClass::WindowChannelGa102;
+    type Parent = DisplayRoot;
+    type Object = DisplayWindowChannel;
     type Params = DmaChannelAllocParams;
 
     fn params(&self) -> &Self::Params {

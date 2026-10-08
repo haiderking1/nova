@@ -180,6 +180,31 @@ impl<'gpu> GpuMm<'gpu> {
 
         Ok(())
     }
+
+    /// Writes `words` to the VRAM at `addr`, which must be 4-byte aligned.
+    pub(crate) fn write_vram(&mut self, addr: VramAddress, words: &[u32]) -> Result {
+        /// Number of words written per PRAMIN access.
+        const CHUNK: usize = 64;
+        const WORD: u64 = num::usize_as_u64(size_of::<u32>());
+
+        let pramin = self.pramin_mut();
+        let mut addr = addr;
+        let mut chunks = words.chunks_exact(CHUNK);
+        for chunk in &mut chunks {
+            let access = pramin.window_at::<[u32; CHUNK]>(addr)?;
+            let view = access.view();
+            for (i, word) in chunk.iter().enumerate() {
+                io_write!(view, [try: i], *word);
+            }
+            addr = addr + num::usize_as_u64(CHUNK) * WORD;
+        }
+        for word in chunks.remainder() {
+            pramin.window_at::<u32>(addr)?.view().write_val(*word);
+            addr = addr + WORD;
+        }
+
+        Ok(())
+    }
 }
 
 /// A physically contiguous range of VRAM, freed when dropped.

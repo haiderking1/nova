@@ -735,7 +735,9 @@ impl<'gpu> Gpu<'gpu> {
             subdevice: this.gsp_static_info.subdevice(),
         };
 
-        let engine = DisplayEngine::new(
+        let vram = VramAddress::ZERO..VramAddress::from_raw(this.gsp_static_info.total_fb_end);
+        #[cfg_attr(not(CONFIG_NOVA_CORE_SELFTESTS), expect(unused_mut))]
+        let mut engine = DisplayEngine::new(
             pdev.as_ref(),
             gsp_resources.bar,
             &gsp_resources.gsp.cmdq,
@@ -743,12 +745,25 @@ impl<'gpu> Gpu<'gpu> {
             this.spec.chipset,
             display,
             &internal,
+            vram,
         )?;
         dev_dbg!(
             pdev,
             "display engine taken over, windows {:#x}\n",
             engine.windows()
         );
+
+        #[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
+        if let Some(boot) = this.boot_display.as_ref() {
+            let _ = crate::display::scanout_test::run(
+                pdev.as_ref(),
+                gsp_resources.bar,
+                this.mm,
+                &mut engine,
+                boot,
+            );
+        }
+
         *this.display_engine = Some(engine);
 
         Ok(())

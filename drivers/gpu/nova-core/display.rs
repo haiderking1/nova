@@ -10,11 +10,15 @@
 
 mod channel;
 mod engine;
+mod instmem;
 mod regs;
+#[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
+pub(crate) mod scanout_test;
 
 pub(crate) use engine::{
     DisplayEngine,
-    InternalHandles, //
+    InternalHandles,
+    Surface, //
 };
 
 use kernel::{

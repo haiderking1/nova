@@ -12,6 +12,7 @@ use kernel::{
     io::{
         io_write,
         poll::read_poll_timeout,
+        register::Array,
         Io, //
     },
     prelude::*,
@@ -49,10 +50,29 @@ fn method_header(method: u32, count: usize) -> Result<u32> {
 /// Jump to the start of the push buffer.
 const JUMP_TO_START: u32 = 0x2000_0000;
 
+/// A display channel driven through a push buffer.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum DmaChannel {
+    /// The core channel.
+    Core,
+    /// The channel of a window.
+    Window(usize),
+}
+
+impl DmaChannel {
+    /// Returns the number of the channel in the display engine (`NV_PDISP_CHN_NUM_*` in `dev_disp.h`).
+    pub(super) fn number(self) -> u32 {
+        match self {
+            Self::Core => 0,
+            // CAST: window indices were checked in `PushBuffer::new()` to be below 32.
+            Self::Window(window) => 1 + window as u32,
+        }
+    }
+}
+
 /// The push buffer of a display channel, and the channel's PUT and GET pointers.
-///
-/// Only the core channel exists so far.
 pub(super) struct PushBuffer<'a> {
+    channel: DmaChannel,
     buffer: Coherent<'a, [u32; PUSHBUFFER_WORDS]>,
     /// Word up to which methods were written.
     cur: usize,
@@ -61,9 +81,14 @@ pub(super) struct PushBuffer<'a> {
 }
 
 impl<'a> PushBuffer<'a> {
-    /// Allocates an empty push buffer.
-    pub(super) fn new(dev: &'a device::Device<device::Bound>) -> Result<Self> {
+    /// Allocates an empty push buffer for `channel`.
+    pub(super) fn new(dev: &'a device::Device<device::Bound>, channel: DmaChannel) -> Result<Self> {
+        if let DmaChannel::Window(window) = channel {
+            regs::NV_UDISP_WIN_PUT::try_at(window).ok_or(EINVAL)?;
+        }
+
         Ok(Self {
+            channel,
             buffer: Coherent::zeroed(dev, GFP_KERNEL)?,
             cur: 0,
             put: 0,
@@ -95,7 +120,15 @@ impl<'a> PushBuffer<'a> {
     pub(super) fn kick(&mut self, bar: Bar0<'_>) -> Result {
         if self.cur != self.put {
             // MMIO writes are ordered after the preceding writes to the (coherent) push buffer.
-            bar.write_reg(regs::NV_UDISP_CORE_PUT::zeroed().try_with_ptr(self.cur)?);
+            match self.channel {
+                DmaChannel::Core => {
+                    bar.write_reg(regs::NV_UDISP_CORE_PUT::zeroed().try_with_ptr(self.cur)?)
+                }
+                DmaChannel::Window(window) => bar.write(
+                    regs::NV_UDISP_WIN_PUT::try_at(window).ok_or(EINVAL)?,
+                    regs::NV_UDISP_WIN_PUT::zeroed().try_with_ptr(self.cur)?,
+                ),
+            }
             self.put = self.cur;
         }
 
@@ -115,7 +148,15 @@ impl<'a> PushBuffer<'a> {
 
     /// Returns the word up to which the display engine read the push buffer.
     pub(super) fn get(&self, bar: Bar0<'_>) -> usize {
-        num::u32_as_usize(bar.read(regs::NV_UDISP_CORE_GET).ptr().get())
+        let ptr = match self.channel {
+            DmaChannel::Core => bar.read(regs::NV_UDISP_CORE_GET).ptr().get(),
+            // The index was checked in `PushBuffer::new()`.
+            DmaChannel::Window(window) => {
+                regs::NV_UDISP_WIN_GET::try_at(window).map_or(0, |reg| bar.read(reg).ptr().get())
+            }
+        };
+
+        num::u32_as_usize(ptr)
     }
 
     /// Number of words that can be written at `cur` without overtaking the display engine.

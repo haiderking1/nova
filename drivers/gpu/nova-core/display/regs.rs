@@ -25,6 +25,18 @@ register! {
         /// Offset in 32-bit words.
         11:2    ptr;
     }
+
+    /// PUT pointers of the window channels (`NV_UDISP_FE_CHN_ASSY_BASEADR_WIN`).
+    pub(super) NV_UDISP_WIN_PUT(u32)[32, stride = 0x1000] @ 0x00690000 {
+        /// Offset in 32-bit words.
+        11:2    ptr;
+    }
+
+    /// GET pointers of the window channels.
+    pub(super) NV_UDISP_WIN_GET(u32)[32, stride = 0x1000] @ 0x00690004 {
+        /// Offset in 32-bit words.
+        11:2    ptr;
+    }
 }
 
 register! {

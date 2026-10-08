@@ -73,6 +73,12 @@ pub(crate) struct DisplayRoot;
 /// outputs.
 pub(crate) struct DisplayCoreChannel;
 
+/// Marker type for the GSP-RM handle of a display window channel.
+///
+/// A window channel, a child of the display object, carries the methods of one window: the
+/// surface it shows, and how.
+pub(crate) struct DisplayWindowChannel;
+
 /// A typed GSP-RM object handle.
 ///
 /// These handles form a tree structure with different types of RM objects, with client at the root.
