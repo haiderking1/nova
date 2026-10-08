@@ -25,14 +25,17 @@ use crate::{
             MessageFromGsp, //
         },
         commands::{
+            Channel,
             Client,
+            CopyEngine,
             Device,
             DisplayCommon,
             DisplayCoreChannel,
             DisplayRoot,
             DisplayWindowChannel,
             Handle,
-            Subdevice, //
+            Subdevice,
+            VaSpace, //
         },
         fw::{
             rm::*,
@@ -431,9 +434,9 @@ impl MessageFromGsp for RmFreeReply {
     }
 }
 
-/// Implements [`RmControlCommand`] for a display control sent to an object of type `$target`, whose
+/// Implements [`RmControlCommand`] for a control sent to an object of type `$target`, whose
 /// parameters are both sent and returned as `$params`.
-macro_rules! disp_control {
+macro_rules! rm_control {
     ($cmd:ty, $target:ty, $function:ident, $params:ty, $reply:ty, |$p:ident| $parse:expr) => {
         impl RmControlCommand for $cmd {
             const FUNCTION: RmControlMsgFunction = RmControlMsgFunction::$function;
@@ -466,7 +469,7 @@ impl DispGetNumHeads {
     }
 }
 
-disp_control!(
+rm_control!(
     DispGetNumHeads,
     DisplayCommon,
     DispSystemGetNumHeads,
@@ -488,7 +491,7 @@ impl DispGetActive {
     }
 }
 
-disp_control!(
+rm_control!(
     DispGetActive,
     DisplayCommon,
     DispSystemGetActive,
@@ -507,7 +510,7 @@ impl DispGetConnectorType {
     }
 }
 
-disp_control!(
+rm_control!(
     DispGetConnectorType,
     DisplayCommon,
     DispSpecificGetConnectorData,
@@ -530,7 +533,7 @@ impl DispGetEdid {
     }
 }
 
-disp_control!(
+rm_control!(
     DispGetEdid,
     DisplayCommon,
     DispSpecificGetEdidV2,
@@ -556,7 +559,7 @@ impl DispGetStaticInfo {
     }
 }
 
-disp_control!(
+rm_control!(
     DispGetStaticInfo,
     Subdevice,
     InternalDisplayGetStaticInfo,
@@ -581,7 +584,7 @@ impl DispWriteInstMem {
     }
 }
 
-disp_control!(
+rm_control!(
     DispWriteInstMem,
     Subdevice,
     InternalDisplayWriteInstMem,
@@ -619,7 +622,7 @@ impl DispChannelPushbuffer {
     }
 }
 
-disp_control!(
+rm_control!(
     DispChannelPushbuffer,
     Subdevice,
     InternalDisplayChannelPushbuffer,
@@ -690,3 +693,216 @@ impl RmAllocCommand for AllocWindowChannelGa102 {
         &self.0
     }
 }
+
+/// Allocation of a GPU virtual address space under a device, whose page tables the client owns:
+/// see [`DmaSetPageDirectory`].
+pub(crate) struct AllocVaSpace(VaSpaceAllocParams);
+
+impl AllocVaSpace {
+    /// Creates the command.
+    pub(crate) fn externally_owned() -> Self {
+        Self(VaSpaceAllocParams::externally_owned())
+    }
+}
+
+impl RmAllocCommand for AllocVaSpace {
+    const CLASS: RmObjectClass = RmObjectClass::VaSpace;
+    type Parent = Device;
+    type Object = VaSpace;
+    type Params = VaSpaceAllocParams;
+
+    fn params(&self) -> &Self::Params {
+        &self.0
+    }
+}
+
+/// Allocation of an object of a GA10x copy engine on a channel bound to it.
+pub(crate) struct AllocCopyEngineAmpereB(CopyEngineAllocParams);
+
+impl AllocCopyEngineAmpereB {
+    /// Creates the command for copy engine `index`.
+    pub(crate) fn new(index: u32) -> Self {
+        Self(CopyEngineAllocParams::new(index))
+    }
+}
+
+impl RmAllocCommand for AllocCopyEngineAmpereB {
+    const CLASS: RmObjectClass = RmObjectClass::CopyEngineAmpereB;
+    type Parent = Channel;
+    type Object = CopyEngine;
+    type Params = CopyEngineAllocParams;
+
+    fn params(&self) -> &Self::Params {
+        &self.0
+    }
+}
+
+/// RM control command making a page directory in VRAM the root of the page tables of an address
+/// space whose page tables the client owns, sent to the address space's device.
+pub(crate) struct DmaSetPageDirectory(SetPageDirectoryParams);
+
+impl DmaSetPageDirectory {
+    /// Creates the command for the page directory of `num_entries` entries at `pdb`, of the
+    /// address space `va_space`.
+    pub(crate) fn new(va_space: Handle<VaSpace>, pdb: VramAddress, num_entries: u32) -> Self {
+        Self(SetPageDirectoryParams::new(
+            va_space.as_raw(),
+            pdb.into_raw(),
+            num_entries,
+        ))
+    }
+}
+
+rm_control!(
+    DmaSetPageDirectory,
+    Device,
+    DmaSetPageDirectory,
+    SetPageDirectoryParams,
+    (),
+    |_p| ()
+);
+
+/// RM control command unsetting the page directory of an address space, sent to the address
+/// space's device.
+pub(crate) struct DmaUnsetPageDirectory(UnsetPageDirectoryParams);
+
+impl DmaUnsetPageDirectory {
+    /// Creates the command for the address space `va_space`.
+    pub(crate) fn new(va_space: Handle<VaSpace>) -> Self {
+        Self(UnsetPageDirectoryParams::new(va_space.as_raw()))
+    }
+}
+
+rm_control!(
+    DmaUnsetPageDirectory,
+    Device,
+    DmaUnsetPageDirectory,
+    UnsetPageDirectoryParams,
+    (),
+    |_p| ()
+);
+
+/// RM control command binding a channel to the engine it runs on.
+pub(crate) struct GpfifoBind(GpfifoBindParams);
+
+impl GpfifoBind {
+    /// Creates the command for the engine of type `engine_type`, an `NV2080_ENGINE_TYPE`.
+    pub(crate) fn new(engine_type: u32) -> Self {
+        Self(GpfifoBindParams::new(engine_type))
+    }
+}
+
+rm_control!(
+    GpfifoBind,
+    Channel,
+    GpfifoBind,
+    GpfifoBindParams,
+    (),
+    |_p| ()
+);
+
+/// RM control command enabling the scheduling of a channel.
+pub(crate) struct GpfifoSchedule(GpfifoScheduleParams);
+
+impl GpfifoSchedule {
+    /// Creates the command.
+    pub(crate) fn enable() -> Self {
+        Self(GpfifoScheduleParams::enable())
+    }
+}
+
+rm_control!(
+    GpfifoSchedule,
+    Channel,
+    GpfifoSchedule,
+    GpfifoScheduleParams,
+    (),
+    |_p| ()
+);
+
+
+/// RM control command querying the size of the method buffer every channel needs, which the GPU
+/// saves pending methods into on faults.
+pub(crate) struct CeGetFaultMethodBufferSize(CeGetFaultMethodBufferSizeParams);
+
+impl CeGetFaultMethodBufferSize {
+    /// Creates the command.
+    pub(crate) fn new() -> Self {
+        Self(CeGetFaultMethodBufferSizeParams::new())
+    }
+}
+
+rm_control!(
+    CeGetFaultMethodBufferSize,
+    Subdevice,
+    CeGetFaultMethodBufferSize,
+    CeGetFaultMethodBufferSizeParams,
+    u32,
+    |p| p.size()
+);
+
+/// Allocation of a GA10x GPFIFO channel under a device. RM puts it in a channel group of its own.
+pub(crate) struct AllocChannelGpfifoAmpere(ChannelGpfifoAllocParams);
+
+impl AllocChannelGpfifoAmpere {
+    /// Creates the command, see [`ChannelGpfifoAllocParams::kernel`].
+    pub(crate) fn kernel(
+        va_space: Handle<VaSpace>,
+        engine_type: u32,
+        chid: u32,
+        gpfifo: u64,
+        entries: u32,
+        memory: &ChannelMemory,
+    ) -> Self {
+        Self(ChannelGpfifoAllocParams::kernel(
+            va_space.as_raw(),
+            engine_type,
+            chid,
+            gpfifo,
+            entries,
+            memory,
+        ))
+    }
+}
+
+impl RmAllocCommand for AllocChannelGpfifoAmpere {
+    const CLASS: RmObjectClass = RmObjectClass::ChannelGpfifoAmpere;
+    type Parent = Device;
+    type Object = Channel;
+    type Params = ChannelGpfifoAllocParams;
+
+    fn params(&self) -> &Self::Params {
+        &self.0
+    }
+}
+
+/// RM control command querying a page of the device info table: the engines of the GPU and the
+/// runlists they are on.
+///
+/// The reply is the engines listed, and whether more entries follow.
+pub(crate) struct FifoGetDeviceInfoTable(DeviceInfoTableParams);
+
+impl FifoGetDeviceInfoTable {
+    /// Number of entries of a page.
+    pub(crate) const PAGE_ENTRIES: u32 = DeviceInfoTableParams::MAX_ENTRIES;
+
+    /// Creates the command for the page starting at entry `base`.
+    pub(crate) fn new(base: u32) -> Self {
+        Self(DeviceInfoTableParams::new(base))
+    }
+}
+
+rm_control!(
+    FifoGetDeviceInfoTable,
+    Subdevice,
+    FifoGetDeviceInfoTable,
+    DeviceInfoTableParams,
+    (KVec<EngineInfo>, bool),
+    |p| {
+        let mut engines = KVec::new();
+        for engine in p.engines() {
+            engines.push(engine, GFP_KERNEL)?;
+        }
+        (engines, p.more())
+    }
+);

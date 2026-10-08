@@ -3,6 +3,7 @@
 
 pub(crate) mod commands;
 pub(crate) mod disp;
+pub(crate) mod fifo;
 mod r570_144;
 pub(crate) mod rm;
 

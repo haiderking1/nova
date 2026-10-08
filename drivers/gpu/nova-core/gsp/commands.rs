@@ -79,6 +79,24 @@ pub(crate) struct DisplayCoreChannel;
 /// surface it shows, and how.
 pub(crate) struct DisplayWindowChannel;
 
+/// Marker type for the GSP-RM handle of a GPU virtual address space.
+///
+/// An address space, a child of a device, holds the GPU virtual addresses channels access memory
+/// through.
+pub(crate) struct VaSpace;
+
+/// Marker type for the GSP-RM handle of a GPFIFO channel.
+///
+/// A channel, a child of a device, fetches the command buffers listed in its GPFIFO and runs them
+/// on the engine it's bound to.
+pub(crate) struct Channel;
+
+/// Marker type for the GSP-RM handle of a copy engine object.
+///
+/// A copy engine object, a child of a channel, makes the copy engine's methods available on the
+/// channel.
+pub(crate) struct CopyEngine;
+
 /// A typed GSP-RM object handle.
 ///
 /// These handles form a tree structure with different types of RM objects, with client at the root.

@@ -42,6 +42,16 @@ pub(crate) enum RmControlMsgFunction {
     /// Set the push buffer of a display channel, before allocating the channel.
     InternalDisplayChannelPushbuffer =
         bindings::NV2080_CTRL_CMD_INTERNAL_DISPLAY_CHANNEL_PUSHBUFFER,
+    /// Set the page directory of a GPU virtual address space whose page tables the client owns.
+    DmaSetPageDirectory = bindings::NV0080_CTRL_CMD_DMA_SET_PAGE_DIRECTORY,
+    /// Unset the page directory of a GPU virtual address space.
+    DmaUnsetPageDirectory = bindings::NV0080_CTRL_CMD_DMA_UNSET_PAGE_DIRECTORY,
+    /// Bind a channel to the engine it runs on.
+    GpfifoBind = bindings::NVA06F_CTRL_CMD_BIND,
+    /// Enable or disable the scheduling of a channel.
+    GpfifoSchedule = bindings::NVA06F_CTRL_CMD_GPFIFO_SCHEDULE,
+    /// Get the engines of the GPU and the runlists they are on.
+    FifoGetDeviceInfoTable = bindings::NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE,
 }
 
 // TODO[FPRI]: This is a temporary solution to be replaced with the corresponding derive macros
@@ -68,6 +78,13 @@ impl TryFrom<u32> for RmControlMsgFunction {
             }
             bindings::NV2080_CTRL_CMD_INTERNAL_DISPLAY_CHANNEL_PUSHBUFFER => {
                 Ok(Self::InternalDisplayChannelPushbuffer)
+            }
+            bindings::NV0080_CTRL_CMD_DMA_SET_PAGE_DIRECTORY => Ok(Self::DmaSetPageDirectory),
+            bindings::NV0080_CTRL_CMD_DMA_UNSET_PAGE_DIRECTORY => Ok(Self::DmaUnsetPageDirectory),
+            bindings::NVA06F_CTRL_CMD_BIND => Ok(Self::GpfifoBind),
+            bindings::NVA06F_CTRL_CMD_GPFIFO_SCHEDULE => Ok(Self::GpfifoSchedule),
+            bindings::NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE => {
+                Ok(Self::FifoGetDeviceInfoTable)
             }
             _ => Err(EINVAL),
         }
@@ -143,6 +160,12 @@ pub(crate) enum RmObjectClass {
     CoreChannelGa102 = bindings::NVC67D_CORE_CHANNEL_DMA,
     /// A window channel of GA10x display engines, child of the display object.
     WindowChannelGa102 = bindings::NVC67E_WINDOW_CHANNEL_DMA,
+    /// A GPU virtual address space, child of a device.
+    VaSpace = bindings::FERMI_VASPACE_A,
+    /// A GPFIFO channel of GA10x GPUs, child of a device.
+    ChannelGpfifoAmpere = bindings::AMPERE_CHANNEL_GPFIFO_A,
+    /// A copy engine object of GA10x GPUs, child of a channel.
+    CopyEngineAmpereB = bindings::AMPERE_DMA_COPY_B,
 }
 
 impl From<RmObjectClass> for u32 {
@@ -571,3 +594,317 @@ impl DmaChannelAllocParams {
 // SAFETY: Padding is explicit and will not contain uninitialized data, and the only non-integer
 // field, `pControl`, is always null.
 unsafe impl AsBytes for DmaChannelAllocParams {}
+
+/// `NV_VASPACE_ALLOCATION_FLAGS_IS_EXTERNALLY_OWNED` in `nvos.h`, `BIT(3)`, which bindgen can't
+/// translate: the client owns the page tables of the address space.
+const VASPACE_FLAGS_IS_EXTERNALLY_OWNED: u32 = 1 << 3;
+
+/// Wrapper for [`bindings::NV_VASPACE_ALLOCATION_PARAMETERS`].
+#[repr(transparent)]
+pub(crate) struct VaSpaceAllocParams(bindings::NV_VASPACE_ALLOCATION_PARAMETERS);
+
+impl VaSpaceAllocParams {
+    /// Creates the parameters to allocate a new GPU virtual address space whose page tables the
+    /// client owns, and sets with [`SetPageDirectoryParams`].
+    pub(crate) fn externally_owned() -> Self {
+        Self(bindings::NV_VASPACE_ALLOCATION_PARAMETERS {
+            index: bindings::NV_VASPACE_ALLOCATION_INDEX_GPU_NEW,
+            flags: VASPACE_FLAGS_IS_EXTERNALLY_OWNED,
+            ..Default::default()
+        })
+    }
+}
+
+// SAFETY: Padding is explicit and will not contain uninitialized data.
+unsafe impl AsBytes for VaSpaceAllocParams {}
+
+/// Wrapper for [`bindings::NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_PARAMS`].
+#[repr(transparent)]
+pub(crate) struct SetPageDirectoryParams(bindings::NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_PARAMS);
+
+impl SetPageDirectoryParams {
+    /// Creates the parameters to make the page directory of `num_entries` entries at `pdb` in
+    /// VRAM the root of the page tables of the address space `va_space`.
+    pub(crate) fn new(va_space: u32, pdb: u64, num_entries: u32) -> Self {
+        Self(bindings::NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_PARAMS {
+            physAddress: pdb,
+            numEntries: num_entries,
+            flags: bindings::NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_FLAGS_APERTURE_VIDMEM,
+            hVASpace: va_space,
+            ..Default::default()
+        })
+    }
+}
+
+// SAFETY: This struct only contains integer types for which all bit patterns are valid.
+unsafe impl FromBytes for SetPageDirectoryParams {}
+
+// SAFETY: Padding is explicit and will not contain uninitialized data.
+unsafe impl AsBytes for SetPageDirectoryParams {}
+
+/// Wrapper for [`bindings::NV0080_CTRL_DMA_UNSET_PAGE_DIRECTORY_PARAMS`].
+#[repr(transparent)]
+pub(crate) struct UnsetPageDirectoryParams(bindings::NV0080_CTRL_DMA_UNSET_PAGE_DIRECTORY_PARAMS);
+
+impl UnsetPageDirectoryParams {
+    /// Creates the parameters to unset the page directory of the address space `va_space`.
+    pub(crate) fn new(va_space: u32) -> Self {
+        Self(bindings::NV0080_CTRL_DMA_UNSET_PAGE_DIRECTORY_PARAMS {
+            hVASpace: va_space,
+            ..Default::default()
+        })
+    }
+}
+
+// SAFETY: This struct only contains integer types for which all bit patterns are valid.
+unsafe impl FromBytes for UnsetPageDirectoryParams {}
+
+// SAFETY: Padding is explicit and will not contain uninitialized data.
+unsafe impl AsBytes for UnsetPageDirectoryParams {}
+
+/// Wrapper for [`bindings::NVC0B5_ALLOCATION_PARAMETERS`].
+#[repr(transparent)]
+pub(crate) struct CopyEngineAllocParams(bindings::NVC0B5_ALLOCATION_PARAMETERS);
+
+impl CopyEngineAllocParams {
+    /// Creates the parameters to allocate an object of copy engine `index`.
+    pub(crate) fn new(index: u32) -> Self {
+        Self(bindings::NVC0B5_ALLOCATION_PARAMETERS {
+            // The engine is given as an `NV2080_ENGINE_TYPE`.
+            version: bindings::NVC0B5_ALLOCATION_PARAMETERS_VERSION_1,
+            engineType: bindings::NV2080_ENGINE_TYPE_COPY0 + index,
+        })
+    }
+}
+
+// SAFETY: This struct only contains integer types, without padding.
+unsafe impl AsBytes for CopyEngineAllocParams {}
+
+/// Wrapper for [`bindings::NVA06F_CTRL_BIND_PARAMS`].
+#[repr(transparent)]
+pub(crate) struct GpfifoBindParams(bindings::NVA06F_CTRL_BIND_PARAMS);
+
+impl GpfifoBindParams {
+    /// Creates the parameters to bind a channel to the engine of type `engine_type`, an
+    /// `NV2080_ENGINE_TYPE`.
+    pub(crate) fn new(engine_type: u32) -> Self {
+        Self(bindings::NVA06F_CTRL_BIND_PARAMS {
+            engineType: engine_type,
+        })
+    }
+}
+
+// SAFETY: This struct only contains integer types for which all bit patterns are valid.
+unsafe impl FromBytes for GpfifoBindParams {}
+
+// SAFETY: This struct only contains integer types, without padding.
+unsafe impl AsBytes for GpfifoBindParams {}
+
+/// Wrapper for [`bindings::NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS`].
+#[repr(transparent)]
+pub(crate) struct GpfifoScheduleParams(bindings::NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS);
+
+impl GpfifoScheduleParams {
+    /// Creates the parameters to enable the scheduling of a channel.
+    pub(crate) fn enable() -> Self {
+        Self(bindings::NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS {
+            bEnable: 1,
+            ..Default::default()
+        })
+    }
+}
+
+// SAFETY: This struct only contains integer types for which all bit patterns are valid.
+unsafe impl FromBytes for GpfifoScheduleParams {}
+
+// SAFETY: This struct only contains integer types, without padding.
+unsafe impl AsBytes for GpfifoScheduleParams {}
+
+
+/// Wrapper for [`bindings::NV2080_CTRL_CE_GET_FAULT_METHOD_BUFFER_SIZE_PARAMS`].
+#[repr(transparent)]
+pub(crate) struct CeGetFaultMethodBufferSizeParams(
+    bindings::NV2080_CTRL_CE_GET_FAULT_METHOD_BUFFER_SIZE_PARAMS,
+);
+
+impl CeGetFaultMethodBufferSizeParams {
+    /// Creates the parameters to query the size of the method buffer of channels.
+    pub(crate) fn new() -> Self {
+        Self(Default::default())
+    }
+
+    /// Returns the size in bytes of the buffer a channel saves pending methods into on faults.
+    pub(crate) fn size(&self) -> u32 {
+        self.0.size
+    }
+}
+
+// SAFETY: This struct only contains integer types for which all bit patterns are valid.
+unsafe impl FromBytes for CeGetFaultMethodBufferSizeParams {}
+
+// SAFETY: This struct only contains integer types, without padding.
+unsafe impl AsBytes for CeGetFaultMethodBufferSizeParams {}
+
+/// An engine of the GPU, as listed in the device info table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EngineInfo {
+    /// The engine, as an `NV2080_ENGINE_TYPE`.
+    pub(crate) engine_type: u32,
+    /// The runlist the engine is on, which schedules the channels running on it.
+    pub(crate) runlist: u32,
+}
+
+impl EngineInfo {
+    /// Returns whether the engine is the graphics engine.
+    pub(crate) fn is_graphics(&self) -> bool {
+        self.engine_type == bindings::NV2080_ENGINE_TYPE_GRAPHICS
+    }
+
+    /// Returns the index of the engine if it's one of the first 10 copy engines, whose engine
+    /// types follow each other.
+    pub(crate) fn copy_engine_index(&self) -> Option<u32> {
+        (bindings::NV2080_ENGINE_TYPE_COPY0..=bindings::NV2080_ENGINE_TYPE_COPY9)
+            .contains(&self.engine_type)
+            .then(|| self.engine_type - bindings::NV2080_ENGINE_TYPE_COPY0)
+    }
+}
+
+/// Wrapper for [`bindings::NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_PARAMS`].
+#[repr(transparent)]
+pub(crate) struct DeviceInfoTableParams(bindings::NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_PARAMS);
+
+impl DeviceInfoTableParams {
+    /// Number of entries of the table returned at once.
+    pub(crate) const MAX_ENTRIES: u32 = bindings::NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_MAX_ENTRIES;
+
+    /// Creates the parameters to query the entries of the table from `base`.
+    pub(crate) fn new(base: u32) -> Self {
+        Self(bindings::NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_PARAMS {
+            baseIndex: base,
+            ..Default::default()
+        })
+    }
+
+    /// Returns the engines of the entries returned.
+    pub(crate) fn engines(&self) -> impl Iterator<Item = EngineInfo> + '_ {
+        let count = usize::try_from(self.0.numEntries).unwrap_or(0);
+
+        self.0.entries.iter().take(count).filter_map(|entry| {
+            let data = |info: bindings::ENGINE_INFO_TYPE| {
+                entry.engineData.get(usize::try_from(info).ok()?).copied()
+            };
+
+            Some(EngineInfo {
+                engine_type: data(bindings::ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_RM_ENGINE_TYPE)?,
+                runlist: data(bindings::ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_RUNLIST)?,
+            })
+        })
+    }
+
+    /// Returns whether more entries follow those returned.
+    pub(crate) fn more(&self) -> bool {
+        self.0.bMore != 0
+    }
+}
+
+// SAFETY: This struct only contains integer types for which all bit patterns are valid.
+unsafe impl FromBytes for DeviceInfoTableParams {}
+
+// SAFETY: Padding is explicit and will not contain uninitialized data.
+unsafe impl AsBytes for DeviceInfoTableParams {}
+
+/// Memory of a GPFIFO channel, which the client allocates for GSP-RM to set up.
+pub(crate) struct ChannelMemory {
+    /// VRAM address of the instance block, 4 KiB aligned, whose first bytes are its RAMFC.
+    pub(crate) instance: u64,
+    /// VRAM address of the USERD, through which the channel is told about new work.
+    pub(crate) userd: u64,
+    /// DMA address of the method buffer in coherent system memory.
+    pub(crate) method_buffer: u64,
+    /// Size of the method buffer, from `NV2080_CTRL_CMD_CE_GET_FAULT_METHOD_BUFFER_SIZE`.
+    pub(crate) method_buffer_size: u64,
+}
+
+/// Size of the instance block of a channel (`NV_RAMIN_ALLOC_SIZE` in RM).
+pub(crate) const CHANNEL_INSTANCE_SIZE: u64 = 0x1000;
+/// Size of the RAMFC of a channel, at the start of its instance block.
+const CHANNEL_RAMFC_SIZE: u64 = 0x200;
+/// Size of the USERD of a channel (`Nvc56fControl`).
+pub(crate) const CHANNEL_USERD_SIZE: u64 = size_of::<bindings::Nvc56fControl>() as u64;
+/// Number of USERDs in a USERD page, which RM indexes channel IDs by.
+const CHANNEL_USERDS_PER_PAGE: u32 = 8;
+
+// `NVOS04_FLAGS_*` fields in `alloc_channel.h`, whose positions bindgen can't translate.
+
+/// `NVOS04_FLAGS_PRIVILEGED_CHANNEL_TRUE`: the channel may run privileged methods.
+const NVOS04_FLAGS_PRIVILEGED_CHANNEL: u32 = 1 << 5;
+/// `NVOS04_FLAGS_CHANNEL_USERD_INDEX_VALUE`: index of the channel's USERD in its page.
+const NVOS04_FLAGS_CHANNEL_USERD_INDEX_VALUE_SHIFT: u32 = 8;
+/// `NVOS04_FLAGS_CHANNEL_USERD_INDEX_PAGE_VALUE`: page of the channel's USERD.
+const NVOS04_FLAGS_CHANNEL_USERD_INDEX_PAGE_VALUE_SHIFT: u32 = 12;
+/// `NVOS04_FLAGS_CHANNEL_USERD_INDEX_PAGE_FIXED_TRUE`: the USERD page, and thus the channel ID,
+/// is the one given.
+const NVOS04_FLAGS_CHANNEL_USERD_INDEX_PAGE_FIXED: u32 = 1 << 21;
+
+// `NV_KERNELCHANNEL_ALLOC_INTERNALFLAGS_*` in RM's `kernel_channel.h`, not part of the SDK.
+
+/// `NV_KERNELCHANNEL_ALLOC_INTERNALFLAGS_PRIVILEGE_ADMIN`.
+const INTERNALFLAGS_PRIVILEGE_ADMIN: u32 = 1;
+/// `NV_KERNELCHANNEL_ALLOC_INTERNALFLAGS_ERROR_NOTIFIER_TYPE_NONE`: no error notifier.
+const INTERNALFLAGS_ERROR_NOTIFIER_TYPE_NONE: u32 = 1 << 2;
+/// `NV_KERNELCHANNEL_ALLOC_INTERNALFLAGS_ECC_ERROR_NOTIFIER_TYPE_NONE`: no ECC error notifier.
+const INTERNALFLAGS_ECC_ERROR_NOTIFIER_TYPE_NONE: u32 = 1 << 4;
+
+/// Wrapper for [`bindings::NV_CHANNEL_ALLOC_PARAMS`].
+#[repr(transparent)]
+pub(crate) struct ChannelGpfifoAllocParams(bindings::NV_CHANNEL_ALLOC_PARAMS);
+
+impl ChannelGpfifoAllocParams {
+    /// Creates the parameters to allocate the privileged channel `chid` on engine `engine_type`
+    /// (an `NV2080_ENGINE_TYPE`), in the address space `va_space`, whose GPFIFO of `entries`
+    /// entries is at GPU virtual address `gpfifo`.
+    pub(crate) fn kernel(
+        va_space: u32,
+        engine_type: u32,
+        chid: u32,
+        gpfifo: u64,
+        entries: u32,
+        memory: &ChannelMemory,
+    ) -> Self {
+        let vram = |base, size| bindings::NV_MEMORY_DESC_PARAMS {
+            base,
+            size,
+            addressSpace: ADDR_FBMEM,
+            cacheAttrib: bindings::NV_MEMORY_UNCACHED,
+        };
+
+        Self(bindings::NV_CHANNEL_ALLOC_PARAMS {
+            gpFifoOffset: gpfifo,
+            gpFifoEntries: entries,
+            // The channel ID is set through the index of the channel's USERD.
+            flags: NVOS04_FLAGS_PRIVILEGED_CHANNEL
+                | (chid % CHANNEL_USERDS_PER_PAGE) << NVOS04_FLAGS_CHANNEL_USERD_INDEX_VALUE_SHIFT
+                | (chid / CHANNEL_USERDS_PER_PAGE)
+                    << NVOS04_FLAGS_CHANNEL_USERD_INDEX_PAGE_VALUE_SHIFT
+                | NVOS04_FLAGS_CHANNEL_USERD_INDEX_PAGE_FIXED,
+            hVASpace: va_space,
+            engineType: engine_type,
+            instanceMem: vram(memory.instance, CHANNEL_INSTANCE_SIZE),
+            userdMem: vram(memory.userd, CHANNEL_USERD_SIZE),
+            ramfcMem: vram(memory.instance, CHANNEL_RAMFC_SIZE),
+            mthdbufMem: bindings::NV_MEMORY_DESC_PARAMS {
+                base: memory.method_buffer,
+                size: memory.method_buffer_size,
+                addressSpace: ADDR_SYSMEM,
+                cacheAttrib: bindings::NV_MEMORY_CACHED,
+            },
+            internalFlags: INTERNALFLAGS_PRIVILEGE_ADMIN
+                | INTERNALFLAGS_ERROR_NOTIFIER_TYPE_NONE
+                | INTERNALFLAGS_ECC_ERROR_NOTIFIER_TYPE_NONE,
+            ..Default::default()
+        })
+    }
+}
+
+// SAFETY: Padding is explicit and will not contain uninitialized data.
+unsafe impl AsBytes for ChannelGpfifoAllocParams {}

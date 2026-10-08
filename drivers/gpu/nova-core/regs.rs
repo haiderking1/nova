@@ -543,6 +543,21 @@ pub(crate) mod gb202 {
     }
 }
 
+// Channel doorbell
+
+register! {
+    base: NovaRegisters;
+
+    /// Doorbell of the channels (`NV_VIRTUAL_FUNCTION_DOORBELL`): writing the token of a channel
+    /// makes it fetch the GPFIFO entries up to its USERD's `GPPut`.
+    pub(crate) NV_VIRTUAL_FUNCTION_DOORBELL(u32) @ 0x00bb0090 {
+        /// Channel ID.
+        11:0    vector;
+        /// Runlist of the channel.
+        22:16   runlist_id;
+    }
+}
+
 // MMU TLB
 
 register! {
