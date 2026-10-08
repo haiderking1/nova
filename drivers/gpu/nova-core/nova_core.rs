@@ -30,6 +30,8 @@ mod regs;
 mod sbuffer;
 #[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
 mod selftest;
+#[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
+mod shader;
 mod vbios;
 mod vgpu;
 

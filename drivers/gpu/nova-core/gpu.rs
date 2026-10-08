@@ -825,16 +825,29 @@ impl<'gpu> Gpu<'gpu> {
             .inspect_err(|e| dev_err!(pdev, "channel: can't set up a copy channel: {:?}\n", e))
             .ok();
 
-            // Blue if a compute shader ran right, green otherwise.
-            let computed = this.gr.as_ref().is_some_and(|gr| {
-                crate::channel::compute_test::run(
+            // A compute channel for a shader to draw the test surface, once it passed its own
+            // test.
+            let mut compute = this.gr.as_ref().and_then(|gr| {
+                crate::channel::gr::ComputeChannel::new(
                     pdev.as_ref(),
                     &gsp_resources.gsp.cmdq,
-                    gsp_resources.bar,
                     this.mm,
                     this.spec.chipset,
-                    this.rm.as_ref(),
+                    this.rm.as_ref()?,
                     gr,
+                    crate::channel::COMPUTE_CHID,
+                )
+                .inspect_err(|e| {
+                    dev_err!(pdev, "channel: can't set up a compute channel: {:?}\n", e)
+                })
+                .ok()
+            });
+            let computed = compute.as_mut().is_some_and(|compute| {
+                crate::channel::compute_test::run(
+                    pdev.as_ref(),
+                    gsp_resources.bar,
+                    this.mm,
+                    compute,
                 )
                 .inspect_err(|e| dev_err!(pdev, "compute test failed: {:?}\n", e))
                 .is_ok()
@@ -847,9 +860,12 @@ impl<'gpu> Gpu<'gpu> {
                 &mut engine,
                 boot,
                 channel.as_mut(),
-                computed,
+                compute.as_mut().filter(|_| computed),
             );
 
+            if let Some(mut compute) = compute {
+                compute.free(pdev.as_ref(), &gsp_resources.gsp.cmdq, this.mm);
+            }
             if let Some(mut channel) = channel {
                 channel.free(pdev.as_ref(), &gsp_resources.gsp.cmdq, this.mm);
             }

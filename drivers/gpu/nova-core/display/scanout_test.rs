@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
 
-//! Self-test of Nova's own scanout: shows a solid surface Nova allocated, then goes back to the
-//! boot display's framebuffer.
+//! Self-test of Nova's own scanout: shows a surface Nova allocated, then goes back to the boot
+//! display's framebuffer.
 //!
-//! With a copy channel, the GPU fills the surface: with blue if a compute shader ran right before,
-//! with green otherwise. Without a copy channel, the CPU fills it with red. The color on screen
-//! thus tells what works.
+//! With a compute channel, a compute shader draws a pattern on the surface, one thread per pixel.
+//! Otherwise, with a copy channel, the copy engine fills it with green, and without either, the
+//! CPU fills it with red. What shows on screen thus tells what works.
 
 use kernel::{
     device,
@@ -20,10 +20,24 @@ use kernel::{
 
 use crate::{
     boot_display::BootDisplay,
-    channel::copy::CopyChannel,
+    channel::{
+        compute_test::{
+            self,
+            Grid, //
+        },
+        copy::CopyChannel,
+        gr::ComputeChannel,
+    },
     driver::Bar0,
-    mm::GpuMm,
-    num, //
+    mm::{
+        GpuMm,
+        VramAddress, //
+    },
+    num,
+    shader::{
+        self,
+        PixelSurface, //
+    }, //
 };
 
 use super::{
@@ -37,10 +51,8 @@ const SHOW_TIME: Delta = Delta::from_secs(1);
 /// Color of the test surface filled by the CPU, in XRGB8888: a full screen of it can't be
 /// mistaken for anything else.
 const RED: u32 = 0xff0000;
-/// Color of the test surface filled by the GPU.
+/// Color of the test surface filled by the copy engine.
 const GREEN: u32 = 0x00ff00;
-/// Color of the test surface filled by the GPU, after a compute shader ran right.
-const BLUE: u32 = 0x0000ff;
 
 /// Shows the test surface for a few seconds, then the boot display's framebuffer again.
 pub(crate) fn run(
@@ -49,8 +61,8 @@ pub(crate) fn run(
     mm: &mut GpuMm<'_>,
     engine: &mut DisplayEngine<'_>,
     boot: &BootDisplay,
-    channel: Option<&mut CopyChannel<'_>>,
-    computed: bool,
+    copy: Option<&mut CopyChannel<'_>>,
+    compute: Option<&mut ComputeChannel<'_>>,
 ) -> Result {
     if boot.format.bits_per_pixel != 32 {
         return Err(ENOTSUPP);
@@ -79,20 +91,30 @@ pub(crate) fn run(
     };
     test.check()?;
 
-    let gpu_color = if computed { BLUE } else { GREEN };
-    let gpu_filled = match channel {
-        Some(channel) => gpu_fill(bar, mm, channel, fb.range(), &test, gpu_color)
+    let drawn = compute.is_some_and(|channel| {
+        draw_pattern(bar, mm, channel, fb.range(), &test)
             .inspect_err(|e| {
                 dev_err!(
                     dev,
-                    "display: the GPU can't fill the test surface: {:?}\n",
+                    "display: a shader can't draw the test surface: {:?}\n",
                     e
                 )
             })
-            .is_ok(),
-        None => false,
-    };
-    if !gpu_filled {
+            .is_ok()
+    });
+    let copied = !drawn
+        && copy.is_some_and(|channel| {
+            copy_fill(bar, mm, channel, fb.range(), &test, GREEN)
+                .inspect_err(|e| {
+                    dev_err!(
+                        dev,
+                        "display: the copy engine can't fill the test surface: {:?}\n",
+                        e
+                    )
+                })
+                .is_ok()
+        });
+    if !drawn && !copied {
         let mut line = KVec::with_capacity(num::u32_as_usize(width), GFP_KERNEL)?;
         line.resize(num::u32_as_usize(width), RED, GFP_KERNEL)?;
         for y in 0..height {
@@ -102,13 +124,14 @@ pub(crate) fn run(
 
     dev_info!(
         dev,
-        "display: showing the scanout test surface (solid {}, filled by the {})\n",
-        match (gpu_filled, computed) {
-            (false, _) => "red",
-            (true, false) => "green",
-            (true, true) => "blue",
-        },
-        if gpu_filled { "GPU" } else { "CPU" }
+        "display: showing the scanout test surface ({})\n",
+        if drawn {
+            "a pattern drawn by a compute shader"
+        } else if copied {
+            "solid green, filled by the copy engine"
+        } else {
+            "solid red, filled by the CPU"
+        }
     );
     let shown = engine.show(bar, &test);
     if shown.is_ok() {
@@ -131,13 +154,52 @@ pub(crate) fn run(
     shown.and(restored)
 }
 
+/// Draws [`shader::pattern`] on `surface`, which is in the VRAM `range`, with a compute shader on
+/// `channel`.
+fn draw_pattern(
+    bar: Bar0<'_>,
+    mm: &mut GpuMm<'_>,
+    channel: &mut ComputeChannel<'_>,
+    range: core::ops::Range<VramAddress>,
+    surface: &Surface,
+) -> Result {
+    let mapped = channel.map_vram(mm, range)?;
+    let target = PixelSurface {
+        addr: mapped.start().into_raw(),
+        width: surface.width,
+        height: surface.height,
+        pitch: surface.pitch,
+    };
+    // One thread per pixel.
+    let grid = Grid {
+        blocks: [
+            surface.width.div_ceil(shader::PATTERN_BLOCK_WIDTH.into()),
+            surface.height.div_ceil(shader::PATTERN_BLOCK_HEIGHT.into()),
+            1,
+        ],
+        threads: [shader::PATTERN_BLOCK_WIDTH, shader::PATTERN_BLOCK_HEIGHT, 1],
+        registers: shader::PATTERN_REGISTERS,
+    };
+    let drawn = compute_test::run_program(
+        bar,
+        mm,
+        channel,
+        |_| Ok(shader::pattern(&target)),
+        grid,
+        |_, _| Ok(()),
+    );
+    let unmapped = channel.unmap(mm, mapped);
+
+    drawn.and(unmapped)
+}
+
 /// Fills `surface`, which is in the VRAM `range`, with `color`, using the copy engine of
 /// `channel`.
-fn gpu_fill(
+fn copy_fill(
     bar: Bar0<'_>,
     mm: &mut GpuMm<'_>,
     channel: &mut CopyChannel<'_>,
-    range: core::ops::Range<crate::mm::VramAddress>,
+    range: core::ops::Range<VramAddress>,
     surface: &Surface,
     color: u32,
 ) -> Result {
