@@ -27,7 +27,7 @@ use super::{
 };
 
 /// How long the test surface stays on screen.
-const SHOW_TIME: Delta = Delta::from_secs(10);
+const SHOW_TIME: Delta = Delta::from_secs(1);
 
 /// Color of the test surface, in XRGB8888: a full screen of it can't be mistaken for anything else.
 const RED: u32 = 0xff0000;
