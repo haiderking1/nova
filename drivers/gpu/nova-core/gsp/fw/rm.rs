@@ -59,6 +59,8 @@ pub(crate) enum RmControlMsgFunction {
     GpuPromoteCtx = bindings::NV2080_CTRL_CMD_GPU_PROMOTE_CTX,
     /// Give GSP-RM the page directories above its part of a split address space.
     VaspaceCopyServerReservedPdes = bindings::NV90F1_CTRL_CMD_VASPACE_COPY_SERVER_RESERVED_PDES,
+    /// Get the interrupt vectors of the units whose interrupts the CPU services.
+    InternalIntrGetKernelTable = bindings::NV2080_CTRL_CMD_INTERNAL_INTR_GET_KERNEL_TABLE,
 }
 
 // TODO[FPRI]: This is a temporary solution to be replaced with the corresponding derive macros
@@ -99,6 +101,9 @@ impl TryFrom<u32> for RmControlMsgFunction {
             bindings::NV2080_CTRL_CMD_GPU_PROMOTE_CTX => Ok(Self::GpuPromoteCtx),
             bindings::NV90F1_CTRL_CMD_VASPACE_COPY_SERVER_RESERVED_PDES => {
                 Ok(Self::VaspaceCopyServerReservedPdes)
+            }
+            bindings::NV2080_CTRL_CMD_INTERNAL_INTR_GET_KERNEL_TABLE => {
+                Ok(Self::InternalIntrGetKernelTable)
             }
             _ => Err(EINVAL),
         }
@@ -844,6 +849,42 @@ unsafe impl FromBytes for DeviceInfoTableParams {}
 
 // SAFETY: Padding is explicit and will not contain uninitialized data.
 unsafe impl AsBytes for DeviceInfoTableParams {}
+
+/// Parameters of `NV2080_CTRL_CMD_INTERNAL_INTR_GET_KERNEL_TABLE`: the interrupt vectors of the
+/// units whose interrupts the CPU services, rather than GSP-RM.
+#[repr(transparent)]
+pub(crate) struct IntrKernelTableParams(
+    bindings::NV2080_CTRL_INTERNAL_INTR_GET_KERNEL_TABLE_PARAMS,
+);
+
+impl IntrKernelTableParams {
+    /// Creates the parameters, all filled in by GSP-RM.
+    pub(crate) fn new() -> Self {
+        Self(Default::default())
+    }
+
+    /// Returns the vector of the display engine's interrupts, as GSP-RM reports it: possibly
+    /// `NV_INTR_VECTOR_INVALID` (`u32::MAX`), out of the range of every interrupt tree.
+    ///
+    /// The display engine's interrupts that the CPU services, such as those of head timing, are
+    /// stalling interrupts, on the stall vector.
+    pub(crate) fn display_vector(&self) -> Option<u32> {
+        let len = usize::try_from(self.0.tableLen).unwrap_or(0);
+
+        self.0
+            .table
+            .iter()
+            .take(len)
+            .find(|entry| u32::from(entry.engineIdx) == bindings::MC_ENGINE_IDX_DISP)
+            .map(|entry| entry.vectorStall)
+    }
+}
+
+// SAFETY: This struct only contains integer types for which all bit patterns are valid.
+unsafe impl FromBytes for IntrKernelTableParams {}
+
+// SAFETY: Padding is explicit and will not contain uninitialized data.
+unsafe impl AsBytes for IntrKernelTableParams {}
 
 /// Memory of a GPFIFO channel, which the client allocates for GSP-RM to set up.
 pub(crate) struct ChannelMemory {

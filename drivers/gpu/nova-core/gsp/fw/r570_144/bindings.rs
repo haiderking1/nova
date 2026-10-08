@@ -55,6 +55,8 @@ pub const NV2080_CTRL_CMD_INTERNAL_DISPLAY_GET_STATIC_INFO: u32 = 545262081;
 pub const NV2080_CTRL_CMD_INTERNAL_STATIC_KGR_GET_CONTEXT_BUFFERS_INFO: u32 = 545262130;
 pub const NV2080_CTRL_CMD_INTERNAL_DISPLAY_WRITE_INST_MEM: u32 = 545262153;
 pub const NV2080_CTRL_CMD_INTERNAL_DISPLAY_CHANNEL_PUSHBUFFER: u32 = 545262168;
+pub const NV2080_CTRL_CMD_INTERNAL_INTR_GET_KERNEL_TABLE: u32 = 545262172;
+pub const NV2080_CTRL_INTERNAL_INTR_MAX_TABLE_SIZE: u32 = 128;
 pub const NV2080_ENGINE_TYPE_GRAPHICS: u32 = 1;
 pub const NV2080_ENGINE_TYPE_COPY0: u32 = 9;
 pub const NV2080_ENGINE_TYPE_COPY9: u32 = 18;
@@ -213,6 +215,7 @@ pub const NVC7C0_SET_SHADER_LOCAL_MEMORY_WINDOW_A: u32 = 1968;
 pub const NVC7C0_SET_REPORT_SEMAPHORE_A: u32 = 6912;
 pub const NVC7C0_SET_REPORT_SEMAPHORE_D_OPERATION_RELEASE: u32 = 0;
 pub const NVC7C0_SET_REPORT_SEMAPHORE_D_STRUCTURE_SIZE_ONE_WORD: u32 = 1;
+pub const MC_ENGINE_IDX_DISP: u32 = 2;
 pub type __u8 = ffi::c_uchar;
 pub type __u16 = ffi::c_ushort;
 pub type __u32 = ffi::c_uint;
@@ -845,6 +848,38 @@ pub struct NV2080_CTRL_INTERNAL_DISPLAY_CHANNEL_PUSHBUFFER_PARAMS {
     pub channelPBSize: u32_,
     pub subDeviceId: u32_,
     pub __bindgen_padding_2: [u8; 4usize],
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV2080_INTR_CATEGORY_SUBTREE_MAP {
+    pub subtreeStart: u8_,
+    pub subtreeEnd: u8_,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV2080_CTRL_INTERNAL_INTR_GET_KERNEL_TABLE_ENTRY {
+    pub engineIdx: u16_,
+    pub __bindgen_padding_0: [u8; 2usize],
+    pub pmcIntrMask: u32_,
+    pub vectorStall: u32_,
+    pub vectorNonStall: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone, MaybeZeroable)]
+pub struct NV2080_CTRL_INTERNAL_INTR_GET_KERNEL_TABLE_PARAMS {
+    pub tableLen: u32_,
+    pub table: [NV2080_CTRL_INTERNAL_INTR_GET_KERNEL_TABLE_ENTRY; 128usize],
+    pub subtreeMap: [NV2080_INTR_CATEGORY_SUBTREE_MAP; 7usize],
+    pub __bindgen_padding_0: [u8; 2usize],
+}
+impl Default for NV2080_CTRL_INTERNAL_INTR_GET_KERNEL_TABLE_PARAMS {
+    fn default() -> Self {
+        let mut s = ::core::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::core::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
 }
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone, MaybeZeroable)]

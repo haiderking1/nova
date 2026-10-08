@@ -1022,3 +1022,26 @@ rm_control!(
     (),
     |_p| ()
 );
+
+/// RM control command querying the interrupt vectors of the units whose interrupts the CPU
+/// services, rather than GSP-RM.
+///
+/// Sent to GSP-RM's internal subdevice. The reply is the vector of the display engine's
+/// interrupts, if the GPU has a display engine.
+pub(crate) struct IntrGetKernelTable(IntrKernelTableParams);
+
+impl IntrGetKernelTable {
+    /// Creates the command.
+    pub(crate) fn new() -> Self {
+        Self(IntrKernelTableParams::new())
+    }
+}
+
+rm_control!(
+    IntrGetKernelTable,
+    Subdevice,
+    InternalIntrGetKernelTable,
+    IntrKernelTableParams,
+    Option<u32>,
+    |p| p.display_vector()
+);
