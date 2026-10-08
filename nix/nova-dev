@@ -5,10 +5,16 @@
 #   nova-dev build    build both modules, put them in /var/lib/nova/dev
 #                     (works from the normal boot; then `nova-try --dev`)
 #   nova-dev reload   only inside the nova boot: swap in the fresh modules live
+#   nova-dev kernel   build the whole kernel too, for changes to rust/kernel or
+#                     other built-in code; puts it and both modules in
+#                     /var/lib/nova/dev-kernel (then `nova-try --dev-kernel`)
 #
-# Builds happen in a local kernel tree ($NOVA_KTREE, default
+# Module builds happen in a local kernel tree ($NOVA_KTREE, default
 # ~/.cache/nova-ktree) using the exact .config and Module.symvers of the
-# Nix-built nova kernel, so the modules match it. Run inside `nix develop`.
+# Nix-built nova kernel, so the modules match it. Kernel builds happen in
+# another one ($NOVA_KERNEL_TREE, default ~/.cache/nova-kernel) with the same
+# .config; they're incremental, so only the first one takes as long as a Nix
+# build. Run inside `nix develop`.
 #
 # NOVA_SYSTEM=<toplevel> builds against a system that isn't switched to yet,
 # NOVA_OUT=<dir> puts the modules somewhere else.
@@ -17,6 +23,8 @@ set -euo pipefail
 src=$(git -C "$(dirname "$(readlink -f "$0")")" rev-parse --show-toplevel)
 ktree=${NOVA_KTREE:-$HOME/.cache/nova-ktree}
 out=${NOVA_OUT:-/var/lib/nova/dev}
+kernel_tree=${NOVA_KERNEL_TREE:-$HOME/.cache/nova-kernel}
+kernel_out=/var/lib/nova/dev-kernel
 system=${NOVA_SYSTEM:-/nix/var/nix/profiles/system} # system generation to build against
 mods=(drivers/gpu/nova-core.ko drivers/gpu/nova-drm.ko)
 
@@ -41,9 +49,33 @@ nova_kbuild() {
   echo "$dev"/lib/modules/*/build
 }
 
+# kmake <tree> <make arguments>
 kmake() {
+  local tree=$1
+  shift
   # LOCALVERSION= stops the git checkout from adding "+" to the version
-  make -C "$src" O="$ktree" LOCALVERSION= "$@"
+  make -C "$src" O="$tree" LOCALVERSION= "$@"
+}
+
+# Configures <tree> like the Nix-built nova kernel, if its config changed
+prepare_tree() {
+  local tree=$1 kbuild=$2
+  mkdir -p "$tree"
+  cmp -s "$kbuild/.config" "$tree/.config.nix" && return 1
+  install -m644 "$kbuild/.config" "$tree/.config.nix"
+  install -m644 "$kbuild/.config" "$tree/.config"
+  "$src/scripts/config" --file "$tree/.config" --disable LOCALVERSION_AUTO
+  kmake "$tree" olddefconfig
+}
+
+# check_modules <dir> <release>: the modules in <dir> are for kernel <release>
+check_modules() {
+  local m vermagic
+  for m in "${mods[@]}"; do
+    vermagic=$(modinfo -F vermagic "$1/$m")
+    [ "${vermagic%% *}" = "$2" ] ||
+      die "$m is for '${vermagic%% *}', but the nova kernel is '$2'"
+  done
 }
 
 build() {
@@ -55,13 +87,9 @@ build() {
   mkdir -p "$ktree"
 
   # (Re)prepare the local tree when the Nix kernel's config changed
-  if ! cmp -s "$kbuild/.config" "$ktree/.config.nix"; then
+  if prepare_tree "$ktree" "$kbuild"; then
     echo "nova-dev: kernel config changed, preparing $ktree (takes a few minutes)"
-    install -m644 "$kbuild/.config" "$ktree/.config.nix"
-    install -m644 "$kbuild/.config" "$ktree/.config"
-    "$src/scripts/config" --file "$ktree/.config" --disable LOCALVERSION_AUTO
-    kmake olddefconfig
-    kmake -j"$(nproc)" modules_prepare
+    kmake "$ktree" -j"$(nproc)" modules_prepare
   fi
   # The real kernel's vmlinux, for module BTF that matches it
   ln -sf "$kdev/vmlinux" "$ktree/vmlinux"
@@ -77,18 +105,48 @@ build() {
     "$ktree/scripts/mod/modpost" "$ktree/Module.symvers" > "$ktree/modpost-wrap"
   chmod +x "$ktree/modpost-wrap"
 
-  kmake -j"$(nproc)" MODPOST="$ktree/modpost-wrap" "${mods[@]}"
-
-  local m vermagic
-  for m in "${mods[@]}"; do
-    vermagic=$(modinfo -F vermagic "$ktree/$m")
-    [ "${vermagic%% *}" = "$release" ] ||
-      die "$m is for '${vermagic%% *}', but the nova kernel is '$release'"
-  done
+  kmake "$ktree" -j"$(nproc)" MODPOST="$ktree/modpost-wrap" "${mods[@]}"
+  check_modules "$ktree" "$release"
 
   install -m644 "${mods[@]/#/$ktree/}" "$out/"
   echo "nova-dev: modules for $release ready in $out"
   echo "nova-dev: boot them with 'nova-try --dev' (or 'nova-dev reload' inside nova)"
+}
+
+kernel() {
+  command -v rustc >/dev/null || die "run this inside 'nix develop' in $src"
+  local kbuild release built
+  kbuild=$(nova_kbuild)
+  release=$(cat "$kbuild/include/config/kernel.release")
+
+  if prepare_tree "$kernel_tree" "$kbuild"; then
+    echo "nova-dev: kernel config changed, configured $kernel_tree; the first build takes as long as a Nix build"
+  fi
+
+  # The kernel and the modules are built against each other, which also checks every symbol the
+  # modules use against the new kernel
+  kmake "$kernel_tree" -j"$(nproc)" bzImage "${mods[@]}"
+
+  # The dev kernel boots the nova system, which loads every other module from
+  # the Nix-built kernel: refuse a kernel those won't load into
+  built=$(kmake "$kernel_tree" -s kernelrelease)
+  [ "$built" = "$release" ] ||
+    die "built kernel '$built', but the nova system's modules are for '$release'"
+  check_modules "$kernel_tree" "$release"
+
+  # `uname -v` of this build, which differs on every link: the modprobe hook in
+  # mother-base loads these modules only into the kernel they were built with
+  local uts
+  uts=$(sed -n 's/^#define UTS_VERSION "\(.*\)"$/\1/p' "$kernel_tree/include/generated/utsversion.h")
+  [ -n "$uts" ] || die "can't find the version of the built kernel"
+
+  mkdir -p "$kernel_out"
+  install -m644 "$kernel_tree/arch/x86/boot/bzImage" "$kernel_out/bzImage.new"
+  install -m644 "${mods[@]/#/$kernel_tree/}" "$kernel_out/"
+  echo "$uts" > "$kernel_out/uts-version"
+  mv "$kernel_out/bzImage.new" "$kernel_out/bzImage"
+  echo "nova-dev: kernel $release and its modules ready in $kernel_out"
+  echo "nova-dev: boot them with 'nova-try --dev-kernel'"
 }
 
 reload() {
@@ -109,6 +167,7 @@ reload() {
 
 case "${1:-}" in
   build) build ;;
+  kernel) kernel ;;
   reload) reload ;;
-  *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  *) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

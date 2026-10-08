@@ -74,6 +74,7 @@
           ncurses # menuconfig
           pkg-config
           cpio
+          zstd # compresses the kernel image (nova-dev kernel)
           kmod
           pahole
 
