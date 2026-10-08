@@ -1196,6 +1196,22 @@ impl<'a, T: ?Sized> Mmio<'a, T> {
     }
 }
 
+impl<'a, const SIZE: usize> Mmio<'a, Region<SIZE>> {
+    /// Returns a view of the region as bytes.
+    ///
+    /// Byte ranges of it can then be projected, e.g. `io_project!(bytes, [try: start..end])`, and
+    /// copied with [`Io::copy_from_slice()`] and [`Io::copy_to_slice()`].
+    #[inline]
+    pub fn as_bytes(self) -> Mmio<'a, [u8]> {
+        // INVARIANT: A `Region` is a `[u8]` with additional guarantees on size and alignment, so
+        // the same memory viewed as bytes is valid and aligned for `'a` as well.
+        Mmio {
+            ptr: self.ptr as *mut [u8],
+            phantom: PhantomData,
+        }
+    }
+}
+
 // SAFETY: `Mmio<'_, T>` is conceptually `&T` but in I/O memory.
 unsafe impl<T: ?Sized + Sync> Send for Mmio<'_, T> {}
 
