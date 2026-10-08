@@ -116,7 +116,9 @@ impl pci::Driver for NovaCoreDriver {
 
             bar1: {
                 let bar1_idx = bar1_resource_index(pdev)?;
-                pdev.iomap_region(bar1_idx, c"nova-core/bar1")?
+                // BAR1 is a window into VRAM, not registers: write-combine it like other GPU
+                // drivers, which makes bulk writes (e.g. the boot display) much faster.
+                pdev.iomap_region_wc(bar1_idx, c"nova-core/bar1")?
             },
 
             // Run self-tests that do not depend on the `Gpu` instance.

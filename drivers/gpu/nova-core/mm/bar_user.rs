@@ -6,10 +6,20 @@
 use core::ops::Range;
 
 use kernel::{
-    io::Io,
+    io::{
+        io_project,
+        Io,
+        IoBase, //
+    },
     new_mutex,
     prelude::*,
-    sync::Mutex, //
+    sync::{
+        barrier::{
+            mb,
+            Write, //
+        },
+        Mutex, //
+    },
 };
 
 use crate::{
@@ -152,16 +162,17 @@ impl<'a> BarUser<'a> {
         self.bar1.try_read32(base)
     }
 
-    /// Write `data` at `offset` into the region `mapped` maps.
+    /// Write `data` at `offset` into the region `mapped` maps, and make it visible to the GPU.
     ///
     /// `offset` and the length of `data` must be multiples of 4.
     pub(crate) fn write(&self, mapped: &MappedRange, offset: usize, data: &[u8]) -> Result {
         let base = Self::mapped_offset(mapped, offset, data.len())?;
+        let end = base.checked_add(data.len()).ok_or(EOVERFLOW)?;
 
-        for (i, word) in data.chunks_exact(4).enumerate() {
-            let value = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
-            self.bar1.try_write32(value, base + i * 4)?;
-        }
+        let bytes = self.bar1.as_view().as_bytes();
+        io_project!(bytes, [try: base..end]).copy_from_slice(data);
+        // BAR1 is write-combined: flush the writes out of the CPU.
+        mb(Write);
 
         Ok(())
     }
@@ -442,6 +453,8 @@ pub(crate) fn run_self_test(
                     .ok_or(EOVERFLOW)?;
 
             bar1.try_write32(PATTERN_BAR1, page_bar1_off)?;
+            // BAR1 is write-combined: flush the write before reading VRAM through PRAMIN.
+            mb(Write);
 
             let pramin_val = mm
                 .pramin_mut()
