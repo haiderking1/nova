@@ -3,6 +3,8 @@
 //! BAR1 user interface for CPU access to GPU virtual memory. Used for USERD
 //! for GPU work submission, and applications to access GPU buffers via mmap().
 
+use core::ops::Range;
+
 use kernel::{
     io::Io,
     new_mutex,
@@ -75,6 +77,59 @@ impl<'a> BarUser<'a> {
             bar_user: self,
             mapped: Some(mapped),
         })
+    }
+
+    /// Map the page-aligned VRAM range `vram` writable into BAR1, for as long as the caller keeps
+    /// the returned [`MappedRange`], which it must give back to [`BarUser::unmap()`].
+    ///
+    /// Unlike [`BarUser::map()`], the mapping doesn't borrow `self`, so it can be kept alongside
+    /// the [`BarUser`].
+    pub(crate) fn map_vram(
+        &self,
+        mm: &mut GpuMm<'_>,
+        vram: Range<VramAddress>,
+    ) -> Result<MappedRange> {
+        let (start, end) = (vram.start.into_raw(), vram.end.into_raw());
+        let page_size: u64 = PAGE_SIZE.into_safe_cast();
+        if start % page_size != 0 || end % page_size != 0 || start >= end {
+            return Err(EINVAL);
+        }
+
+        let mut pfns = KVec::new();
+        for pfn in (start / page_size)..(end / page_size) {
+            pfns.push(Pfn::new(pfn), GFP_KERNEL)?;
+        }
+
+        self.vmm.lock().map_pages(mm, &pfns, None, true)
+    }
+
+    /// Tear down a mapping made by [`BarUser::map_vram()`].
+    pub(crate) fn unmap(&self, mm: &mut GpuMm<'_>, mapped: MappedRange) -> Result {
+        self.vmm.lock().unmap_pages(mm, mapped)
+    }
+
+    /// Write `data` at `offset` into the region `mapped` maps.
+    ///
+    /// `offset` and the length of `data` must be multiples of 4.
+    pub(crate) fn write(&self, mapped: &MappedRange, offset: usize, data: &[u8]) -> Result {
+        let size = mapped.num_pages.checked_mul(PAGE_SIZE).ok_or(EOVERFLOW)?;
+        let end = offset.checked_add(data.len()).ok_or(EOVERFLOW)?;
+        if end > size || offset % 4 != 0 || data.len() % 4 != 0 {
+            return Err(EINVAL);
+        }
+
+        let base_vfn: usize = mapped.vfn_start.raw().into_safe_cast();
+        let base = base_vfn
+            .checked_mul(PAGE_SIZE)
+            .and_then(|base| base.checked_add(offset))
+            .ok_or(EOVERFLOW)?;
+
+        for (i, word) in data.chunks_exact(4).enumerate() {
+            let value = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+            self.bar1.try_write32(value, base + i * 4)?;
+        }
+
+        Ok(())
     }
 }
 

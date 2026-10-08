@@ -140,9 +140,14 @@ impl pci::Driver for NovaCoreDriver {
                 unsafe { &*core::ptr::from_ref(bar) },
                 // SAFETY: `bar1` is initialized above, pinned, and outlives `gpu`.
                 unsafe { &*core::ptr::from_ref(bar1) },
-            ).pin_chain(|_gpu| {
+            ).pin_chain(|mut gpu| {
                 #[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
-                _gpu.run_selftests(pdev);
+                gpu.as_mut().run_selftests(pdev);
+
+                // Not fatal: without it the display just isn't usable.
+                if let Err(err) = gpu.map_boot_display() {
+                    dev_warn!(pdev, "can't map the boot display: {:?}\n", err);
+                }
                 Ok(())
             }),
 

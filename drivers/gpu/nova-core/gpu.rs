@@ -8,6 +8,7 @@ use kernel::{
     fmt,
     gpu::buddy::GpuBuddyParams,
     io::Io,
+    new_mutex,
     num::Bounded,
     pci,
     prelude::*,
@@ -16,6 +17,7 @@ use kernel::{
         SizeConstants,
         SZ_4K, //
     },
+    sync::Mutex,
     uapi, //
 };
 
@@ -51,9 +53,12 @@ use crate::{
     mm::{
         bar_user::BarUser,
         pagetable::MmuVersion,
+        vmm::MappedRange,
         GpuMm,
-        VramAddress, //
+        VramAddress,
+        PAGE_SIZE, //
     },
+    num::IntoSafeCast,
     vgpu::VgpuManager, //
 };
 
@@ -378,11 +383,16 @@ impl<'a> GspSubtree<'a> {
 }
 
 /// Structure holding the resources required to operate the GPU.
-#[pin_data]
+#[pin_data(PinnedDrop)]
 pub(crate) struct Gpu<'gpu> {
     pub(crate) spec: Spec,
     /// The display the system firmware set up on this GPU, if any.
     pub(crate) boot_display: Option<BootDisplay>,
+    /// BAR1 mapping of the boot display's framebuffer, for the CPU to draw into.
+    ///
+    /// Unmapped in [`Gpu`]'s `PinnedDrop`, while `mm` and `bar_user` are still alive.
+    #[pin]
+    boot_scanout: Mutex<Option<MappedRange>>,
     /// GSP event interrupt registration, and the enable of its subtree.
     ///
     /// Must be kept declared *before* `gsp_resources`, so that the handler is unregistered, and
@@ -465,6 +475,9 @@ impl<'gpu> Gpu<'gpu> {
                 dev_warn!(dev, "ignoring the firmware display: {:?}\n", err);
                 None
             }),
+
+            // Mapped by `Gpu::map_boot_display()` once the GPU is up.
+            boot_scanout <- new_mutex!(None, "nova_boot_scanout"),
 
             tree: Tree::new(pdev, bar, spec.chipset, irq::gsp::GSP_SUBTREE.into())?,
 
@@ -621,6 +634,41 @@ impl<'gpu> Gpu<'gpu> {
             .inspect_err(|_| dev_err!(dev, "GFW boot did not complete\n"))
     }
 
+    /// Maps the framebuffer of the boot display into BAR1, so the CPU can draw into it with
+    /// [`Gpu::write_boot_display()`]. Does nothing without a boot display.
+    pub(crate) fn map_boot_display(self: Pin<&mut Self>) -> Result {
+        let this = self.project();
+        let Some(display) = this.boot_display.as_ref() else {
+            return Ok(());
+        };
+
+        // BAR1 maps whole pages; the end of the last line may not be page-aligned.
+        let page_size: u64 = PAGE_SIZE.into_safe_cast();
+        let end = display
+            .vram
+            .end
+            .into_raw()
+            .checked_next_multiple_of(page_size)
+            .ok_or(EOVERFLOW)?;
+        let vram = display.vram.start..VramAddress::from_raw(end);
+
+        let mapped = this.bar_user.as_ref().get_ref().map_vram(this.mm, vram)?;
+        *this.boot_scanout.lock() = Some(mapped);
+
+        Ok(())
+    }
+
+    /// Writes `data` at `offset` into the framebuffer of the boot display, which shows on screen.
+    ///
+    /// `offset` and the length of `data` must be multiples of 4. Fails with `ENODEV` if the boot
+    /// display isn't mapped.
+    pub(crate) fn write_boot_display(&self, offset: usize, data: &[u8]) -> Result {
+        let scanout = self.boot_scanout.lock();
+        let mapped = scanout.as_ref().ok_or(ENODEV)?;
+
+        self.bar_user.write(mapped, offset, data)
+    }
+
     /// Runs self-tests on the constructed [`Gpu`], logging failures without failing probe.
     #[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
     pub(crate) fn run_selftests(self: Pin<&mut Self>, pdev: &pci::Device<device::Bound>) {
@@ -643,6 +691,24 @@ impl<'gpu> Gpu<'gpu> {
             if let Err(err) = crate::mm::boot_display_test::draw(dev, this.mm, display, regions) {
                 dev_err!(dev, "boot display test pattern failed: {:?}\n", err);
             }
+        }
+    }
+}
+
+#[pinned_drop]
+impl PinnedDrop for Gpu<'_> {
+    fn drop(self: Pin<&mut Self>) {
+        let this = self.project();
+
+        // Before any field is dropped: unmapping needs `mm`, `bar_user` and a running GSP.
+        let mapped = this.boot_scanout.lock().take();
+        if let Some(mapped) = mapped {
+            let _ = this
+                .bar_user
+                .as_ref()
+                .get_ref()
+                .unmap(this.mm, mapped)
+                .inspect_err(|e| pr_err!("failed to unmap the boot display: {:?}\n", e));
         }
     }
 }

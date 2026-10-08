@@ -10,6 +10,7 @@ use kernel::{
     device::Bound,
     pci,
     prelude::*,
+    screen_info::PixelFormat,
     types::ForLt, //
 };
 
@@ -29,6 +30,10 @@ pub struct BootDisplayMode {
     pub width: u32,
     /// Height in pixels.
     pub height: u32,
+    /// Distance between the starts of two lines of the framebuffer, in bytes.
+    pub stride: u32,
+    /// Pixel layout of the framebuffer.
+    pub format: PixelFormat,
 }
 
 /// API handle for the auxiliary bus child drivers to interact with nova-core.
@@ -59,7 +64,18 @@ impl NovaCoreApi<'_> {
         self.gpu.boot_display.as_ref().map(|display| BootDisplayMode {
             width: display.width,
             height: display.height,
+            stride: display.stride,
+            format: display.format,
         })
+    }
+
+    /// Writes `data` at `offset` into the framebuffer of the boot display, which shows on screen.
+    ///
+    /// `offset` is in bytes from the start of the framebuffer (see [`BootDisplayMode`] for its
+    /// layout). `offset` and the length of `data` must be multiples of 4. Fails with `ENODEV`
+    /// without a usable boot display.
+    pub fn write_boot_display(&self, offset: usize, data: &[u8]) -> Result {
+        self.gpu.write_boot_display(offset, data)
     }
 
     /// Returns the size of the PCIe BAR used for accessing VRAM, typically
