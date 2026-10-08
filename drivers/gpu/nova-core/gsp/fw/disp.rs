@@ -64,8 +64,14 @@ pub(crate) mod window_c67e {
     pub(crate) const SET_WINDOW_INTERLOCK_FLAGS: u32 = bindings::NVC67E_SET_WINDOW_INTERLOCK_FLAGS;
     /// First of the 12 coefficients of the format conversion matrix, in S5.16 fixed point.
     pub(crate) const SET_FMT_COEFFICIENT_C00: u32 = bindings::NVC67E_SET_FMT_COEFFICIENT_C00;
+    /// Input LUT: interpolation in bit 0, mode in bits 3:2, number of entries in bits 18:8.
+    pub(crate) const SET_ILUT_CONTROL: u32 = bindings::NVC67E_SET_ILUT_CONTROL;
+    /// Input LUT mode: one entry per 10-bit input value.
+    pub(crate) const ILUT_MODE_DIRECT10: u32 = bindings::NVC67E_SET_ILUT_CONTROL_MODE_DIRECT10;
     /// Context DMA of the input LUT, 0 for none.
     pub(crate) const SET_CONTEXT_DMA_ILUT: u32 = bindings::NVC67E_SET_CONTEXT_DMA_ILUT;
+    /// Offset of the input LUT in its context DMA, in units of 256 bytes.
+    pub(crate) const SET_OFFSET_ILUT: u32 = bindings::NVC67E_SET_OFFSET_ILUT;
 
     // The following methods take the index of a surface plane: bindgen can't translate their
     // function-like macros, so they are defined here, after `clc67e.h`.
