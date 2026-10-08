@@ -52,6 +52,11 @@ pub(crate) enum RmControlMsgFunction {
     GpfifoSchedule = bindings::NVA06F_CTRL_CMD_GPFIFO_SCHEDULE,
     /// Get the engines of the GPU and the runlists they are on.
     FifoGetDeviceInfoTable = bindings::NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE,
+    /// Get the sizes of the context buffers of the graphics engines.
+    InternalStaticKgrGetContextBuffersInfo =
+        bindings::NV2080_CTRL_CMD_INTERNAL_STATIC_KGR_GET_CONTEXT_BUFFERS_INFO,
+    /// Give the context buffers of a channel to GSP-RM.
+    GpuPromoteCtx = bindings::NV2080_CTRL_CMD_GPU_PROMOTE_CTX,
 }
 
 // TODO[FPRI]: This is a temporary solution to be replaced with the corresponding derive macros
@@ -86,6 +91,10 @@ impl TryFrom<u32> for RmControlMsgFunction {
             bindings::NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE => {
                 Ok(Self::FifoGetDeviceInfoTable)
             }
+            bindings::NV2080_CTRL_CMD_INTERNAL_STATIC_KGR_GET_CONTEXT_BUFFERS_INFO => {
+                Ok(Self::InternalStaticKgrGetContextBuffersInfo)
+            }
+            bindings::NV2080_CTRL_CMD_GPU_PROMOTE_CTX => Ok(Self::GpuPromoteCtx),
             _ => Err(EINVAL),
         }
     }
@@ -166,6 +175,10 @@ pub(crate) enum RmObjectClass {
     ChannelGpfifoAmpere = bindings::AMPERE_CHANNEL_GPFIFO_A,
     /// A copy engine object of GA10x GPUs, child of a channel.
     CopyEngineAmpereB = bindings::AMPERE_DMA_COPY_B,
+    /// A 3D object of GA10x GPUs (but GA100), child of a channel on the graphics engine.
+    ThreeDAmpereB = bindings::AMPERE_B,
+    /// A compute object of GA10x GPUs (but GA100), child of a channel on the graphics engine.
+    ComputeAmpereB = bindings::AMPERE_COMPUTE_B,
 }
 
 impl From<RmObjectClass> for u32 {
@@ -720,7 +733,6 @@ unsafe impl FromBytes for GpfifoScheduleParams {}
 // SAFETY: This struct only contains integer types, without padding.
 unsafe impl AsBytes for GpfifoScheduleParams {}
 
-
 /// Wrapper for [`bindings::NV2080_CTRL_CE_GET_FAULT_METHOD_BUFFER_SIZE_PARAMS`].
 #[repr(transparent)]
 pub(crate) struct CeGetFaultMethodBufferSizeParams(
@@ -775,7 +787,8 @@ pub(crate) struct DeviceInfoTableParams(bindings::NV2080_CTRL_FIFO_GET_DEVICE_IN
 
 impl DeviceInfoTableParams {
     /// Number of entries of the table returned at once.
-    pub(crate) const MAX_ENTRIES: u32 = bindings::NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_MAX_ENTRIES;
+    pub(crate) const MAX_ENTRIES: u32 =
+        bindings::NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_MAX_ENTRIES;
 
     /// Creates the parameters to query the entries of the table from `base`.
     pub(crate) fn new(base: u32) -> Self {
@@ -908,3 +921,232 @@ impl ChannelGpfifoAllocParams {
 
 // SAFETY: Padding is explicit and will not contain uninitialized data.
 unsafe impl AsBytes for ChannelGpfifoAllocParams {}
+
+/// A kind of context buffer of the graphics engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GrContextBuffer {
+    /// The buffer in [`GrContextBuffersInfoParams`]
+    /// (`NV0080_CTRL_FIFO_GET_ENGINE_CONTEXT_PROPERTIES_ENGINE_ID_*`).
+    pub(crate) engine_id: u32,
+    /// The buffer in [`PromoteCtxParams`] (`NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ID_*`).
+    pub(crate) promote_id: u16,
+    /// Whether all the channels share the buffer, or each has its own.
+    pub(crate) global: bool,
+    /// Whether GSP-RM initializes the buffer when it's given.
+    pub(crate) init: bool,
+    /// Whether the graphics engine only reads the buffer.
+    pub(crate) read_only: bool,
+}
+
+impl GrContextBuffer {
+    /// Returns whether the buffer is the main context buffer, which ends with per-subcontext
+    /// headers.
+    pub(crate) fn is_main(&self) -> bool {
+        u32::from(self.promote_id) == bindings::NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ID_MAIN
+    }
+
+    /// Returns whether the buffer is the attribute circular buffer, whose GPU virtual address must
+    /// be aligned to its size.
+    pub(crate) fn is_attribute_cb(&self) -> bool {
+        u32::from(self.promote_id) == bindings::NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ID_ATTRIBUTE_CB
+    }
+
+    /// Returns whether the buffer is the privileged register access map, which the golden context
+    /// takes unmapped, and twice: also as the unrestricted map.
+    pub(crate) fn is_priv_access_map(&self) -> bool {
+        u32::from(self.promote_id)
+            == bindings::NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ID_PRIV_ACCESS_MAP
+    }
+}
+
+/// [`GrContextBuffer::promote_id`] of the unrestricted privileged register access map, which only
+/// the golden context takes: a copy of the privileged register access map.
+pub(crate) const GR_UNRESTRICTED_PRIV_ACCESS_MAP: u16 =
+    bindings::NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ID_UNRESTRICTED_PRIV_ACCESS_MAP as u16;
+
+/// The context buffers of the graphics engine that channels need, like nouveau's.
+pub(crate) const GR_CONTEXT_BUFFERS: [GrContextBuffer; 8] = {
+    const fn buffer(
+        engine_id: u32,
+        promote_id: u32,
+        global: bool,
+        init: bool,
+        read_only: bool,
+    ) -> GrContextBuffer {
+        GrContextBuffer {
+            engine_id,
+            // CAST: promote IDs are below 16.
+            promote_id: promote_id as u16,
+            global,
+            init,
+            read_only,
+        }
+    }
+
+    [
+        buffer(
+            bindings::NV0080_CTRL_FIFO_GET_ENGINE_CONTEXT_PROPERTIES_ENGINE_ID_GRAPHICS,
+            bindings::NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ID_MAIN,
+            false,
+            true,
+            false,
+        ),
+        buffer(
+            bindings::NV0080_CTRL_FIFO_GET_ENGINE_CONTEXT_PROPERTIES_ENGINE_ID_GRAPHICS_PATCH,
+            bindings::NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ID_PATCH,
+            false,
+            true,
+            false,
+        ),
+        buffer(
+            bindings::NV0080_CTRL_FIFO_GET_ENGINE_CONTEXT_PROPERTIES_ENGINE_ID_GRAPHICS_BUNDLE_CB,
+            bindings::NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ID_BUFFER_BUNDLE_CB,
+            true,
+            false,
+            false,
+        ),
+        buffer(
+            bindings::NV0080_CTRL_FIFO_GET_ENGINE_CONTEXT_PROPERTIES_ENGINE_ID_GRAPHICS_PAGEPOOL,
+            bindings::NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ID_PAGEPOOL,
+            true,
+            false,
+            false,
+        ),
+        buffer(
+            bindings::NV0080_CTRL_FIFO_GET_ENGINE_CONTEXT_PROPERTIES_ENGINE_ID_GRAPHICS_ATTRIBUTE_CB,
+            bindings::NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ID_ATTRIBUTE_CB,
+            true,
+            false,
+            false,
+        ),
+        buffer(
+            bindings::NV0080_CTRL_FIFO_GET_ENGINE_CONTEXT_PROPERTIES_ENGINE_ID_GRAPHICS_RTV_CB_GLOBAL,
+            bindings::NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ID_RTV_CB_GLOBAL,
+            true,
+            false,
+            false,
+        ),
+        buffer(
+            bindings::NV0080_CTRL_FIFO_GET_ENGINE_CONTEXT_PROPERTIES_ENGINE_ID_GRAPHICS_FECS_EVENT,
+            bindings::NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ID_FECS_EVENT,
+            true,
+            true,
+            false,
+        ),
+        buffer(
+            bindings::NV0080_CTRL_FIFO_GET_ENGINE_CONTEXT_PROPERTIES_ENGINE_ID_GRAPHICS_PRIV_ACCESS_MAP,
+            bindings::NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ID_PRIV_ACCESS_MAP,
+            true,
+            true,
+            true,
+        ),
+    ]
+};
+
+/// Size and alignment of a context buffer of the graphics engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ContextBufferInfo {
+    /// Size in bytes.
+    pub(crate) size: u32,
+    /// Alignment in bytes.
+    pub(crate) alignment: u32,
+}
+
+/// Wrapper for [`bindings::NV2080_CTRL_INTERNAL_STATIC_GR_GET_CONTEXT_BUFFERS_INFO_PARAMS`].
+#[repr(transparent)]
+pub(crate) struct GrContextBuffersInfoParams(
+    bindings::NV2080_CTRL_INTERNAL_STATIC_GR_GET_CONTEXT_BUFFERS_INFO_PARAMS,
+);
+
+impl GrContextBuffersInfoParams {
+    /// Creates the parameters to query the sizes of the context buffers of the graphics engines.
+    pub(crate) fn new() -> Self {
+        Self(Default::default())
+    }
+
+    /// Returns the size and alignment of the context buffer `buffer` of the first graphics engine.
+    pub(crate) fn info(&self, buffer: &GrContextBuffer) -> Option<ContextBufferInfo> {
+        let info = self
+            .0
+            .engineContextBuffersInfo
+            .first()?
+            .engine
+            .get(usize::try_from(buffer.engine_id).ok()?)?;
+
+        Some(ContextBufferInfo {
+            size: info.size,
+            alignment: info.alignment,
+        })
+    }
+}
+
+// SAFETY: This struct only contains integer types for which all bit patterns are valid.
+unsafe impl FromBytes for GrContextBuffersInfoParams {}
+
+// SAFETY: This struct only contains integer types, without padding.
+unsafe impl AsBytes for GrContextBuffersInfoParams {}
+
+/// A context buffer given to GSP-RM with [`PromoteCtxParams`].
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PromoteEntry {
+    /// The buffer (`NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ID_*`).
+    pub(crate) promote_id: u16,
+    /// GPU virtual address of the buffer in the channel's address space, if mapped there.
+    pub(crate) gpu_va: Option<u64>,
+    /// VRAM address and size of the buffer, if GSP-RM is to initialize it.
+    pub(crate) init: Option<(u64, u64)>,
+}
+
+/// `physAttr` of initialized buffers: in VRAM, not cached by the GPU (`NV2080_CTRL_GPU_INITIALIZE_CTX_*`,
+/// aperture in bits 1:0, `GPU_CACHEABLE` in bit 2).
+const PROMOTE_PHYS_ATTR_VIDMEM_UNCACHED: u32 =
+    bindings::NV2080_CTRL_GPU_INITIALIZE_CTX_APERTURE_VIDMEM
+        | bindings::NV2080_CTRL_GPU_INITIALIZE_CTX_GPU_CACHEABLE_NO << 2;
+
+/// Wrapper for [`bindings::NV2080_CTRL_GPU_PROMOTE_CTX_PARAMS`].
+#[repr(transparent)]
+pub(crate) struct PromoteCtxParams(bindings::NV2080_CTRL_GPU_PROMOTE_CTX_PARAMS);
+
+impl PromoteCtxParams {
+    /// Creates the parameters to give the graphics context buffers of the channel `channel` of
+    /// `client` to GSP-RM.
+    pub(crate) fn graphics(client: u32, channel: u32) -> Self {
+        Self(bindings::NV2080_CTRL_GPU_PROMOTE_CTX_PARAMS {
+            engineType: bindings::NV2080_ENGINE_TYPE_GRAPHICS,
+            hChanClient: client,
+            hObject: channel,
+            ..Default::default()
+        })
+    }
+
+    /// Adds `entry`.
+    pub(crate) fn push(&mut self, entry: &PromoteEntry) -> Result {
+        let slot = self
+            .0
+            .promoteEntry
+            .get_mut(usize::try_from(self.0.entryCount)?)
+            .ok_or(ENOSPC)?;
+
+        *slot = bindings::NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ENTRY {
+            bufferId: entry.promote_id,
+            gpuVirtAddr: entry.gpu_va.unwrap_or(0),
+            bNonmapped: u8::from(entry.gpu_va.is_none()),
+            ..Default::default()
+        };
+        if let Some((addr, size)) = entry.init {
+            slot.bInitialize = 1;
+            slot.gpuPhysAddr = addr;
+            slot.size = size;
+            slot.physAttr = PROMOTE_PHYS_ATTR_VIDMEM_UNCACHED;
+        }
+        self.0.entryCount += 1;
+
+        Ok(())
+    }
+}
+
+// SAFETY: This struct only contains integer types for which all bit patterns are valid.
+unsafe impl FromBytes for PromoteCtxParams {}
+
+// SAFETY: Padding is explicit and will not contain uninitialized data.
+unsafe impl AsBytes for PromoteCtxParams {}

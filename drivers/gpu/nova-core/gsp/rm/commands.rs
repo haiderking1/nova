@@ -33,6 +33,7 @@ use crate::{
             DisplayCoreChannel,
             DisplayRoot,
             DisplayWindowChannel,
+            GraphicsObject,
             Handle,
             Subdevice,
             VaSpace, //
@@ -820,7 +821,6 @@ rm_control!(
     |_p| ()
 );
 
-
 /// RM control command querying the size of the method buffer every channel needs, which the GPU
 /// saves pending methods into on faults.
 pub(crate) struct CeGetFaultMethodBufferSize(CeGetFaultMethodBufferSizeParams);
@@ -905,4 +905,93 @@ rm_control!(
         }
         (engines, p.more())
     }
+);
+
+/// Allocation of a GA10x 3D object on a channel on the graphics engine.
+pub(crate) struct AllocThreeDAmpereB;
+
+impl RmAllocCommand for AllocThreeDAmpereB {
+    const CLASS: RmObjectClass = RmObjectClass::ThreeDAmpereB;
+    type Parent = Channel;
+    type Object = GraphicsObject;
+    // The class takes no parameters.
+    type Params = [u8; 0];
+
+    fn params(&self) -> &Self::Params {
+        &[]
+    }
+}
+
+/// Allocation of a GA10x compute object on a channel on the graphics engine.
+pub(crate) struct AllocComputeAmpereB;
+
+impl RmAllocCommand for AllocComputeAmpereB {
+    const CLASS: RmObjectClass = RmObjectClass::ComputeAmpereB;
+    type Parent = Channel;
+    type Object = GraphicsObject;
+    // The class takes no parameters.
+    type Params = [u8; 0];
+
+    fn params(&self) -> &Self::Params {
+        &[]
+    }
+}
+
+/// RM control command querying the sizes of the context buffers of the graphics engines, sent to
+/// GSP-RM's internal subdevice.
+///
+/// The reply is the size and alignment of the buffers of [`GR_CONTEXT_BUFFERS`], in order.
+pub(crate) struct GrGetContextBuffersInfo(GrContextBuffersInfoParams);
+
+impl GrGetContextBuffersInfo {
+    /// Creates the command.
+    pub(crate) fn new() -> Self {
+        Self(GrContextBuffersInfoParams::new())
+    }
+}
+
+rm_control!(
+    GrGetContextBuffersInfo,
+    Subdevice,
+    InternalStaticKgrGetContextBuffersInfo,
+    GrContextBuffersInfoParams,
+    [ContextBufferInfo; GR_CONTEXT_BUFFERS.len()],
+    |p| {
+        let mut infos = [ContextBufferInfo {
+            size: 0,
+            alignment: 0,
+        }; GR_CONTEXT_BUFFERS.len()];
+        for (info, buffer) in infos.iter_mut().zip(GR_CONTEXT_BUFFERS.iter()) {
+            *info = p.info(buffer).ok_or(EINVAL)?;
+        }
+        infos
+    }
+);
+
+/// RM control command giving the graphics context buffers of a channel to GSP-RM, sent to the
+/// subdevice of the channel's client.
+pub(crate) struct GpuPromoteCtx(PromoteCtxParams);
+
+impl GpuPromoteCtx {
+    /// Creates the command for `channel` of `client`.
+    pub(crate) fn graphics(client: Handle<Client>, channel: Handle<Channel>) -> Self {
+        Self(PromoteCtxParams::graphics(
+            client.as_raw(),
+            channel.as_raw(),
+        ))
+    }
+
+    /// Adds `entry`.
+    pub(crate) fn push(&mut self, entry: &PromoteEntry) -> Result {
+        self.0.push(entry)
+    }
+}
+
+rm_control!(
+    GpuPromoteCtx,
+    Subdevice,
+    GpuPromoteCtx,
+    PromoteCtxParams,
+    (),
+    |_p| ()
 );
