@@ -8,6 +8,10 @@
 
 use kernel::{
     device,
+    io::{
+        register::Array,
+        Io, //
+    },
     prelude::*,
     ptr::Alignment,
     sizes::SZ_64K, //
@@ -44,6 +48,7 @@ use crate::{
 
 use super::{
     channel::PushBuffer,
+    regs,
     Display, //
 };
 
@@ -119,6 +124,8 @@ impl<'a> DisplayEngine<'a> {
         )
         .send(dev, cmdq)?;
         dev_dbg!(dev, "display: windows {:#x}\n", windows);
+
+        log_armed_state(dev, bar);
 
         // From here on GSP-RM may use the instance memory, which must thus not be freed before the
         // GSP is unloaded, even if the channels can't be set up.
@@ -228,5 +235,67 @@ impl<'a> Channels<'a> {
 
         dev_info!(dev, "display: core channel up\n");
         Ok(())
+    }
+}
+
+/// Core channel methods of head 0 whose armed state is logged, with their names in `clc67d.h`.
+const LOGGED_HEAD_METHODS: [(&str, usize); 26] = [
+    ("PROCAMP", 0x2000),
+    ("CONTROL_OUTPUT_RESOURCE", 0x2004),
+    ("CONTROL", 0x2008),
+    ("PIXEL_CLOCK_FREQUENCY", 0x200c),
+    ("PIXEL_CLOCK_CONFIGURATION", 0x201c),
+    ("DISPLAY_ID(0)", 0x2020),
+    ("PIXEL_CLOCK_FREQUENCY_MAX", 0x2028),
+    ("HEAD_USAGE_BOUNDS", 0x2030),
+    ("VIEWPORT_POINT_IN", 0x2048),
+    ("VIEWPORT_SIZE_IN", 0x204c),
+    ("VIEWPORT_SIZE_OUT", 0x2058),
+    ("RASTER_SIZE", 0x2064),
+    ("RASTER_SYNC_END", 0x2068),
+    ("RASTER_BLANK_END", 0x206c),
+    ("RASTER_BLANK_START", 0x2070),
+    ("0x2074", 0x2074),
+    ("CONTEXT_DMA_CURSOR(0)", 0x2088),
+    ("OFFSET_CURSOR(0)", 0x2090),
+    ("CONTROL_CURSOR", 0x209c),
+    ("PRESENT_CONTROL", 0x218c),
+    ("DISPLAY_RATE", 0x21a8),
+    ("OLUT_CONTROL", 0x2280),
+    ("OLUT_FP_NORM_SCALE", 0x2284),
+    ("CONTEXT_DMA_OLUT", 0x2288),
+    ("OFFSET_OLUT", 0x228c),
+    ("DSC_CONTROL", 0x22d4),
+];
+
+/// Returns the armed value of the core channel method at `method`.
+fn armed(bar: Bar0<'_>, method: usize) -> Option<u32> {
+    let reg = regs::NV_UDISP_CORE_ARMED::try_at(method / size_of::<u32>())?;
+    Some(bar.read(reg).into_raw())
+}
+
+/// Logs the parts of the armed state of the core channel that taking over head 0 depends on.
+fn log_armed_state(dev: &device::Device, bar: Bar0<'_>) {
+    let log = |name: &str, method: usize| {
+        if let Some(value) = armed(bar, method) {
+            dev_dbg!(
+                dev,
+                "display: armed {} ({:#06x}) = {:#010x}\n",
+                name,
+                method,
+                value
+            );
+        }
+    };
+
+    log("SET_CONTEXT_DMA_NOTIFIER", 0x208);
+    for sor in 0..4 {
+        log("SOR_SET_CONTROL", 0x300 + sor * 0x20);
+    }
+    for window in 0..8 {
+        log("WINDOW_SET_CONTROL", 0x1000 + window * 0x80);
+    }
+    for (name, method) in LOGGED_HEAD_METHODS {
+        log(name, method);
     }
 }

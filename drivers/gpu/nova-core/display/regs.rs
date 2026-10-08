@@ -26,3 +26,13 @@ register! {
         11:2    ptr;
     }
 }
+
+register! {
+    base: NovaRegisters;
+
+    /// Armed state of the core channel: the values of its methods the display engine currently
+    /// uses, each at the offset of its method (`NV_UDISP_FE_CHN_ARMED_BASEADR_CORE`).
+    pub(super) NV_UDISP_CORE_ARMED(u32)[0x2000] @ 0x00688000 {
+        31:0    value;
+    }
+}
