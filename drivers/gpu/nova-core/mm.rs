@@ -34,15 +34,25 @@ macro_rules! impl_pfn_bounded {
 
 use core::{
     fmt::LowerHex,
-    ops, //
+    ops::{
+        self,
+        Range, //
+    },
 };
 
 use kernel::{
     bitfield,
     fmt,
     gpu::buddy::{
+        AllocatedBlocks,
         GpuBuddy,
+        GpuBuddyAllocFlag,
+        GpuBuddyAllocMode,
         GpuBuddyParams, //
+    },
+    io::{
+        io_write,
+        Io, //
     },
     num::Bounded,
     prelude::*,
@@ -55,7 +65,11 @@ use kernel::{
 
 use crate::{
     driver::Bar0,
-    gpu::Chipset, //
+    gpu::Chipset,
+    num::{
+        self,
+        IntoSafeCast, //
+    },
 };
 
 pub(crate) use tlb::Tlb;
@@ -112,6 +126,72 @@ impl<'gpu> GpuMm<'gpu> {
     /// Access the [`Tlb`] manager.
     pub(crate) fn tlb(&self) -> &Tlb<'gpu> {
         self.tlb.as_ref().get_ref()
+    }
+
+    /// Allocates `size` bytes of physically contiguous VRAM, aligned to `align`.
+    pub(crate) fn alloc_contiguous(&self, size: usize, align: Alignment) -> Result<ContiguousVram> {
+        let blocks = KBox::pin_init(
+            self.buddy.alloc_blocks(
+                GpuBuddyAllocMode::Simple,
+                size.into_safe_cast(),
+                align,
+                GpuBuddyAllocFlag::Contiguous,
+            ),
+            GFP_KERNEL,
+        )?;
+
+        // The blocks of a contiguous allocation follow each other: the allocation starts at the
+        // lowest one.
+        let start = blocks
+            .iter()
+            .map(|block| block.offset())
+            .min()
+            .ok_or(ENOMEM)?;
+        let start = VramAddress::from_raw(start);
+        let end = start.checked_add(size.into_safe_cast()).ok_or(EOVERFLOW)?;
+
+        Ok(ContiguousVram {
+            _blocks: blocks,
+            range: start..end,
+        })
+    }
+
+    /// Fills the VRAM in `range` with zeroes. `range` must be 8-byte aligned.
+    pub(crate) fn clear_vram(&mut self, range: Range<VramAddress>) -> Result {
+        /// Number of `u64`s cleared per PRAMIN access.
+        const CHUNK: usize = 64;
+        const CHUNK_BYTES: u64 = num::usize_as_u64(CHUNK * size_of::<u64>());
+
+        let pramin = self.pramin_mut();
+        let mut addr = range.start;
+        while addr < range.end {
+            if range.end - addr >= CHUNK_BYTES {
+                let access = pramin.window_at::<[u64; CHUNK]>(addr)?;
+                let view = access.view();
+                for i in 0..CHUNK {
+                    io_write!(view, [try: i], 0u64);
+                }
+                addr = addr + CHUNK_BYTES;
+            } else {
+                pramin.window_at::<u64>(addr)?.view().write_val(0u64);
+                addr = addr + num::usize_as_u64(size_of::<u64>());
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// A physically contiguous range of VRAM, freed when dropped.
+pub(crate) struct ContiguousVram {
+    _blocks: Pin<KBox<AllocatedBlocks>>,
+    range: Range<VramAddress>,
+}
+
+impl ContiguousVram {
+    /// Returns the VRAM range of the allocation.
+    pub(crate) fn range(&self) -> Range<VramAddress> {
+        self.range.clone()
     }
 }
 
@@ -387,7 +467,10 @@ pub(crate) mod boot_display_test {
         );
 
         // Where the page tables say each 2 MiB chunk goes.
-        for page in (0..num_pages).step_by(512).flat_map(|p| [p, (p + 511).min(num_pages - 1)]) {
+        for page in (0..num_pages)
+            .step_by(512)
+            .flat_map(|p| [p, (p + 511).min(num_pages - 1)])
+        {
             let (vfn, pte) = bar_user.walk_mapped(mm, mapped, page)?;
             match pte {
                 Some((pte_addr, pfn)) => dev_info!(
@@ -434,13 +517,22 @@ pub(crate) mod boot_display_test {
 
         let (start, end) = (display.vram.start.into_raw(), display.vram.end.into_raw());
         // Don't draw over memory nova may hand out.
-        if usable_fb_regions.iter().any(|r| r.start < end && start < r.end) {
-            dev_warn!(dev, "boot display: [{start:#x}, {end:#x}) is usable VRAM, not drawing\n");
+        if usable_fb_regions
+            .iter()
+            .any(|r| r.start < end && start < r.end)
+        {
+            dev_warn!(
+                dev,
+                "boot display: [{start:#x}, {end:#x}) is usable VRAM, not drawing\n"
+            );
             return Err(EBUSY);
         }
         if display.format.bits_per_pixel != 32 {
-            dev_info!(dev, "boot display: {} bpp not supported by the test pattern\n",
-                display.format.bits_per_pixel);
+            dev_info!(
+                dev,
+                "boot display: {} bpp not supported by the test pattern\n",
+                display.format.bits_per_pixel
+            );
             return Err(ENOTSUPP);
         }
 
@@ -467,7 +559,12 @@ pub(crate) mod boot_display_test {
             }
         }
 
-        dev_info!(dev, "boot display: drew test pattern ({}x{})\n", display.width, display.height);
+        dev_info!(
+            dev,
+            "boot display: drew test pattern ({}x{})\n",
+            display.width,
+            display.height
+        );
         Ok(())
     }
 }
