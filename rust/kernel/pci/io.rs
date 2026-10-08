@@ -191,6 +191,7 @@ impl<'a, const SIZE: usize> Bar<'a, SIZE> {
         pdev: &'a Device<device::Bound>,
         num: u32,
         name: &'static CStr,
+        write_combine: bool,
     ) -> Result<Self> {
         let len = pdev.resource_len(num)?;
         if len == 0 {
@@ -213,7 +214,13 @@ impl<'a, const SIZE: usize> Bar<'a, SIZE> {
         // `pdev` is valid by the invariants of `Device`.
         // `num` is checked for validity by a previous call to `Device::resource_len`.
         // `name` is always valid.
-        let ioptr: usize = unsafe { bindings::pci_iomap(pdev.as_raw(), num, 0) } as usize;
+        let ioptr: usize = unsafe {
+            if write_combine {
+                bindings::pci_iomap_wc(pdev.as_raw(), num, 0)
+            } else {
+                bindings::pci_iomap(pdev.as_raw(), num, 0)
+            }
+        } as usize;
         if ioptr == 0 {
             // SAFETY:
             // `pdev` is valid by the invariants of `Device`.
@@ -301,12 +308,25 @@ impl Device<device::Bound> {
         bar: u32,
         name: &'static CStr,
     ) -> Result<Bar<'a, SIZE>> {
-        Bar::new(self, bar, name)
+        Bar::new(self, bar, name, false)
     }
 
     /// Maps an entire PCI BAR after performing a region-request on it.
     pub fn iomap_region<'a>(&'a self, bar: u32, name: &'static CStr) -> Result<Bar<'a>> {
         self.iomap_region_sized::<0>(bar, name)
+    }
+
+    /// Maps an entire PCI BAR write-combined after performing a region-request on it.
+    ///
+    /// For BARs exposing memory rather than registers, e.g. a GPU's VRAM aperture: writes may be
+    /// merged and reordered, which makes bulk writes much faster. Use a write barrier
+    /// ([`mb(Write)`]) before others, like the device, need to see them. See
+    /// [`pci_iomap_wc()`].
+    ///
+    /// [`mb(Write)`]: crate::sync::barrier::mb
+    /// [`pci_iomap_wc()`]: srctree/drivers/pci/iomap.c
+    pub fn iomap_region_wc<'a>(&'a self, bar: u32, name: &'static CStr) -> Result<Bar<'a>> {
+        Bar::new(self, bar, name, true)
     }
 
     /// Returns the size of configuration space.
