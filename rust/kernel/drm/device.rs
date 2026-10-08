@@ -189,7 +189,7 @@ impl<T: drm::Driver> UnregisteredDevice<T> {
         dumb_map_offset: T::Object::ALLOC_OPS.dumb_map_offset,
 
         show_fdinfo: None,
-        fbdev_probe: T::FBDEV_PROBE,
+        fbdev_probe: T::Object::ALLOC_OPS.fbdev_probe,
 
         major: T::INFO.major,
         minor: T::INFO.minor,
@@ -288,10 +288,7 @@ pub struct Device<T: drm::Driver, C: DeviceContext = Normal> {
 }
 
 impl<T: drm::Driver, C: DeviceContext> Device<T, C> {
-    /// Returns a raw pointer to the `struct drm_device`.
-    ///
-    /// Public so drivers can call C KMS functions that have no Rust abstraction yet.
-    pub fn as_raw(&self) -> *mut bindings::drm_device {
+    pub(crate) fn as_raw(&self) -> *mut bindings::drm_device {
         self.dev.get()
     }
 
