@@ -181,6 +181,11 @@ impl<'gpu> GpuMm<'gpu> {
         Ok(())
     }
 
+    /// Reads the word of VRAM at `addr`, which must be 4-byte aligned.
+    pub(crate) fn read_vram(&mut self, addr: VramAddress) -> Result<u32> {
+        Ok(self.pramin_mut().window_at::<u32>(addr)?.view().read_val())
+    }
+
     /// Writes `words` to the VRAM at `addr`, which must be 4-byte aligned.
     pub(crate) fn write_vram(&mut self, addr: VramAddress, words: &[u32]) -> Result {
         /// Number of words written per PRAMIN access.

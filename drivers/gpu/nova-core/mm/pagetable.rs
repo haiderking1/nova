@@ -55,6 +55,16 @@ impl From<Architecture> for MmuVersion {
     }
 }
 
+impl MmuVersion {
+    /// Returns the number of entries of the root page directory of an address space.
+    pub(crate) fn pdb_entries(self) -> usize {
+        match self {
+            Self::V2 => MmuV2::entries_per_page(PageTableLevel::Pdb),
+            Self::V3 => MmuV3::entries_per_page(PageTableLevel::Pdb),
+        }
+    }
+}
+
 /// Page Table Level hierarchy for MMU v2/v3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PageTableLevel {

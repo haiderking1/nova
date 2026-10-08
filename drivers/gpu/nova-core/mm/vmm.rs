@@ -32,6 +32,7 @@ use crate::{
         GpuMm,
         Pfn,
         Vfn,
+        VirtualAddress,
         VramAddress,
         PAGE_SIZE, //
     },
@@ -66,6 +67,13 @@ pub(crate) struct MappedRange {
     pub(super) num_pages: usize,
     /// Logs a warning if dropped without unmapping.
     _drop_guard: MustUnmapGuard,
+}
+
+impl MappedRange {
+    /// Returns the virtual address the mapping starts at.
+    pub(crate) fn start(&self) -> VirtualAddress {
+        VirtualAddress::from(self.vfn_start)
+    }
 }
 
 /// Guard that logs a warning if a [`PreparedMapping`] is dropped without
@@ -193,6 +201,19 @@ impl Vmm {
         };
 
         Ok(Vfn::new(start_vfn.into_safe_cast()))
+    }
+
+    /// Keeps the page-aligned virtual addresses of `range` from being allocated, e.g. to leave
+    /// the first addresses unmapped so that null pointers fault.
+    pub(crate) fn reserve(&self, range: Range<u64>) -> Result {
+        let page_size: u64 = PAGE_SIZE.into_safe_cast();
+        if range.start % page_size != 0 || range.end % page_size != 0 || range.start >= range.end {
+            return Err(EINVAL);
+        }
+        let start: usize = (range.start / page_size).into_safe_cast();
+        let end: usize = (range.end / page_size).into_safe_cast();
+
+        Ok(self.virt_alloc.insert_range(start..end, (), GFP_KERNEL)?)
     }
 
     /// Free a virtual frame number range back to the maple tree.
