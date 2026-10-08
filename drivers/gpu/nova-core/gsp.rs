@@ -30,19 +30,19 @@ mod sequencer;
 
 pub use fw::rm::ConnectorType;
 pub(crate) use fw::{
-    disp,
-    fifo,
+    disp, fifo,
     rm::{
         ChannelMemory,
         ContextBufferInfo,
+        DpLinkConfig,
         EngineInfo,
         GrContextBuffer,
         PromoteEntry,
         ServerReservedLevel,
         DISP_PUSHBUFFER_SIZE,
-        RM_SERVER_VA,
         GR_CONTEXT_BUFFERS,
         GR_UNRESTRICTED_PRIV_ACCESS_MAP, //
+        RM_SERVER_VA,
     },
 };
 pub(crate) use fw::{

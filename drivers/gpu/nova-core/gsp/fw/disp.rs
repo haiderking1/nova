@@ -28,6 +28,82 @@ pub(crate) mod core_c67d {
 
     /// Sets the context DMA of the notifier written on the next update.
     pub(crate) const SET_CONTEXT_DMA_NOTIFIER: u32 = bindings::NVC67D_SET_CONTEXT_DMA_NOTIFIER;
+    /// Cursor channels the next update waits for.
+    pub(crate) const SET_INTERLOCK_FLAGS: u32 = bindings::NVC67D_SET_INTERLOCK_FLAGS;
+    /// Window channels the next update waits for, one bit per window.
+    pub(crate) const SET_WINDOW_INTERLOCK_FLAGS: u32 = bindings::NVC67D_SET_WINDOW_INTERLOCK_FLAGS;
+    /// Makes the methods sent since the last update take effect.
+    pub(crate) const UPDATE: u32 = bindings::NVC67D_UPDATE;
+    /// [`UPDATE`] releasing the methods to the display engine.
+    pub(crate) const UPDATE_RELEASE: u32 = bindings::NVC67D_UPDATE_RELEASE_ELV_TRUE;
+
+    // The following methods take the index of a head: bindgen can't translate their
+    // function-like macros, so they are defined here, after `clc67d.h`. Positions are X in bits
+    // 14:0 and Y in bits 30:16.
+
+    /// Output of head `head`: sync polarities in bits 2 (horizontal) and 3 (vertical), negative
+    /// if set (`NVC67D_HEAD_SET_CONTROL_OUTPUT_RESOURCE`).
+    pub(crate) const fn head_set_control_output_resource(head: u32) -> u32 {
+        0x2004 + head * 0x400
+    }
+
+    /// Pixel clock of head `head`, in Hz in bits 30:0 (`NVC67D_HEAD_SET_PIXEL_CLOCK_FREQUENCY`).
+    pub(crate) const fn head_set_pixel_clock_frequency(head: u32) -> u32 {
+        0x200c + head * 0x400
+    }
+
+    /// Control of SOR `sor`: the heads it is driven by in bits 7:0, its protocol in bits 11:8
+    /// (`NVC67D_SOR_SET_CONTROL`).
+    pub(crate) const fn sor_set_control(sor: u32) -> u32 {
+        0x300 + sor * 0x20
+    }
+
+    /// Number of SORs.
+    pub(crate) const SORS: u32 = 4;
+
+    /// RM display ID of the display head `head` drives (`NVC67D_HEAD_SET_DISPLAY_ID`, index 0),
+    /// which GSP-RM programs the output of the head for.
+    pub(crate) const fn head_set_display_id(head: u32) -> u32 {
+        0x2020 + head * 0x400
+    }
+
+    /// Pixel clock configuration of head `head` (`NVC67D_HEAD_SET_PIXEL_CLOCK_CONFIGURATION`).
+    pub(crate) const fn head_set_pixel_clock_configuration(head: u32) -> u32 {
+        0x201c + head * 0x400
+    }
+
+    /// Highest pixel clock of head `head`, in Hz in bits 30:0
+    /// (`NVC67D_HEAD_SET_PIXEL_CLOCK_FREQUENCY_MAX`).
+    pub(crate) const fn head_set_pixel_clock_frequency_max(head: u32) -> u32 {
+        0x2028 + head * 0x400
+    }
+
+    /// Total width and height of the raster of head `head` (`NVC67D_HEAD_SET_RASTER_SIZE`).
+    pub(crate) const fn head_set_raster_size(head: u32) -> u32 {
+        0x2064 + head * 0x400
+    }
+
+    /// End of the sync pulse of head `head` (`NVC67D_HEAD_SET_RASTER_SYNC_END`).
+    pub(crate) const fn head_set_raster_sync_end(head: u32) -> u32 {
+        0x2068 + head * 0x400
+    }
+
+    /// End of blanking of head `head` (`NVC67D_HEAD_SET_RASTER_BLANK_END`).
+    pub(crate) const fn head_set_raster_blank_end(head: u32) -> u32 {
+        0x206c + head * 0x400
+    }
+
+    /// Start of blanking of head `head` (`NVC67D_HEAD_SET_RASTER_BLANK_START`).
+    pub(crate) const fn head_set_raster_blank_start(head: u32) -> u32 {
+        0x2070 + head * 0x400
+    }
+
+    /// Start and end of the second vertical blanking of interlaced rasters of head `head`, in bits
+    /// 14:0 and 30:16. The method follows [`head_set_raster_blank_start`]; `clc67d.h` doesn't name
+    /// it, nouveau writes it raw.
+    pub(crate) const fn head_set_raster_vert_blank2(head: u32) -> u32 {
+        0x2074 + head * 0x400
+    }
 }
 
 /// Methods of the GA10x window channel (`NVC67E_WINDOW_CHANNEL_DMA`, `clc67e.h`).

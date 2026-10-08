@@ -30,6 +30,7 @@ use super::{
         InternalHandles,
         Surface, //
     },
+    mode::HeadRaster,
 };
 
 mod ga102;
@@ -109,6 +110,24 @@ pub(crate) trait DisplayHal: Sync {
     /// Acknowledges the vblank interrupts pending, and returns the heads they are of, one bit per
     /// head.
     fn take_vblanks(&self, bar: Bar0<'_>) -> u32;
+
+    /// Pushes the core channel methods giving head `head` the raster `raster`, driving the display
+    /// `display_id` (an RM display ID) on the output it has. The head keeps its output and the
+    /// windows it shows: only its timings change.
+    fn push_head_mode(
+        &self,
+        bar: Bar0<'_>,
+        push: &mut PushBuffer<'_>,
+        head: u32,
+        display_id: u32,
+        raster: &HeadRaster,
+    ) -> Result;
+
+    /// Pushes a core channel update without a notifier, which doesn't wait for other channels.
+    fn push_core_update(&self, bar: Bar0<'_>, push: &mut PushBuffer<'_>) -> Result;
+
+    /// Returns the raster head `head` scans out with, as the core channel has it armed.
+    fn armed_raster(&self, bar: Bar0<'_>, head: u32) -> Option<HeadRaster>;
 
     /// Logs the parts of the armed state of the core channel that taking over head 0 and window
     /// `window` depends on.

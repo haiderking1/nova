@@ -11,6 +11,7 @@ mod channel;
 mod engine;
 pub(crate) mod hal;
 mod instmem;
+mod mode;
 mod regs;
 mod scanout;
 #[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
@@ -22,10 +23,11 @@ pub(crate) use engine::{
     InternalHandles,
     Surface, //
 };
+pub use mode::ModeTimings;
 pub(crate) use scanout::Scanout;
 pub use scanout::ScanoutMode;
-pub(crate) use vblank::VblankHandlerSlot;
 pub use vblank::VblankHandler;
+pub(crate) use vblank::VblankHandlerSlot;
 
 use kernel::{
     device,
@@ -47,13 +49,14 @@ use crate::gsp::{
             DispGetConnectorType,
             DispGetEdid,
             DispGetNumHeads,
+            DpGetLinkConfig,
             RmAlloc,
             RmControl,
             RmFree, //
         },
         device::RmDevice,
     },
-    ConnectorType,
+    ConnectorType, DpLinkConfig,
 };
 
 /// Handle of the display common object, after its class. The caller of an allocation picks the
@@ -63,6 +66,13 @@ const DISPLAY_COMMON_HANDLE: u32 = 0x0073_0000;
 /// A display, i.e. a display output path of the display engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DisplayId(u32);
+
+impl DisplayId {
+    /// Returns the RM display ID: a single bit set.
+    pub(crate) fn into_raw(self) -> u32 {
+        self.0
+    }
+}
 
 /// The display engine, through the RM object allocated to query and control it.
 ///
@@ -148,6 +158,19 @@ impl Display {
             DispGetConnectorType::new(display.0),
         )
         .send(dev, cmdq)?)
+    }
+
+    /// Returns the configuration of the link of `display`, which must be a DisplayPort display.
+    pub(crate) fn dp_link_config(
+        &self,
+        dev: &device::Device,
+        cmdq: &Cmdq<'_>,
+        display: DisplayId,
+    ) -> Result<DpLinkConfig> {
+        Ok(
+            RmControl::new(self.client, self.common, DpGetLinkConfig::new(display.0))
+                .send(dev, cmdq)?,
+        )
     }
 
     /// Reads the EDID of `display` from the connected monitor, or returns the copy GSP-RM cached

@@ -44,8 +44,10 @@ use super::{
         channel::PushBuffer,
         engine::{
             armed,
+            assembly,
             InternalHandles, //
         },
+        mode::HeadRaster,
         regs,
     },
     DisplayHal,
@@ -230,16 +232,121 @@ impl DisplayHal for Ga102 {
         heads
     }
 
+    fn push_head_mode(
+        &self,
+        bar: Bar0<'_>,
+        push: &mut PushBuffer<'_>,
+        head: u32,
+        display_id: u32,
+        raster: &HeadRaster,
+    ) -> Result {
+        use core_c67d::*;
+
+        // Like NVIDIA's driver on each head enable (`nvkms-evo.c`): the SORs the head drives keep
+        // their control, sent again, and GSP-RM is told the display the head drives, which it
+        // programs the output for in the modeset's supervisor steps.
+        let head_bit = 1u32.checked_shl(head).ok_or(EINVAL)?;
+        for sor in 0..SORS {
+            let method = sor_set_control(sor);
+            if let Some(control) = armed(bar, usize::try_from(method)?) {
+                if control & 0xff & head_bit != 0 {
+                    push.push(bar, method, &[control])?;
+                }
+            }
+        }
+        push.push(bar, head_set_display_id(head), &[display_id])?;
+
+        let position = |(x, y): (u16, u16)| u32::from(x) | u32::from(y) << 16;
+        // The output stays as it is but for the sync polarities, in bits 2 and 3.
+        let output = armed(
+            bar,
+            usize::try_from(head_set_control_output_resource(head))?,
+        )
+        .ok_or(EINVAL)?;
+        let output = output & !0b1100
+            | u32::from(raster.sync_negative.0) << 2
+            | u32::from(raster.sync_negative.1) << 3;
+
+        push.push(bar, head_set_control_output_resource(head), &[output])?;
+        push.push(
+            bar,
+            head_set_pixel_clock_frequency(head),
+            &[raster.pixel_clock],
+        )?;
+        // Not driver-managed, no spread spectrum.
+        push.push(bar, head_set_pixel_clock_configuration(head), &[0])?;
+        push.push(
+            bar,
+            head_set_pixel_clock_frequency_max(head),
+            &[raster.pixel_clock],
+        )?;
+        push.push(
+            bar,
+            head_set_raster_size(head),
+            &[
+                position(raster.total),
+                position(raster.sync_end),
+                position(raster.blank_end),
+                position(raster.blank_start),
+            ],
+        )?;
+        // No second vertical blanking, as for progressive rasters in nouveau.
+        push.push(bar, head_set_raster_vert_blank2(head), &[1])
+    }
+
+    fn push_core_update(&self, bar: Bar0<'_>, push: &mut PushBuffer<'_>) -> Result {
+        use core_c67d::*;
+
+        push.push(bar, SET_CONTEXT_DMA_NOTIFIER, &[0])?;
+        push.push(bar, SET_INTERLOCK_FLAGS, &[0])?;
+        push.push(bar, SET_WINDOW_INTERLOCK_FLAGS, &[0])?;
+        push.push(bar, UPDATE, &[UPDATE_RELEASE])
+    }
+
+    fn armed_raster(&self, bar: Bar0<'_>, head: u32) -> Option<HeadRaster> {
+        use core_c67d::*;
+
+        let read = |method: u32| armed(bar, usize::try_from(method).ok()?);
+        // CAST: positions are 15-bit fields.
+        let position = |value: u32| ((value & 0x7fff) as u16, (value >> 16 & 0x7fff) as u16);
+
+        Some(HeadRaster {
+            total: position(read(head_set_raster_size(head))?),
+            sync_end: position(read(head_set_raster_sync_end(head))?),
+            blank_end: position(read(head_set_raster_blank_end(head))?),
+            blank_start: position(read(head_set_raster_blank_start(head))?),
+            pixel_clock: read(head_set_pixel_clock_frequency(head))? & 0x7fff_ffff,
+            sync_negative: {
+                let output = read(head_set_control_output_resource(head))?;
+                (output & 1 << 2 != 0, output & 1 << 3 != 0)
+            },
+        })
+    }
+
     fn log_armed_state(&self, dev: &device::Device, bar: Bar0<'_>, window: usize) {
+        // What the first core update would change is logged too: it arms all of the assembly
+        // state.
         let log = |name: &str, method: usize| {
+            let pending = assembly(bar, method);
             if let Some(value) = armed(bar, method) {
-                dev_dbg!(
-                    dev,
-                    "display: armed {} ({:#06x}) = {:#010x}\n",
-                    name,
-                    method,
-                    value
-                );
+                if pending.is_some_and(|pending| pending != value) {
+                    dev_info!(
+                        dev,
+                        "display: armed {} ({:#06x}) = {:#010x}, assembly {:#010x?}\n",
+                        name,
+                        method,
+                        value,
+                        pending
+                    );
+                } else {
+                    dev_dbg!(
+                        dev,
+                        "display: armed {} ({:#06x}) = {:#010x}\n",
+                        name,
+                        method,
+                        value
+                    );
+                }
             }
         };
 

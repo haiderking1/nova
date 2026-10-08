@@ -38,6 +38,7 @@ use crate::{
         DisplayEngine,
         DisplayId,
         InternalHandles,
+        ModeTimings,
         Scanout,
         ScanoutMode,
         VblankHandler,
@@ -886,6 +887,13 @@ impl<'gpu> Gpu<'gpu> {
             engine.windows()
         );
 
+        if let Some(output) = *this.boot_output {
+            match display.dp_link_config(pdev.as_ref(), &gsp_resources.gsp.cmdq, output) {
+                Ok(link) => dev_info!(pdev, "display: boot display DP link: {:?}\n", link),
+                Err(e) => dev_dbg!(pdev, "display: no DP link for the boot display: {:?}\n", e),
+            }
+        }
+
         #[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
         if let Some(boot) = this.boot_display.as_ref() {
             // A copy channel for the GPU to fill the test surface.
@@ -1009,6 +1017,26 @@ impl<'gpu> Gpu<'gpu> {
         let hal = display::hal::display_hal(self.spec.chipset).ok_or(ENOTSUPP)?;
 
         hal.set_vblank_interrupt(self.gsp_resources.bar, usize::try_from(head)?, enable)
+    }
+
+    /// Has head `head` scan out `mode`, at the resolution it has, and returns once it does.
+    /// Returns whether the head had another mode.
+    pub(crate) fn set_mode(&self, head: u32, mode: &ModeTimings) -> Result<bool> {
+        let dev = self.gsp_resources.device.as_ref();
+        // The head drives the boot display: Nova can't drive others yet.
+        let display = self.boot_output.ok_or(ENODEV)?;
+        let mut output = self.display_engine.lock();
+        let output = Option::as_mut(&mut output).ok_or(ENODEV)?;
+
+        let changed = output
+            .engine
+            .set_mode(self.gsp_resources.bar, head, display.into_raw(), mode)
+            .inspect_err(|e| dev_err!(dev, "display: can't set head {}'s mode: {:?}\n", head, e))?;
+        if changed {
+            dev_info!(dev, "display: head {} switched to {:?}\n", head, mode);
+        }
+
+        Ok(changed)
     }
 
     /// Sets the handler that the vblanks of the heads whose vblank interrupt is enabled are passed

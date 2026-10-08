@@ -33,6 +33,8 @@ pub(crate) enum RmControlMsgFunction {
     DispSystemGetActive = bindings::NV0073_CTRL_CMD_SYSTEM_GET_ACTIVE,
     /// Get the connector data of a display.
     DispSpecificGetConnectorData = bindings::NV0073_CTRL_CMD_SPECIFIC_GET_CONNECTOR_DATA,
+    /// Get the link configuration of a DisplayPort display.
+    DispDpGetLinkConfig = bindings::NV0073_CTRL_CMD_DP_GET_LINK_CONFIG,
     /// Get the EDID of a display.
     DispSpecificGetEdidV2 = bindings::NV0073_CTRL_CMD_SPECIFIC_GET_EDID_V2,
     /// Get the static configuration of the display engine.
@@ -79,6 +81,7 @@ impl TryFrom<u32> for RmControlMsgFunction {
                 Ok(Self::DispSpecificGetConnectorData)
             }
             bindings::NV0073_CTRL_CMD_SPECIFIC_GET_EDID_V2 => Ok(Self::DispSpecificGetEdidV2),
+            bindings::NV0073_CTRL_CMD_DP_GET_LINK_CONFIG => Ok(Self::DispDpGetLinkConfig),
             bindings::NV2080_CTRL_CMD_INTERNAL_DISPLAY_GET_STATIC_INFO => {
                 Ok(Self::InternalDisplayGetStaticInfo)
             }
@@ -455,6 +458,47 @@ unsafe impl FromBytes for DispGetConnectorDataParams {}
 
 // SAFETY: This struct contains no padding.
 unsafe impl AsBytes for DispGetConnectorDataParams {}
+
+/// Configuration of a DisplayPort link.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DpLinkConfig {
+    /// Number of lanes.
+    pub(crate) lanes: u32,
+    /// Rate of each lane, in units of 270 Mb/s (`NV0073_CTRL_CMD_DP_GET_LINK_CONFIG_LINK_BW_*`,
+    /// like the DPCD `LINK_BW_SET` register): 0x0a for HBR, 0x14 for HBR2, 0x1e for HBR3.
+    pub(crate) link_bw: u32,
+}
+
+/// Wrapper for [`bindings::NV0073_CTRL_DP_GET_LINK_CONFIG_PARAMS`].
+#[repr(transparent)]
+pub(crate) struct DpGetLinkConfigParams(bindings::NV0073_CTRL_DP_GET_LINK_CONFIG_PARAMS);
+
+impl DpGetLinkConfigParams {
+    /// Creates the parameters to query the link configuration of `display_id` on subdevice 0.
+    pub(crate) fn new(display_id: u32) -> Self {
+        Self(bindings::NV0073_CTRL_DP_GET_LINK_CONFIG_PARAMS {
+            displayId: display_id,
+            ..Default::default()
+        })
+    }
+
+    /// Returns the link configuration.
+    pub(crate) fn config(&self) -> DpLinkConfig {
+        DpLinkConfig {
+            // `NV0073_CTRL_CMD_DP_GET_LINK_CONFIG_LANE_COUNT` is bits 3:0. `_LINK_BW` is said to
+            // be bits 3:0 too, but its values (`_LINK_BW_8_10GBPS` is 0x1e) need more: the whole
+            // value is taken.
+            lanes: self.0.laneCount & 0xf,
+            link_bw: self.0.linkBW,
+        }
+    }
+}
+
+// SAFETY: This struct only contains integer types for which all bit patterns are valid.
+unsafe impl FromBytes for DpGetLinkConfigParams {}
+
+// SAFETY: This struct contains no padding.
+unsafe impl AsBytes for DpGetLinkConfigParams {}
 
 /// Wrapper for [`bindings::NV0073_CTRL_SPECIFIC_GET_EDID_V2_PARAMS`].
 #[repr(transparent)]

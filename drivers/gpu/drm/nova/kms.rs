@@ -37,7 +37,8 @@ use kernel::{
             },
             crtc::{
                 self,
-                DriverCrtcState, //
+                DriverCrtcState,
+                RawCrtcState, //
             },
             encoder,
             modes::{
@@ -81,6 +82,7 @@ use kernel::{
 
 use nova_core::api::{
     ConnectorType,
+    ModeTimings,
     NovaCoreApi,
     ScanoutMode,
     VblankHandler, //
@@ -212,6 +214,27 @@ pub(crate) fn with_api<R>(
     let registered = drm.registration_guard().ok_or(ENODEV)?;
 
     registered.registration_data_with(|reg| reg.api.with(|api| f(&api)))
+}
+
+/// Returns the timings of `mode`, which must be progressive.
+fn mode_timings(mode: &DisplayMode) -> Result<ModeTimings> {
+    if !mode.is_progressive() {
+        return Err(EINVAL);
+    }
+
+    Ok(ModeTimings {
+        clock_khz: u32::try_from(mode.clock())?,
+        hsync_negative: mode.negative_hsync(),
+        vsync_negative: mode.negative_vsync(),
+        hdisplay: mode.hdisplay(),
+        hsync_start: mode.hsync_start(),
+        hsync_end: mode.hsync_end(),
+        htotal: mode.htotal(),
+        vdisplay: mode.vdisplay(),
+        vsync_start: mode.vsync_start(),
+        vsync_end: mode.vsync_end(),
+        vtotal: mode.vtotal(),
+    })
 }
 
 /// Returns the head showing nova-core's scanout, which the CRTC's vblanks are those of.
@@ -489,6 +512,21 @@ impl crtc::DriverCrtc for NovaCrtc {
     fn atomic_enable(commit: crtc::CrtcAtomicCommit<'_, Self>) {
         let crtc = commit.crtc();
         let drm = crtc.drm_dev();
+        let new_state = commit.take_new_state();
+
+        // The resolution stays the firmware's: only the timings, e.g. the refresh rate, change.
+        let mode = new_state.adjusted_mode();
+        let set = scanout_head(drm).and_then(|head| {
+            let timings = mode_timings(mode)?;
+            with_api(drm, |api| api.set_mode(head, &timings))
+        });
+        pr_info!(
+            "enabling {}x{}@{}: mode changed {:?}\n",
+            mode.hdisplay(),
+            mode.vdisplay(),
+            mode.vrefresh(),
+            set
+        );
 
         // Without vblank interrupts, DRM completes commits without vblanks.
         let registered = scanout_head(drm).and_then(|head| {

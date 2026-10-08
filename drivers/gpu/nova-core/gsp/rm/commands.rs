@@ -1045,3 +1045,22 @@ rm_control!(
     Option<u32>,
     |p| p.display_vector()
 );
+
+/// RM control command for querying the configuration of the link of a DisplayPort display.
+pub(crate) struct DpGetLinkConfig(DpGetLinkConfigParams);
+
+impl DpGetLinkConfig {
+    /// Creates the command for `display_id`.
+    pub(crate) fn new(display_id: u32) -> Self {
+        Self(DpGetLinkConfigParams::new(display_id))
+    }
+}
+
+rm_control!(
+    DpGetLinkConfig,
+    DisplayCommon,
+    DispDpGetLinkConfig,
+    DpGetLinkConfigParams,
+    DpLinkConfig,
+    |p| p.config()
+);

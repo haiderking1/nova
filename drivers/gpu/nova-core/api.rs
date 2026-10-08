@@ -17,6 +17,7 @@ use kernel::{
 
 pub use crate::{
     display::{
+        ModeTimings,
         ScanoutMode,
         VblankHandler, //
     },
@@ -125,6 +126,13 @@ impl NovaCoreApi<'_> {
     /// interrupt.
     pub fn set_vblank_interrupt(&self, head: u32, enable: bool) -> Result {
         self.gpu.set_vblank_interrupt(head, enable)
+    }
+
+    /// Has head `head` scan out `mode`, and returns once it does: whether the head had another
+    /// mode. Only the timings may change, not the resolution: the head keeps showing nova-core's
+    /// scanout.
+    pub fn set_mode(&self, head: u32, mode: &ModeTimings) -> Result<bool> {
+        self.gpu.set_mode(head, mode)
     }
 
     /// Sets the handler of vblanks, replacing any, or removes it with `None`.

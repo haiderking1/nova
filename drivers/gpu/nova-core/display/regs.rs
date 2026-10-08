@@ -76,3 +76,40 @@ register! {
         1:1     last_data => bool;
     }
 }
+
+register! {
+    base: NovaRegisters;
+
+    /// Assembly state of the core channel: the values of its methods the next update makes take
+    /// effect, each at the offset of its method (`NV_UDISP_FE_CHN_ASSY_BASEADR_CORE`). The first
+    /// words, below the core channel's first method, are the PUT and GET pointers.
+    pub(super) NV_UDISP_CORE_ASSEMBLY(u32)[0x2000] @ 0x00680000 {
+        31:0    value;
+    }
+}
+
+// Exceptions of the display channels (`gv100_disp_exception()` in nouveau), one slot per channel:
+// the core channel's is 0, window `w`'s is `w + 1`. GSP-RM services and clears them; Nova only
+// reads them, to report why an update failed.
+
+register! {
+    base: NovaRegisters;
+
+    /// The exception of a channel: the method it happened on, and why.
+    pub(super) NV_PDISP_FE_EXCEPT(u32)[33, stride = 12] @ 0x00611020 {
+        /// Offset of the method, in 32-bit words.
+        11:0    method;
+        /// Reason of the exception.
+        14:12   reason;
+    }
+
+    /// Data of the method an exception happened on.
+    pub(super) NV_PDISP_FE_EXCEPTARG(u32)[33, stride = 12] @ 0x00611024 {
+        31:0    data;
+    }
+
+    /// Error code of an exception.
+    pub(super) NV_PDISP_FE_EXCEPTERR(u32)[33, stride = 12] @ 0x00611028 {
+        31:0    code;
+    }
+}

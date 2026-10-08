@@ -61,6 +61,10 @@ use super::{
         WindowImage, //
     },
     instmem::InstMem,
+    mode::{
+        HeadRaster,
+        ModeTimings, //
+    },
     regs,
     Display, //
 };
@@ -88,6 +92,8 @@ const NOTIFIER_SLOTS: usize = 2;
 /// Number of 32-bit words of a notifier.
 const NOTIFIER_SLOT_WORDS: usize = num::u32_as_usize(notifier::SIZE) / size_of::<u32>();
 static_assert!(NOTIFIER_SLOTS * NOTIFIER_SLOT_WORDS <= NOTIFIER_WORDS);
+/// How long a core update may take to finish: a modeset, which takes a few frames.
+const MODESET_TIMEOUT: Delta = Delta::from_secs(2);
 
 /// How long an update may take to begin: a frame, even at the lowest refresh rates, with margin.
 const UPDATE_TIMEOUT: Delta = Delta::from_millis(500);
@@ -245,9 +251,78 @@ impl<'a> DisplayEngine<'a> {
         let channels = self.channels.as_mut().ok_or(ENODEV)?;
         channels.show(bar, surface)
     }
+
+    /// Has head `head` scan out `mode`, keeping its output and what it shows, and returns once
+    /// the display engine switched to it. Returns whether the head had another mode.
+    ///
+    /// The head must keep its resolution: only its timings change.
+    pub(crate) fn set_mode(
+        &mut self,
+        bar: Bar0<'_>,
+        head: u32,
+        display_id: u32,
+        mode: &ModeTimings,
+    ) -> Result<bool> {
+        let channels = self.channels.as_mut().ok_or(ENODEV)?;
+        let raster = HeadRaster::new(mode)?;
+        let armed = channels.hal.armed_raster(bar, head).ok_or(EINVAL)?;
+        if armed == raster {
+            return Ok(false);
+        }
+        // The window and the head's viewport keep their size.
+        if (
+            armed.blank_start.0 - armed.blank_end.0,
+            armed.blank_start.1 - armed.blank_end.1,
+        ) != (
+            raster.blank_start.0 - raster.blank_end.0,
+            raster.blank_start.1 - raster.blank_end.1,
+        ) {
+            return Err(ENOTSUPP);
+        }
+
+        channels.set_mode(bar, head, display_id, &raster)?;
+        Ok(true)
+    }
 }
 
 impl<'a> Channels<'a> {
+    /// Gives head `head`, driving the display `display_id`, the raster `raster` with a core
+    /// update, and returns once the display engine uses it: once the core channel has it armed.
+    ///
+    /// GSP-RM carries out the supervisor steps of the modeset that the update starts: the pixel
+    /// clock, the output and the DisplayPort stream follow the new raster.
+    fn set_mode(
+        &mut self,
+        bar: Bar0<'_>,
+        head: u32,
+        display_id: u32,
+        raster: &HeadRaster,
+    ) -> Result {
+        let hal = self.hal;
+        let push = &mut self.core_push;
+
+        hal.push_head_mode(bar, push, head, display_id, raster)?;
+        hal.push_core_update(bar, push)?;
+        push.kick(bar)?;
+
+        read_poll_timeout(
+            || Ok(hal.armed_raster(bar, head)),
+            |armed| armed.as_ref() == Some(raster),
+            Delta::from_micros(100),
+            MODESET_TIMEOUT,
+        )
+        .map(|_| ())
+        .inspect_err(|_| {
+            dev_err!(
+                self.dev,
+                "display: core update not armed, core channel GET {:#x}\n",
+                self.core_push.get(bar)
+            );
+            log_exception(self.dev, bar, 0);
+            log_exception(self.dev, bar, WINDOW + 1);
+        })
+    }
+
     #[expect(clippy::too_many_arguments)]
     fn new(
         dev: &'a device::Device<device::Bound>,
@@ -388,11 +463,41 @@ impl<'a> Channels<'a> {
         .inspect_err(|_| {
             dev_err!(
                 self.dev,
-                "display: window update didn't begin, notifier {:#010x?}\n",
+                "display: window update didn't begin, notifier {:x?}\n",
                 read_status().ok()
             )
         })
     }
+}
+
+/// Logs the exception of display channel `chid`, if it has one.
+fn log_exception(dev: &device::Device, bar: Bar0<'_>, chid: usize) {
+    let (Some(except), Some(arg), Some(err)) = (
+        regs::NV_PDISP_FE_EXCEPT::try_at(chid),
+        regs::NV_PDISP_FE_EXCEPTARG::try_at(chid),
+        regs::NV_PDISP_FE_EXCEPTERR::try_at(chid),
+    ) else {
+        return;
+    };
+    let except = bar.read(except);
+
+    dev_err!(
+        dev,
+        "display: channel {} exception {:#010x}: reason {}, method {:#06x}, data {:#010x}, code {:#010x}\n",
+        chid,
+        except.into_raw(),
+        except.reason().get(),
+        except.method().get() << 2,
+        bar.read(arg).into_raw(),
+        bar.read(err).into_raw()
+    );
+}
+
+/// Returns the assembly value of the core channel method at `method`: the value its next update
+/// arms.
+pub(super) fn assembly(bar: Bar0<'_>, method: usize) -> Option<u32> {
+    let reg = regs::NV_UDISP_CORE_ASSEMBLY::try_at(method / size_of::<u32>())?;
+    Some(bar.read(reg).into_raw())
 }
 
 /// Returns the armed value of the core channel method at `method`.
