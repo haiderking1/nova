@@ -324,6 +324,17 @@ impl<T: DriverPlane> Plane<T, KmsProbe> {
         // SAFETY: We just allocated the plane above, so this pointer must be valid
         Ok(unsafe { &*this })
     }
+
+    /// Enables the `FB_DAMAGE_CLIPS` property of this [`Plane`].
+    ///
+    /// With it, userspace can tell which parts of the framebuffer changed in an atomic commit, which
+    /// [`PlaneStateMutator::damage`] then reports instead of the whole plane. Drivers that only
+    /// update the damaged parts of the display should enable it.
+    pub fn enable_fb_damage_clips(&self) {
+        // SAFETY: `self.as_raw()` is a valid, initialized `struct drm_plane`. The device is still
+        // being probed, so the plane is not registered yet and properties may be attached to it.
+        unsafe { bindings::drm_plane_enable_fb_damage_clips(self.as_raw()) }
+    }
 }
 
 /// A trait implemented by any type that acts as a [`struct drm_plane`] interface.
