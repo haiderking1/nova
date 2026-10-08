@@ -3,22 +3,21 @@
 //! DRM EDID.
 //!
 //! An EDID (Extended Display Identification Data) is the description a display gives of itself:
-//! its name, physical size, supported modes and so on. Drivers read it from the display (usually
-//! over DDC), wrap it in an [`Edid`] and hand it to the connector the display is plugged into.
+//! its name, physical size, supported modes and so on. DRM reads it from the display (see
+//! [`ConnectorGuard::read_edid`]) and hands it to the connector the display is plugged into.
 //!
 //! C header: [`include/drm/drm_edid.h`](srctree/include/drm/drm_edid.h)
+//!
+//! [`ConnectorGuard::read_edid`]: crate::drm::kms::connector::ConnectorGuard::read_edid
 
-use crate::{
-    bindings,
-    prelude::*, //
-};
+use crate::bindings;
 use core::ptr::NonNull;
 
 /// An EDID, as read from a display.
 ///
 /// # Invariants
 ///
-/// `ptr` points to a valid [`struct drm_edid`] allocated with `drm_edid_alloc()`, which this
+/// `ptr` points to a valid [`struct drm_edid`] allocated by DRM's EDID functions, which this
 /// object owns.
 ///
 /// [`struct drm_edid`]: srctree/include/drm/drm_edid.h
@@ -27,24 +26,19 @@ pub struct Edid {
 }
 
 impl Edid {
-    /// Creates an [`Edid`] holding a copy of the raw EDID `data`.
+    /// Takes ownership of the [`struct drm_edid`] `ptr`, as returned by DRM's EDID read and
+    /// allocation functions, or returns `None` if `ptr` is NULL.
     ///
-    /// The data is not validated here: DRM checks it when the EDID is used, and [`Edid::is_valid`]
-    /// tells whether it would accept it.
-    pub fn new(data: &[u8]) -> Result<Self> {
-        // SAFETY: `data` is valid for reads of `data.len()` bytes, which `drm_edid_alloc()` copies.
-        let ptr = unsafe { bindings::drm_edid_alloc(data.as_ptr().cast(), data.len()) };
-
-        // INVARIANT: `drm_edid_alloc()` returns either a valid `struct drm_edid` or NULL.
-        Ok(Self {
-            ptr: NonNull::new(ptr.cast_mut()).ok_or(ENOMEM)?,
-        })
-    }
-
-    /// Returns whether the EDID is valid: well formed, with valid checksums.
-    pub fn is_valid(&self) -> bool {
-        // SAFETY: `self.ptr` is a valid `struct drm_edid` by the type invariants.
-        unsafe { bindings::drm_edid_valid(self.ptr.as_ptr()) }
+    /// # Safety
+    ///
+    /// `ptr` must be NULL or point to a valid [`struct drm_edid`], to be freed with
+    /// `drm_edid_free()`, that nothing else owns.
+    ///
+    /// [`struct drm_edid`]: srctree/include/drm/drm_edid.h
+    pub(crate) unsafe fn from_raw(ptr: *const bindings::drm_edid) -> Option<Self> {
+        // INVARIANT: By the safety requirements, a non-NULL `ptr` is a valid `struct drm_edid`
+        // that we now own.
+        NonNull::new(ptr.cast_mut()).map(|ptr| Self { ptr })
     }
 
     /// Returns the raw `struct drm_edid`.
@@ -55,8 +49,7 @@ impl Edid {
 
 impl Drop for Edid {
     fn drop(&mut self) {
-        // SAFETY: `self.ptr` was allocated with `drm_edid_alloc()` and is owned by `self`, by the
-        // type invariants.
+        // SAFETY: `self.ptr` is a valid `struct drm_edid` owned by `self`, by the type invariants.
         unsafe { bindings::drm_edid_free(self.ptr.as_ptr()) };
     }
 }

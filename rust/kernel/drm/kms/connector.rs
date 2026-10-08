@@ -30,6 +30,11 @@ use crate::{
 };
 use core::{
     cell::Cell,
+    ffi::{
+        c_int,
+        c_uint,
+        c_void, //
+    },
     marker::*,
     mem::ManuallyDrop,
     ops::*,
@@ -558,6 +563,38 @@ impl<'a, T: DriverConnector> ConnectorGuard<'a, T> {
         unsafe { bindings::drm_connector_helper_get_modes_fixed(self.as_raw(), mode.as_raw()) }
     }
 
+    /// Reads the EDID of the display plugged into the underlying [`Connector`] with `read_block`,
+    /// for drivers whose DDC channel is hidden behind a device that only gives access to whole
+    /// EDID blocks.
+    ///
+    /// DRM calls `read_block(block, buf)` to fill `buf` with EDID block number `block`, for each
+    /// block the EDID announces, and retries reading blocks that are invalid. EDID overrides (from
+    /// debugfs or firmware) are applied without calling `read_block` at all.
+    ///
+    /// Returns `None` if no valid EDID could be read. This is the equivalent of
+    /// [`drm_edid_read_custom()`].
+    ///
+    /// [`drm_edid_read_custom()`]: srctree/drivers/gpu/drm/drm_edid.c
+    pub fn read_edid<F>(&self, mut read_block: F) -> Option<Edid>
+    where
+        F: FnMut(usize, &mut [u8]) -> Result,
+    {
+        // SAFETY:
+        // - We hold the locks required to call this via our type invariants.
+        // - `read_edid_block_callback::<F>` expects `context` to point to an `F`, which it does.
+        //   `read_block` outlives the call, and isn't accessed otherwise during it.
+        let ptr = unsafe {
+            bindings::drm_edid_read_custom(
+                self.as_raw(),
+                Some(read_edid_block_callback::<F>),
+                (&raw mut read_block).cast(),
+            )
+        };
+
+        // SAFETY: `drm_edid_read_custom()` returns NULL or a `struct drm_edid` owned by the caller.
+        unsafe { Edid::from_raw(ptr) }
+    }
+
     /// Updates the underlying [`Connector`] from the EDID of the display plugged into it, or
     /// resets it if `edid` is `None` (e.g. after the display was unplugged).
     ///
@@ -578,6 +615,38 @@ impl<'a, T: DriverConnector> ConnectorGuard<'a, T> {
     pub fn add_edid_modes(&self) -> i32 {
         // SAFETY: We hold the locks required to call this via our type invariants.
         unsafe { bindings::drm_edid_connector_add_modes(self.as_raw()) }
+    }
+}
+
+/// The `read_block` callback of [`ConnectorGuard::read_edid`]: reads EDID block `block` into the
+/// `len` bytes at `buf`, with the `F` that `context` points to.
+///
+/// # Safety
+///
+/// `context` must point to an `F` that is not accessed otherwise during the call, and `buf` must be
+/// valid for writes of `len` bytes.
+unsafe extern "C" fn read_edid_block_callback<F>(
+    context: *mut c_void,
+    buf: *mut u8,
+    block: c_uint,
+    len: usize,
+) -> c_int
+where
+    F: FnMut(usize, &mut [u8]) -> Result,
+{
+    // SAFETY: `context` points to an `F` that we have exclusive access to, by the safety
+    // requirements.
+    let read_block = unsafe { &mut *context.cast::<F>() };
+    // SAFETY: `buf` is valid for writes of `len` bytes, by the safety requirements.
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+
+    let Ok(block) = usize::try_from(block) else {
+        return EINVAL.to_errno();
+    };
+
+    match read_block(block, buf) {
+        Ok(()) => 0,
+        Err(err) => err.to_errno(),
     }
 }
 
