@@ -315,11 +315,78 @@ pub(crate) mod boot_display_test {
     use super::*;
     use crate::{
         boot_display::BootDisplay,
+        mm::{
+            bar_user::BarUser,
+            vmm::MappedRange, //
+        },
         num::IntoSafeCast, //
     };
 
     /// Pixels written per PRAMIN access: amortizes the window check and ordering read.
     const CHUNK: usize = 64;
+
+    /// Checks that `mapped`, the BAR1 mapping of `display`'s framebuffer, maps each page to the
+    /// right VRAM: writes a marker into every page through BAR1 and reads VRAM back through
+    /// PRAMIN. Logs the pages that map elsewhere, and for the first ones where their writes land.
+    pub(crate) fn check_bar1_mapping(
+        dev: &device::Device<device::Bound>,
+        mm: &mut GpuMm<'_>,
+        bar_user: &BarUser<'_>,
+        mapped: &MappedRange,
+        display: &BootDisplay,
+    ) -> Result {
+        // Probe an offset inside each page, away from the start.
+        const PROBE: usize = 0x40;
+
+        let num_pages = mapped.num_pages;
+        let fb_pages = usize::try_from(display.vram.end - display.vram.start)? / PAGE_SIZE;
+        let mut bad = 0;
+
+        for page in 0..num_pages.min(fb_pages) {
+            let offset = page * PAGE_SIZE + PROBE;
+            let vram = display.vram.start + u64::try_from(offset)?;
+            let marker = 0x5a00_0000 | u32::try_from(page)?;
+
+            // Restore through BAR1 what BAR1 points at, wherever that is.
+            let original = bar_user.read32(mapped, offset)?;
+            bar_user.write(mapped, offset, &marker.to_le_bytes())?;
+            // Reading back through BAR1 also flushes the posted write.
+            let via_bar1 = bar_user.read32(mapped, offset)?;
+            let in_vram = mm.pramin_mut().window_at::<u32>(vram)?.view().read_val();
+
+            if in_vram != marker {
+                if bad < 2 {
+                    // Find where the write went within the framebuffer.
+                    let mut found = None;
+                    for other in 0..fb_pages {
+                        let addr = display.vram.start + u64::try_from(other * PAGE_SIZE + PROBE)?;
+                        if mm.pramin_mut().window_at::<u32>(addr)?.view().read_val() == marker {
+                            found = Some(other);
+                            break;
+                        }
+                    }
+                    dev_warn!(
+                        dev,
+                        "boot display: BAR1 page {page} reads back {via_bar1:#x}, but VRAM page \
+                         {page} has {in_vram:#x}; the write landed in framebuffer page {found:?}\n"
+                    );
+                } else if bad < 8 {
+                    dev_warn!(dev, "boot display: BAR1 page {page} maps elsewhere\n");
+                }
+                bad += 1;
+            }
+
+            bar_user.write(mapped, offset, &original.to_le_bytes())?;
+        }
+
+        dev_info!(
+            dev,
+            "boot display: BAR1 mapping check: {} of {} pages map to the right VRAM\n",
+            num_pages.min(fb_pages) - bad,
+            num_pages.min(fb_pages)
+        );
+        Ok(())
+    }
 
     /// Returns `rgb` (8 bits per channel, `0xRRGGBB`) encoded in `format`.
     fn encode(format: &PixelFormat, rgb: u32) -> u32 {

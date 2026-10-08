@@ -108,21 +108,34 @@ impl<'a> BarUser<'a> {
         self.vmm.lock().unmap_pages(mm, mapped)
     }
 
-    /// Write `data` at `offset` into the region `mapped` maps.
-    ///
-    /// `offset` and the length of `data` must be multiples of 4.
-    pub(crate) fn write(&self, mapped: &MappedRange, offset: usize, data: &[u8]) -> Result {
+    /// Returns the BAR1 offset of `offset` within `mapped`, checking that `len` bytes from there
+    /// fit and that `offset` and `len` are multiples of 4.
+    fn mapped_offset(mapped: &MappedRange, offset: usize, len: usize) -> Result<usize> {
         let size = mapped.num_pages.checked_mul(PAGE_SIZE).ok_or(EOVERFLOW)?;
-        let end = offset.checked_add(data.len()).ok_or(EOVERFLOW)?;
-        if end > size || offset % 4 != 0 || data.len() % 4 != 0 {
+        let end = offset.checked_add(len).ok_or(EOVERFLOW)?;
+        if end > size || offset % 4 != 0 || len % 4 != 0 {
             return Err(EINVAL);
         }
 
         let base_vfn: usize = mapped.vfn_start.raw().into_safe_cast();
-        let base = base_vfn
+        base_vfn
             .checked_mul(PAGE_SIZE)
             .and_then(|base| base.checked_add(offset))
-            .ok_or(EOVERFLOW)?;
+            .ok_or(EOVERFLOW)
+    }
+
+    /// Read the 32-bit value at `offset` in the region `mapped` maps.
+    pub(crate) fn read32(&self, mapped: &MappedRange, offset: usize) -> Result<u32> {
+        let base = Self::mapped_offset(mapped, offset, 4)?;
+
+        self.bar1.try_read32(base)
+    }
+
+    /// Write `data` at `offset` into the region `mapped` maps.
+    ///
+    /// `offset` and the length of `data` must be multiples of 4.
+    pub(crate) fn write(&self, mapped: &MappedRange, offset: usize, data: &[u8]) -> Result {
+        let base = Self::mapped_offset(mapped, offset, data.len())?;
 
         for (i, word) in data.chunks_exact(4).enumerate() {
             let value = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);

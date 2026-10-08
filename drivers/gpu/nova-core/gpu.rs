@@ -636,7 +636,12 @@ impl<'gpu> Gpu<'gpu> {
 
     /// Maps the framebuffer of the boot display into BAR1, so the CPU can draw into it with
     /// [`Gpu::write_boot_display()`]. Does nothing without a boot display.
-    pub(crate) fn map_boot_display(self: Pin<&mut Self>) -> Result {
+    pub(crate) fn map_boot_display(
+        self: Pin<&mut Self>,
+        #[cfg_attr(not(CONFIG_NOVA_CORE_SELFTESTS), allow(unused_variables))] pdev: &pci::Device<
+            device::Bound,
+        >,
+    ) -> Result {
         let this = self.project();
         let Some(display) = this.boot_display.as_ref() else {
             return Ok(());
@@ -652,7 +657,20 @@ impl<'gpu> Gpu<'gpu> {
             .ok_or(EOVERFLOW)?;
         let vram = display.vram.start..VramAddress::from_raw(end);
 
-        let mapped = this.bar_user.as_ref().get_ref().map_vram(this.mm, vram)?;
+        let bar_user = this.bar_user.as_ref().get_ref();
+        let mapped = bar_user.map_vram(this.mm, vram)?;
+
+        #[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
+        if let Err(err) = crate::mm::boot_display_test::check_bar1_mapping(
+            pdev.as_ref(),
+            this.mm,
+            bar_user,
+            &mapped,
+            display,
+        ) {
+            dev_err!(pdev, "boot display: BAR1 mapping check failed: {:?}\n", err);
+        }
+
         *this.boot_scanout.lock() = Some(mapped);
 
         Ok(())
