@@ -27,14 +27,8 @@ use crate::{
     gpu::Chipset,
     gsp::{
         cmdq::Cmdq,
-        fifo::{
-            compute_c7c0,
-            host_c56f, //
-        },
         rm::{
             commands::{
-                AllocComputeAmpereB,
-                AllocThreeDAmpereB,
                 GpuPromoteCtx,
                 GrGetContextBuffersInfo,
                 RmControl, //
@@ -56,6 +50,10 @@ use crate::{
 
 use super::{
     gpfifo::Channel,
+    hal::{
+        Grid,
+        Release, //
+    },
     vaspace::Mode, //
 };
 
@@ -63,9 +61,6 @@ use super::{
 const THREE_D_HANDLE: u32 = 0xc797_0000;
 /// Handle of the compute object of compute channels, completed with the channel ID.
 const COMPUTE_HANDLE: u32 = 0xc7c0_0000;
-
-/// Subchannel compute objects are bound to, as in NVIDIA's drivers.
-pub(crate) const COMPUTE_SUBCHANNEL: u32 = 1;
 
 /// Number of subcontexts whose headers end the main context buffer.
 const SUBCONTEXT_HEADERS: u64 = 64;
@@ -311,7 +306,7 @@ impl GrContext {
             }
 
             promote(dev, cmdq, rm, channel, &entries)?;
-            channel.alloc_object(dev, cmdq, THREE_D_HANDLE, AllocThreeDAmpereB)?;
+            channel.hal().alloc_3d(dev, cmdq, channel, THREE_D_HANDLE)?;
             dev_info!(dev, "gr: golden context built\n");
 
             Ok(())
@@ -423,28 +418,16 @@ impl<'a> ComputeChannel<'a> {
         promote(dev, cmdq, rm, &self.channel, &entries)?;
 
         self.channel
-            .alloc_object(dev, cmdq, COMPUTE_HANDLE | chid, AllocComputeAmpereB)?;
+            .hal()
+            .alloc_compute(dev, cmdq, &self.channel, COMPUTE_HANDLE | chid)?;
 
         Ok(())
     }
 
     /// Binds the compute object to its subchannel, and sets up the compute state work runs with.
     pub(crate) fn init(&mut self, bar: Bar0<'_>, mm: &mut GpuMm<'_>) -> Result {
-        let methods = |method, count| host_c56f::methods(COMPUTE_SUBCHANNEL, method, count);
-
-        // Windows of shared and local memory in the generic address space, as in Mesa.
-        let push = [
-            methods(host_c56f::SET_OBJECT, 1)?,
-            compute_c7c0::CLASS,
-            methods(compute_c7c0::SET_SHADER_SHARED_MEMORY_WINDOW_A, 2)?,
-            0,
-            0xfe00_0000,
-            methods(compute_c7c0::SET_SHADER_LOCAL_MEMORY_WINDOW_A, 2)?,
-            0,
-            0xff00_0000,
-            methods(compute_c7c0::INVALIDATE_SKED_CACHES, 1)?,
-            0,
-        ];
+        let mut push = KVec::new();
+        self.channel.hal().push_compute_init(&mut push)?;
 
         self.channel.run(bar, mm, &push)
     }
@@ -465,21 +448,28 @@ impl<'a> ComputeChannel<'a> {
         self.channel.unmap(mm, mapped)
     }
 
+    /// Returns the work descriptor of `grid`, running the program at GPU virtual address
+    /// `program`, and doing `release` once done. It must be at a GPU virtual address aligned to its
+    /// size.
+    pub(crate) fn qmd(
+        &self,
+        program: u64,
+        grid: &Grid,
+        release: Option<Release>,
+    ) -> Result<KVec<u32>> {
+        self.channel.hal().qmd(program, grid, release)
+    }
+
+    /// Returns the version of the instruction set of the shaders the channel runs, as in `sm_86`.
+    pub(crate) fn shader_model(&self) -> u8 {
+        self.channel.hal().shader_model()
+    }
+
     /// Runs the compute work described by the work descriptor at GPU virtual address `qmd`, and
     /// returns once it is done.
     pub(crate) fn launch(&mut self, bar: Bar0<'_>, mm: &mut GpuMm<'_>, qmd: u64) -> Result {
-        let methods = |method, count| host_c56f::methods(COMPUTE_SUBCHANNEL, method, count);
-        if qmd % num::usize_as_u64(compute_c7c0::QMD_SIZE) != 0 || qmd >> 40 != 0 {
-            return Err(EINVAL);
-        }
-
-        // CAST: the descriptor's address was checked to fit in 40 bits.
-        let push = [
-            methods(compute_c7c0::SEND_PCAS_A, 1)?,
-            (qmd >> 8) as u32,
-            methods(compute_c7c0::SEND_SIGNALING_PCAS2_B, 1)?,
-            compute_c7c0::PCAS_ACTION_INVALIDATE_COPY_SCHEDULE,
-        ];
+        let mut push = KVec::new();
+        self.channel.hal().push_compute_launch(&mut push, qmd)?;
 
         self.channel.run(bar, mm, &push)
     }

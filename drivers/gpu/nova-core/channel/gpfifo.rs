@@ -12,10 +12,7 @@ use core::ops::Range;
 use kernel::{
     device,
     dma::Coherent,
-    io::{
-        poll::read_poll_timeout,
-        Io, //
-    },
+    io::poll::read_poll_timeout,
     prelude::*,
     ptr::Alignment,
     sizes::{
@@ -35,10 +32,8 @@ use crate::{
             Client,
             Handle, //
         },
-        fifo::host_c56f,
         rm::{
             commands::{
-                AllocChannelGpfifoAmpere,
                 CeGetFaultMethodBufferSize,
                 GpfifoBind,
                 GpfifoSchedule,
@@ -58,13 +53,21 @@ use crate::{
         GpuMm,
         VramAddress, //
     },
-    num,
-    regs, //
+    num, //
 };
 
-use super::vaspace::{
-    AddressSpace,
-    Mode, //
+use super::{
+    hal::{
+        self,
+        ChannelHal,
+        GpEntry,
+        GpfifoAlloc,
+        Release, //
+    },
+    vaspace::{
+        AddressSpace,
+        Mode, //
+    },
 };
 
 /// Handle of the address space of a channel, after nouveau's, completed with the channel's ID.
@@ -85,7 +88,7 @@ const GPFIFO: usize = PUSH_BUFFER + PUSH_BUFFER_SIZE;
 /// Number of entries of the GPFIFO ring: a power of two.
 const GPFIFO_ENTRIES: u32 = 1024;
 /// Offset of the semaphore the channel releases.
-const SEMAPHORE: usize = GPFIFO + num::u32_as_usize(GPFIFO_ENTRIES) * host_c56f::GP_ENTRY_SIZE;
+const SEMAPHORE: usize = GPFIFO + num::u32_as_usize(GPFIFO_ENTRIES) * size_of::<GpEntry>();
 static_assert!(SEMAPHORE + size_of::<u32>() <= CONTROL_SIZE);
 
 /// How long work may take: much longer than any fill of a framebuffer.
@@ -95,6 +98,7 @@ const TIMEOUT: Delta = Delta::from_secs(1);
 ///
 /// It must be released with [`Channel::free`] while the GSP is running.
 pub(crate) struct Channel<'a> {
+    hal: &'static dyn ChannelHal,
     client: Handle<Client>,
     address_space: AddressSpace,
     /// The channel, once allocated.
@@ -117,8 +121,9 @@ pub(crate) struct Channel<'a> {
 
 impl<'a> Channel<'a> {
     /// Allocates channel `chid` on `engine` under the device of `rm`, in an address space of its
-    /// own in `mode`. Unless `scheduled`, the channel is only allocated: it is neither bound to its
-    /// engine nor scheduled, so it can't run work.
+    /// own in `mode`. Fails with `ENOTSUPP` if Nova doesn't support the channels of `chipset`.
+    /// Unless `scheduled`, the channel is only allocated: it is neither bound to its engine nor
+    /// scheduled, so it can't run work.
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         dev: &'a device::Device<device::Bound>,
@@ -131,6 +136,7 @@ impl<'a> Channel<'a> {
         scheduled: bool,
         mode: Mode,
     ) -> Result<Self> {
+        let hal = hal::channel_hal(chipset).ok_or(ENOTSUPP)?;
         let (client, device) = (rm.client(), rm.device());
 
         let method_buffer_size =
@@ -160,6 +166,7 @@ impl<'a> Channel<'a> {
         )?;
 
         let mut channel = Self {
+            hal,
             client,
             address_space,
             handle: None,
@@ -193,20 +200,21 @@ impl<'a> Channel<'a> {
                 method_buffer: channel.method_buffer.dma_address(),
                 method_buffer_size: u64::from(method_buffer_size),
             };
-            let handle = RmAlloc::new(
+            let handle = hal.alloc_gpfifo(
+                dev,
+                cmdq,
                 client,
                 device,
-                Handle::new(CHANNEL_HANDLE | chid),
-                AllocChannelGpfifoAmpere::kernel(
-                    channel.address_space.handle(),
-                    engine.engine_type,
+                CHANNEL_HANDLE | chid,
+                &GpfifoAlloc {
+                    va_space: channel.address_space.handle(),
+                    engine_type: engine.engine_type,
                     chid,
                     gpfifo,
-                    GPFIFO_ENTRIES,
-                    &memory,
-                ),
-            )
-            .send(dev, cmdq)?;
+                    entries: GPFIFO_ENTRIES,
+                    memory: &memory,
+                },
+            )?;
             channel.handle = Some(handle);
 
             if scheduled {
@@ -225,6 +233,11 @@ impl<'a> Channel<'a> {
                 Err(err)
             }
         }
+    }
+
+    /// Returns the HAL of the channel's GPU.
+    pub(crate) fn hal(&self) -> &'static dyn ChannelHal {
+        self.hal
     }
 
     /// Returns the client the channel is allocated under.
@@ -298,42 +311,39 @@ impl<'a> Channel<'a> {
     pub(crate) fn run(&mut self, bar: Bar0<'_>, mm: &mut GpuMm<'_>, push: &[u32]) -> Result {
         let control_va = self.control_va()?;
         let sequence = self.sequence.wrapping_add(1);
-        // Once the work is done and its memory writes are visible, release the semaphore.
-        let flush = host_c56f::wait_idle_and_flush()?;
-        let release =
-            host_c56f::semaphore_release(control_va + num::usize_as_u64(SEMAPHORE), sequence)?;
 
-        let words = push.len() + flush.len() + release.len();
-        if words * size_of::<u32>() > PUSH_BUFFER_SIZE {
+        let mut words = KVec::with_capacity(push.len(), GFP_KERNEL)?;
+        words.extend_from_slice(push, GFP_KERNEL)?;
+        // Once the work is done and its memory writes are visible, release the semaphore.
+        self.hal.push_release(
+            &mut words,
+            Release {
+                addr: control_va + num::usize_as_u64(SEMAPHORE),
+                payload: sequence,
+            },
+        )?;
+        if words.len() * size_of::<u32>() > PUSH_BUFFER_SIZE {
             return Err(EINVAL);
         }
         let control = self.control.range().start;
-        let mut offset = num::usize_as_u64(PUSH_BUFFER);
-        for part in [push, &flush, &release] {
-            mm.write_vram(control + offset, part)?;
-            offset += num::usize_as_u64(part.len() * size_of::<u32>());
-        }
+        mm.write_vram(control + num::usize_as_u64(PUSH_BUFFER), &words)?;
 
-        let entry = host_c56f::gp_entry(
+        let entry = self.hal.gp_entry(
             control_va + num::usize_as_u64(PUSH_BUFFER),
-            u32::try_from(words)?,
+            u32::try_from(words.len())?,
         )?;
-        let entry_offset = GPFIFO + num::u32_as_usize(self.put) * host_c56f::GP_ENTRY_SIZE;
+        let entry_offset = GPFIFO + num::u32_as_usize(self.put) * size_of::<GpEntry>();
         mm.write_vram(control + num::usize_as_u64(entry_offset), &entry)?;
 
         self.put = (self.put + 1) % GPFIFO_ENTRIES;
         mm.write_vram(
-            self.userd.range().start + num::usize_as_u64(host_c56f::USERD_GP_PUT),
+            self.userd.range().start + num::usize_as_u64(self.hal.userd_gp_put()),
             &[self.put],
         )?;
 
         // PRAMIN and the doorbell are both in BAR0: the channel sees the writes above when told to
         // look.
-        bar.write_reg(
-            regs::NV_VIRTUAL_FUNCTION_DOORBELL::zeroed()
-                .try_with_vector(self.chid)?
-                .try_with_runlist_id(self.engine.runlist)?,
-        );
+        self.hal.ring_doorbell(bar, &self.engine, self.chid)?;
 
         self.sequence = sequence;
         self.wait_semaphore(mm, sequence)
@@ -361,7 +371,7 @@ impl<'a> Channel<'a> {
             TIMEOUT,
         );
         if result.is_err() {
-            let gp_get = mm.read_vram(userd + num::usize_as_u64(host_c56f::USERD_GP_GET));
+            let gp_get = mm.read_vram(userd + num::usize_as_u64(self.hal.userd_gp_get()));
             pr_err!(
                 "nova-core: channel {}: work not done: semaphore {:?}, GPGet {:?}, GPPut {}\n",
                 self.chid,

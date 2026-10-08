@@ -9,6 +9,12 @@
 //! Bit positions and opcodes are those of Mesa's NAK compiler (`sm70_encode.rs`), latencies those
 //! of its Ampere tables (`sm80_instr_latencies.rs`).
 
+/// Whether instructions for GPUs of shader model `sm` (as in `sm_86`) can be encoded: those of
+/// Ampere and Ada, SM 8.x, which the latencies are of.
+pub(crate) const fn supports(sm: u8) -> bool {
+    matches!(sm, 80..=89)
+}
+
 /// A general purpose register.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Reg(pub(crate) u8);

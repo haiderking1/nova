@@ -12,15 +12,24 @@ use kernel::{
 
 use crate::{
     driver::Bar0,
-    gsp::fifo::compute_c7c0::Qmd,
-    mm::GpuMm,
+    mm::{
+        GpuMm,
+        VramAddress, //
+    },
+    num,
     shader::{
         self,
         Instr, //
     },
 };
 
-use super::gr::ComputeChannel;
+use super::{
+    gr::ComputeChannel,
+    hal::{
+        Grid,
+        Release, //
+    },
+};
 
 /// Value the storing shader stores.
 const VALUE: u32 = 0x600d_cafe;
@@ -47,24 +56,12 @@ const MAX_PROGRAM_LEN: usize = (QMD - PROGRAM) as usize / size_of::<Instr>();
 /// What the page is filled with first, to tell the words written since.
 const UNWRITTEN: u32 = 0xa5a5_a5a5;
 
-/// Size and shape of the work of a program.
-pub(crate) struct Grid {
-    /// Number of blocks of threads.
-    pub(crate) blocks: [u32; 3],
-    /// Number of threads of each block.
-    pub(crate) threads: [u16; 3],
-    /// Number of registers each thread uses.
-    pub(crate) registers: u8,
-}
-
-impl Grid {
-    /// A single thread using `registers` registers.
-    const fn single(registers: u8) -> Self {
-        Self {
-            blocks: [1, 1, 1],
-            threads: [1, 1, 1],
-            registers,
-        }
+/// A grid of a single thread using `registers` registers.
+const fn single_thread(registers: u8) -> Grid {
+    Grid {
+        blocks: [1, 1, 1],
+        threads: [1, 1, 1],
+        registers,
     }
 }
 
@@ -75,6 +72,9 @@ pub(crate) fn run(
     mm: &mut GpuMm<'_>,
     channel: &mut ComputeChannel<'_>,
 ) -> Result {
+    if !shader::supports(channel.shader_model()) {
+        return Err(ENOTSUPP);
+    }
     channel.init(bar, mm)?;
 
     // Exit right away.
@@ -88,7 +88,7 @@ pub(crate) fn run(
                 shader::bra_self(),
             ])
         },
-        Grid::single(shader::registers(0)),
+        single_thread(shader::registers(0)),
         |_, _| Ok(()),
     )?;
     dev_info!(dev, "compute test: a shader ran\n");
@@ -100,7 +100,7 @@ pub(crate) fn run(
         mm,
         channel,
         |va| Ok(shader::store(va + RESULT, VALUE)),
-        Grid::single(shader::STORE_REGISTERS),
+        single_thread(shader::STORE_REGISTERS),
         |mm, base| {
             stored = mm.read_vram(base + RESULT)?;
             let released = mm.read_vram(base + RELEASE)?;
@@ -134,7 +134,7 @@ pub(crate) fn run_program<const N: usize>(
     channel: &mut ComputeChannel<'_>,
     program: impl FnOnce(u64) -> Result<[Instr; N]>,
     grid: Grid,
-    check: impl FnOnce(&mut GpuMm<'_>, crate::mm::VramAddress) -> Result,
+    check: impl FnOnce(&mut GpuMm<'_>, VramAddress) -> Result,
 ) -> Result {
     const { assert!(N <= MAX_PROGRAM_LEN) };
 
@@ -153,9 +153,18 @@ pub(crate) fn run_program<const N: usize>(
         }
         mm.write_vram(base + PROGRAM, &words)?;
 
-        let qmd = Qmd::new(va + PROGRAM, grid.blocks, grid.threads, grid.registers)
-            .release(va + RELEASE, RELEASED)?;
-        mm.write_vram(base + QMD, qmd.words())?;
+        let qmd = channel.qmd(
+            va + PROGRAM,
+            &grid,
+            Some(Release {
+                addr: va + RELEASE,
+                payload: RELEASED,
+            }),
+        )?;
+        if qmd.len() * size_of::<u32>() > num::u64_as_usize(RESULT - QMD) {
+            return Err(EINVAL);
+        }
+        mm.write_vram(base + QMD, &qmd)?;
 
         channel.launch(bar, mm, va + QMD)?;
         check(mm, base)

@@ -12,18 +12,7 @@ use kernel::{
 use crate::{
     driver::Bar0,
     gpu::Chipset,
-    gsp::{
-        cmdq::Cmdq,
-        fifo::{
-            copy_c7b5,
-            host_c56f, //
-        },
-        rm::{
-            commands::AllocCopyEngineAmpereB,
-            device::RmDevice, //
-        },
-        EngineInfo,
-    },
+    gsp::{cmdq::Cmdq, rm::device::RmDevice, EngineInfo},
     mm::{
         pagetable::Access,
         vmm::MappedRange,
@@ -40,9 +29,6 @@ use super::{
 
 /// Handle of the copy engine object of the channel.
 const COPY_ENGINE_HANDLE: u32 = 0xc7b5_0000;
-
-/// Subchannel the copy engine object is bound to, as recommended for copy engines.
-const SUBCHANNEL: u32 = 4;
 
 /// A kernel channel on a copy engine.
 ///
@@ -76,12 +62,10 @@ impl<'a> CopyChannel<'a> {
             true,
             Mode::ClientOwned,
         )?;
-        if let Err(err) = channel.alloc_object(
-            dev,
-            cmdq,
-            COPY_ENGINE_HANDLE,
-            AllocCopyEngineAmpereB::new(index),
-        ) {
+        if let Err(err) = channel
+            .hal()
+            .alloc_copy(dev, cmdq, &channel, COPY_ENGINE_HANDLE, index)
+        {
             channel.free(dev, cmdq, mm);
             return Err(err);
         }
@@ -118,28 +102,10 @@ impl<'a> CopyChannel<'a> {
         height: u32,
         value: u32,
     ) -> Result {
-        let addr = addr.into_raw();
-        let methods = |method, count| host_c56f::methods(SUBCHANNEL, method, count);
-
-        // CAST: the upper and lower halves of addresses are set separately.
-        let push = [
-            methods(host_c56f::SET_OBJECT, 1)?,
-            copy_c7b5::CLASS,
-            methods(copy_c7b5::SET_REMAP_CONST_A, 3)?,
-            value,
-            0,
-            copy_c7b5::REMAP_FILL_32,
-            methods(copy_c7b5::OFFSET_OUT_UPPER, 2)?,
-            (addr >> 32) as u32,
-            addr as u32,
-            methods(copy_c7b5::PITCH_IN, 4)?,
-            pitch,
-            pitch,
-            width,
-            height,
-            methods(copy_c7b5::LAUNCH_DMA, 1)?,
-            copy_c7b5::LAUNCH_FILL,
-        ];
+        let mut push = KVec::new();
+        self.channel
+            .hal()
+            .push_fill(&mut push, addr.into_raw(), pitch, width, height, value)?;
 
         self.channel.run(bar, mm, &push)
     }

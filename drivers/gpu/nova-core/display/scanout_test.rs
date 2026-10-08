@@ -20,14 +20,7 @@ use kernel::{
 
 use crate::{
     boot_display::BootDisplay,
-    channel::{
-        compute_test::{
-            self,
-            Grid, //
-        },
-        copy::CopyChannel,
-        gr::ComputeChannel,
-    },
+    channel::{compute_test, copy::CopyChannel, gr::ComputeChannel, hal::Grid},
     driver::Bar0,
     mm::{
         GpuMm,
