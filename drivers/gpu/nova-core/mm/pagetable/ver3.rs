@@ -26,6 +26,7 @@ use kernel::{
 use pin_init::Zeroable;
 
 use super::{
+    Access,
     AperturePde,
     AperturePte,
     DualPdeOps,
@@ -208,8 +209,8 @@ impl PteOps for Pte {
         Self::zeroed()
     }
 
-    fn new(aperture: AperturePte, pfn: Pfn, writable: bool) -> Self {
-        let pcf = match (aperture, writable) {
+    fn new(aperture: AperturePte, pfn: Pfn, access: Access) -> Self {
+        let pcf = match (aperture, access.writable) {
             (AperturePte::VideoMemory, true) => PtePcf::rw(),
             (AperturePte::VideoMemory, false) => PtePcf::ro(),
             // Sysmem PTEs use uncached+no_atomic PCF for cache coherency.
@@ -228,7 +229,7 @@ impl PteOps for Pte {
         Self::zeroed()
             .with_valid(true)
             .with_aperture(aperture)
-            .with_pcf(pcf)
+            .with_pcf(pcf.with_privileged(access.privileged))
             .with_frame_number(pfn)
     }
 

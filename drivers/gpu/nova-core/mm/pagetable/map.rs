@@ -26,6 +26,7 @@ use super::{
         WalkPdeResult,
         WalkResult, //
     },
+    Access,
     AperturePde,
     AperturePte,
     DualPdeOps,
@@ -194,7 +195,7 @@ impl<M: MmuConfig> PtMapInner<M> {
         page_table_allocs: &mut KVec<Pin<KBox<AllocatedBlocks>>>,
         vfn_start: Vfn,
         pfns: &[Pfn],
-        writable: bool,
+        access: Access,
     ) -> Result {
         {
             let pramin = mm.pramin_mut();
@@ -230,7 +231,7 @@ impl<M: MmuConfig> PtMapInner<M> {
 
                 match result {
                     WalkResult::Unmapped { pte_addr } | WalkResult::Mapped { pte_addr, .. } => {
-                        let pte = M::Pte::new(AperturePte::VideoMemory, pfn, writable);
+                        let pte = M::Pte::new(AperturePte::VideoMemory, pfn, access);
                         pte.write(pramin, pte_addr)?;
                     }
                     WalkResult::PageTableMissing => {
@@ -325,11 +326,11 @@ impl PtMap {
         page_table_allocs: &mut KVec<Pin<KBox<AllocatedBlocks>>>,
         vfn_start: Vfn,
         pfns: &[Pfn],
-        writable: bool,
+        access: Access,
     ) -> Result {
         pt_map_dispatch!(
             self,
-            install_mappings(mm, pt_pages, page_table_allocs, vfn_start, pfns, writable)
+            install_mappings(mm, pt_pages, page_table_allocs, vfn_start, pfns, access)
         )
     }
 

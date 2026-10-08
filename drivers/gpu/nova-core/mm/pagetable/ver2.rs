@@ -17,6 +17,7 @@ use kernel::{
 use pin_init::Zeroable;
 
 use super::{
+    Access,
     AperturePde,
     AperturePte,
     DualPdeOps,
@@ -130,11 +131,12 @@ impl PteOps for Pte {
         Self::zeroed()
     }
 
-    fn new(aperture: AperturePte, pfn: Pfn, writable: bool) -> Self {
+    fn new(aperture: AperturePte, pfn: Pfn, access: Access) -> Self {
         let base = Self::zeroed()
             .with_valid(true)
             .with_aperture(aperture)
-            .with_read_only(!writable);
+            .with_read_only(!access.writable)
+            .with_privilege(access.privileged);
         match aperture {
             AperturePte::VideoMemory => base.with_frame_number_vid(pfn),
             // Sysmem PTEs use VOL=1 to bypass L2 for cache coherency.

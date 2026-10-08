@@ -27,6 +27,7 @@ use crate::{
                 PtWalk,
                 WalkResult, //
             },
+            Access,
             MmuVersion, //
         },
         GpuMm,
@@ -284,7 +285,7 @@ impl Vmm {
         mm: &mut GpuMm<'_>,
         prepared: PreparedMapping,
         pfns: &[Pfn],
-        writable: bool,
+        access: Access,
     ) -> Result<MappedRange> {
         if pfns.len() != prepared.num_pages {
             self.free_vfn(prepared.vfn_start);
@@ -304,7 +305,7 @@ impl Vmm {
             &mut self.page_table_allocs,
             vfn_start,
             pfns,
-            writable,
+            access,
         ) {
             self.free_vfn(vfn_start);
             return Err(e);
@@ -327,7 +328,7 @@ impl Vmm {
         mm: &mut GpuMm<'_>,
         pfns: &[Pfn],
         va_range: Option<Range<u64>>,
-        writable: bool,
+        access: Access,
     ) -> Result<MappedRange> {
         if pfns.is_empty() {
             return Err(EINVAL);
@@ -347,7 +348,7 @@ impl Vmm {
         }
 
         let prepared = self.prepare_map(mm, pfns.len(), va_range)?;
-        self.execute_map(mm, prepared, pfns, writable)
+        self.execute_map(mm, prepared, pfns, access)
     }
 
     /// Unmap all pages in a [`MappedRange`] with a single TLB flush.

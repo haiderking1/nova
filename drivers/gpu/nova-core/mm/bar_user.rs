@@ -26,6 +26,7 @@ use crate::{
     driver::Bar1,
     gpu::Chipset,
     mm::{
+        pagetable::Access,
         vmm::{
             MappedRange,
             Vmm, //
@@ -75,13 +76,13 @@ impl<'a> BarUser<'a> {
         &self,
         mm: &mut GpuMm<'_>,
         pfns: &[Pfn],
-        writable: bool,
+        access: Access,
     ) -> Result<BarUserAccess<'_>> {
         if pfns.is_empty() {
             return Err(EINVAL);
         }
         let mut vmm = self.vmm.lock();
-        let mapped = vmm.map_pages(mm, pfns, None, writable)?;
+        let mapped = vmm.map_pages(mm, pfns, None, access)?;
 
         Ok(BarUserAccess {
             bar_user: self,
@@ -110,7 +111,9 @@ impl<'a> BarUser<'a> {
             pfns.push(Pfn::new(pfn), GFP_KERNEL)?;
         }
 
-        self.vmm.lock().map_pages(mm, &pfns, None, true)
+        self.vmm
+            .lock()
+            .map_pages(mm, &pfns, None, Access::READ_WRITE)
     }
 
     /// Tear down a mapping made by [`BarUser::map_vram()`].
@@ -337,7 +340,7 @@ pub(crate) fn run_self_test(
     let mut vmm = bar_user.vmm.lock();
 
     // Create a test mapping.
-    let mapped = vmm.map_pages(mm, &[test_pfn], None, true)?;
+    let mapped = vmm.map_pages(mm, &[test_pfn], None, Access::READ_WRITE)?;
     let test_vfn = mapped.vfn_start;
 
     // Pre-compute test addresses for the PRAMIN to BAR1 read test.
@@ -372,7 +375,7 @@ pub(crate) fn run_self_test(
 
     // Test 2: Two-phase prepare/execute API.
     let prepared = vmm.prepare_map(mm, 1, None)?;
-    let mapped2 = vmm.execute_map(mm, prepared, &[test_pfn], true)?;
+    let mapped2 = vmm.execute_map(mm, prepared, &[test_pfn], Access::READ_WRITE)?;
     let readback = vmm.read_mapping(mm, mapped2.vfn_start)?;
     let test2_passed = if readback == Some(test_pfn) {
         true
@@ -440,7 +443,7 @@ pub(crate) fn run_self_test(
             )?;
         }
 
-        let mapped = vmm.map_pages(mm, &pfns, None, true)?;
+        let mapped = vmm.map_pages(mm, &pfns, None, Access::READ_WRITE)?;
         let bar1_base_vfn: usize = mapped.vfn_start.raw().into_safe_cast();
         let bar1_base = bar1_base_vfn.checked_mul(PAGE_SIZE).ok_or(EOVERFLOW)?;
 
@@ -492,7 +495,7 @@ pub(crate) fn run_self_test(
     drop(vmm);
 
     // Test 4: Exercise `BarUser::map()` end-to-end.
-    let access = bar_user.map(mm, &[test_pfn], true)?;
+    let access = bar_user.map(mm, &[test_pfn], Access::READ_WRITE)?;
 
     // Write pattern via PRAMIN, read via BarUserAccess.
     mm.pramin_mut()

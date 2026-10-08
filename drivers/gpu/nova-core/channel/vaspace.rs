@@ -34,7 +34,10 @@ use crate::{
         },
     },
     mm::{
-        pagetable::MmuVersion,
+        pagetable::{
+            Access,
+            MmuVersion, //
+        },
         vmm::{
             MappedRange,
             Vmm, //
@@ -115,12 +118,13 @@ impl AddressSpace {
         self.handle
     }
 
-    /// Maps the page-aligned VRAM `range` writable at a free virtual address, returned by
+    /// Maps the page-aligned VRAM `range` with `access` at a free virtual address, returned by
     /// [`MappedRange::start`]. The mapping must be given back to [`AddressSpace::unmap`].
     pub(crate) fn map_vram(
         &mut self,
         mm: &mut GpuMm<'_>,
         range: Range<VramAddress>,
+        access: Access,
     ) -> Result<MappedRange> {
         let (start, end) = (range.start.into_raw(), range.end.into_raw());
         let page_size = u64::try_from(PAGE_SIZE)?;
@@ -133,7 +137,7 @@ impl AddressSpace {
             pfns.push(Pfn::new(pfn), GFP_KERNEL)?;
         }
 
-        self.vmm.map_pages(mm, &pfns, None, true)
+        self.vmm.map_pages(mm, &pfns, None, access)
     }
 
     /// Tears down a mapping made by [`AddressSpace::map_vram`].

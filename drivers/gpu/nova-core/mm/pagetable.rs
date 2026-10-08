@@ -65,6 +65,24 @@ impl MmuVersion {
     }
 }
 
+/// How the GPU may access the memory a mapping maps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Access {
+    /// Whether the memory may be written.
+    pub(crate) writable: bool,
+    /// Whether only privileged accessors may access the memory, such as the context switch
+    /// firmware of the engines.
+    pub(crate) privileged: bool,
+}
+
+impl Access {
+    /// Read and write access, for everyone.
+    pub(crate) const READ_WRITE: Self = Self {
+        writable: true,
+        privileged: false,
+    };
+}
+
 /// Page Table Level hierarchy for MMU v2/v3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PageTableLevel {
@@ -121,8 +139,8 @@ pub(super) trait PteOps: Copy + core::fmt::Debug + Into<u64> {
     /// Create an invalid `PTE`.
     fn invalid() -> Self;
 
-    /// Create a valid `PTE` for the given memory aperture.
-    fn new(aperture: AperturePte, pfn: Pfn, writable: bool) -> Self;
+    /// Create a valid `PTE` for the given memory aperture, giving `access` to it.
+    fn new(aperture: AperturePte, pfn: Pfn, access: Access) -> Self;
 
     /// Check if this `PTE` is valid.
     fn is_valid(&self) -> bool;

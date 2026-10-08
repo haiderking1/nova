@@ -56,6 +56,7 @@ use crate::{
         ChannelMemory, EngineInfo,
     },
     mm::{
+        pagetable::Access,
         vmm::MappedRange,
         ContiguousVram,
         GpuMm,
@@ -176,9 +177,10 @@ impl<'a> CopyChannel<'a> {
         };
 
         let set_up = |channel: &mut Self, mm: &mut GpuMm<'_>| -> Result {
-            let control_mapped = channel
-                .address_space
-                .map_vram(mm, channel.control.range())?;
+            let control_mapped =
+                channel
+                    .address_space
+                    .map_vram(mm, channel.control.range(), Access::READ_WRITE)?;
             let gpfifo = control_mapped.start().into_raw() + num::usize_as_u64(GPFIFO);
             channel.control_mapped = Some(control_mapped);
 
@@ -269,7 +271,7 @@ impl<'a> CopyChannel<'a> {
         mm: &mut GpuMm<'_>,
         range: core::ops::Range<VramAddress>,
     ) -> Result<MappedRange> {
-        self.address_space.map_vram(mm, range)
+        self.address_space.map_vram(mm, range, Access::READ_WRITE)
     }
 
     /// Tears down a mapping made by [`CopyChannel::map_vram`].
