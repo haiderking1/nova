@@ -9,13 +9,14 @@ use kernel::{
     gpu::buddy::AllocatedBlocks,
     maple_tree::MapleTreeAlloc,
     prelude::*,
-    rbtree::RBTree, //
+    rbtree::RBTree,
+    sync::atomic::{
+        Atomic,
+        Relaxed, //
+    }, //
 };
 
-use core::{
-    cell::Cell,
-    ops::Range, //
-};
+use core::ops::Range;
 
 use crate::{
     mm::{
@@ -95,29 +96,34 @@ impl MappedRange {
     pub(crate) fn start(&self) -> VirtualAddress {
         VirtualAddress::from(self.vfn_start)
     }
+
+    /// Drops the mapping without unmapping it, for when its address space is gone.
+    pub(crate) fn forget(self) {
+        self._drop_guard.disarm();
+    }
 }
 
 /// Guard that logs a warning if a [`PreparedMapping`] is dropped without
 /// being consumed by [`Vmm::execute_map()`].
 struct MustExecuteGuard {
-    armed: Cell<bool>,
+    armed: Atomic<bool>,
 }
 
 impl MustExecuteGuard {
     const fn new() -> Self {
         Self {
-            armed: Cell::new(true),
+            armed: Atomic::new(true),
         }
     }
 
     fn disarm(&self) {
-        self.armed.set(false);
+        self.armed.store(false, Relaxed);
     }
 }
 
 impl Drop for MustExecuteGuard {
     fn drop(&mut self) {
-        if self.armed.get() {
+        if self.armed.load(Relaxed) {
             kernel::pr_warn!("PreparedMapping dropped without calling execute_map()\n");
         }
     }
@@ -126,24 +132,24 @@ impl Drop for MustExecuteGuard {
 /// Guard that logs a warning if a [`MappedRange`] is dropped without
 /// calling [`Vmm::unmap_pages()`].
 struct MustUnmapGuard {
-    armed: Cell<bool>,
+    armed: Atomic<bool>,
 }
 
 impl MustUnmapGuard {
     const fn new() -> Self {
         Self {
-            armed: Cell::new(true),
+            armed: Atomic::new(true),
         }
     }
 
     fn disarm(&self) {
-        self.armed.set(false);
+        self.armed.store(false, Relaxed);
     }
 }
 
 impl Drop for MustUnmapGuard {
     fn drop(&mut self) {
-        if self.armed.get() {
+        if self.armed.load(Relaxed) {
             kernel::pr_warn!("MappedRange dropped without calling unmap_pages()\n");
         }
     }

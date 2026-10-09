@@ -208,6 +208,19 @@ impl AddressSpace {
         self.handle
     }
 
+    /// Maps the pages `pfns` of `memory`, in order, with `access` at a free virtual address,
+    /// returned by [`MappedRange::start`]. The mapping must be given back to
+    /// [`AddressSpace::unmap`].
+    pub(crate) fn map_pages(
+        &mut self,
+        mm: &mut GpuMm<'_>,
+        pfns: &[Pfn],
+        memory: Memory,
+        access: Access,
+    ) -> Result<MappedRange> {
+        self.vmm.map_memory(mm, pfns, None, access, memory)
+    }
+
     /// Maps the page-aligned VRAM `range` with `access` at a free virtual address, returned by
     /// [`MappedRange::start`]. The mapping must be given back to [`AddressSpace::unmap`].
     pub(crate) fn map_vram(

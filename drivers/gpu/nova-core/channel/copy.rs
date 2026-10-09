@@ -15,8 +15,12 @@ use crate::{
     gsp::{cmdq::Cmdq, rm::device::RmDevice, EngineInfo},
     mm::{
         pagetable::Access,
-        vmm::MappedRange,
+        vmm::{
+            MappedRange,
+            Memory, //
+        },
         GpuMm,
+        Pfn,
         VirtualAddress,
         VramAddress, //
     },
@@ -84,7 +88,17 @@ impl<'a> CopyChannel<'a> {
         self.channel.map_vram(mm, range, Access::READ_WRITE)
     }
 
-    /// Tears down a mapping made by [`CopyChannel::map_vram`].
+    /// Like [`CopyChannel::map_vram`], for the pages `pfns` of `memory`, in order.
+    pub(crate) fn map_pages(
+        &mut self,
+        mm: &mut GpuMm<'_>,
+        pfns: &[Pfn],
+        memory: Memory,
+    ) -> Result<MappedRange> {
+        self.channel.map_pages(mm, pfns, memory, Access::READ_WRITE)
+    }
+
+    /// Tears down a mapping made by [`CopyChannel::map_vram`] or [`CopyChannel::map_pages`].
     pub(crate) fn unmap(&mut self, mm: &mut GpuMm<'_>, mapped: MappedRange) -> Result {
         self.channel.unmap(mm, mapped)
     }

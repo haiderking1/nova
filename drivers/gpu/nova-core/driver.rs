@@ -156,6 +156,13 @@ impl pci::Driver for NovaCoreDriver {
                     dev_warn!(pdev, "can't set up the graphics engine: {:?}\n", err);
                 }
 
+                // Not fatal: only new VRAM buffers need it, to be cleared. After the graphics
+                // engine, whose golden context must be built before any other channel is
+                // allocated.
+                if let Err(err) = gpu.as_mut().init_copy() {
+                    dev_warn!(pdev, "can't set up the kernel's copy channel: {:?}\n", err);
+                }
+
                 // Not fatal either: the boot display keeps working without it.
                 if let Err(err) = gpu.as_mut().init_display_engine() {
                     dev_warn!(pdev, "can't take over the display engine: {:?}\n", err);

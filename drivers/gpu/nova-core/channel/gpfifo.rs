@@ -48,9 +48,13 @@ use crate::{
     },
     mm::{
         pagetable::Access,
-        vmm::MappedRange,
+        vmm::{
+            MappedRange,
+            Memory, //
+        },
         ContiguousVram,
         GpuMm,
+        Pfn,
         VramAddress, //
     },
     num, //
@@ -287,6 +291,17 @@ impl<'a> Channel<'a> {
         access: Access,
     ) -> Result<MappedRange> {
         self.address_space.map_vram(mm, range, access)
+    }
+
+    /// Like [`Channel::map_vram`], for the pages `pfns` of `memory`, in order.
+    pub(crate) fn map_pages(
+        &mut self,
+        mm: &mut GpuMm<'_>,
+        pfns: &[Pfn],
+        memory: Memory,
+        access: Access,
+    ) -> Result<MappedRange> {
+        self.address_space.map_pages(mm, pfns, memory, access)
     }
 
     /// Like [`Channel::map_vram`], but at a virtual address aligned to `alignment`, a power of

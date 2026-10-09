@@ -116,7 +116,14 @@ impl<'a> BarUser<'a> {
             .map_pages(mm, &pfns, None, Access::READ_WRITE)
     }
 
-    /// Tear down a mapping made by [`BarUser::map_vram()`].
+    /// Like [`BarUser::map_vram()`], for the VRAM pages `pfns`, mapped in order.
+    pub(crate) fn map_vram_pages(&self, mm: &mut GpuMm<'_>, pfns: &[Pfn]) -> Result<MappedRange> {
+        self.vmm
+            .lock()
+            .map_pages(mm, pfns, None, Access::READ_WRITE)
+    }
+
+    /// Tear down a mapping made by [`BarUser::map_vram()`] or [`BarUser::map_vram_pages()`].
     pub(crate) fn unmap(&self, mm: &mut GpuMm<'_>, mapped: MappedRange) -> Result {
         self.vmm.lock().unmap_pages(mm, mapped)
     }

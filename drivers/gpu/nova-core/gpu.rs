@@ -6,7 +6,11 @@ use kernel::{
     device,
     dma::Device,
     fmt,
-    gpu::buddy::GpuBuddyParams,
+    gpu::buddy::{
+        GpuBuddyAllocFlags,
+        GpuBuddyAllocMode,
+        GpuBuddyParams, //
+    },
     io::Io,
     new_mutex,
     num::Bounded,
@@ -29,8 +33,14 @@ use kernel::{
 use crate::{
     boot_display::BootDisplay,
     bounded_enum,
+    buffer::{
+        SystemBuffer,
+        VramBuffer,
+        VRAM_BUFFER_ALIGN, //
+    },
     channel::{
         self,
+        copy::CopyChannel,
         gr::{
             GrContext,
             GraphicsInfo, //
@@ -91,8 +101,12 @@ use crate::{
     mm::{
         bar_user::BarUser,
         pagetable::MmuVersion,
-        vmm::MappedRange,
+        vmm::{
+            MappedRange,
+            Memory, //
+        },
         GpuMm,
+        Pfn,
         VramAddress,
         PAGE_SIZE, //
     },
@@ -463,6 +477,13 @@ pub(crate) struct Gpu<'gpu> {
     display_engine: Mutex<Option<DisplayOutput<'gpu>>>,
     /// The context of the graphics engine, once set up by [`Gpu::init_graphics()`].
     gr: Option<GrContext<'gpu>>,
+    /// The kernel's channel on a copy engine, which clears new VRAM buffers, once set up by
+    /// [`Gpu::init_copy()`].
+    ///
+    /// Freed in [`Gpu`]'s `PinnedDrop`, while the GSP is still running. Locked after
+    /// `display_engine` and before `mm` when they are.
+    #[pin]
+    copy: Mutex<Option<CopyChannel<'gpu>>>,
     /// GPU memory manager owning memory management resources.
     ///
     /// Must be kept declared *before* `gsp_resources`, so that its components are dropped while
@@ -727,6 +748,9 @@ impl<'gpu> Gpu<'gpu> {
             // Set up by `Gpu::init_graphics()`, which needs to allocate VRAM.
             gr: None,
 
+            // Set up by `Gpu::init_copy()`, after the graphics engine's golden context.
+            copy <- new_mutex!(None, "nova_copy"),
+
             // Create GPU memory manager owning memory management resources.
             mm <- new_mutex!({
                 let usable_vram = gsp_static_info.usable_fb_regions.first().ok_or(ENODEV)?;
@@ -883,11 +907,42 @@ impl<'gpu> Gpu<'gpu> {
         Ok(())
     }
 
+    /// Sets up the kernel's channel on a copy engine, which clears new VRAM buffers.
+    ///
+    /// Must be done after [`Gpu::init_graphics()`], which must be done before any other channel is
+    /// allocated.
+    pub(crate) fn init_copy(self: Pin<&mut Self>) -> Result {
+        let this = self.as_ref().get_ref();
+        let gsp_resources = &this.gsp_resources;
+        {
+            let mut copy = this.copy.lock();
+            let mut mm = this.mm.lock();
+
+            *copy = Some(CopyChannel::new(
+                gsp_resources.device.as_ref(),
+                &gsp_resources.gsp.cmdq,
+                &mut mm,
+                this.spec.chipset,
+                this.rm.as_ref().ok_or(ENODEV)?,
+            )?);
+        }
+
+        #[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
+        let _ = this.test_buffers().inspect_err(|e| {
+            dev_err!(gsp_resources.device, "buffers: self-test failed: {:?}\n", e)
+        });
+
+        Ok(())
+    }
+
     /// Takes over the display engine from GSP-RM, so that Nova can drive displays itself.
     ///
     /// Fails with `ENOTSUPP` on GPUs whose display engine isn't supported yet.
     pub(crate) fn init_display_engine(self: Pin<&mut Self>) -> Result {
         let this = self.project();
+        // `copy` is locked before `mm`.
+        #[cfg_attr(not(CONFIG_NOVA_CORE_SELFTESTS), expect(unused_mut, unused_variables))]
+        let mut copy = this.copy.lock();
         let mut mm = this.mm.lock();
         let gsp_resources = this.gsp_resources.as_ref().get_ref();
         let pdev = gsp_resources.device;
@@ -928,17 +983,6 @@ impl<'gpu> Gpu<'gpu> {
 
         #[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
         if let Some(boot) = this.boot_display.as_ref() {
-            // A copy channel for the GPU to fill the test surface.
-            let mut channel = crate::channel::copy::CopyChannel::new(
-                pdev.as_ref(),
-                &gsp_resources.gsp.cmdq,
-                &mut mm,
-                this.spec.chipset,
-                this.rm.as_ref().ok_or(ENODEV)?,
-            )
-            .inspect_err(|e| dev_err!(pdev, "channel: can't set up a copy channel: {:?}\n", e))
-            .ok();
-
             // A compute channel for a shader to draw the test surface, once it passed its own
             // test.
             let mut compute = this.gr.as_ref().and_then(|gr| {
@@ -973,15 +1017,13 @@ impl<'gpu> Gpu<'gpu> {
                 &mut mm,
                 &mut engine,
                 boot,
-                channel.as_mut(),
+                // The kernel's copy channel fills the test surface.
+                Option::as_mut(&mut *copy),
                 compute.as_mut().filter(|_| computed),
             );
 
             if let Some(mut compute) = compute {
                 compute.free(pdev.as_ref(), &gsp_resources.gsp.cmdq, &mut mm);
-            }
-            if let Some(mut channel) = channel {
-                channel.free(pdev.as_ref(), &gsp_resources.gsp.cmdq, &mut mm);
             }
         }
 
@@ -998,8 +1040,9 @@ impl<'gpu> Gpu<'gpu> {
             .ok()
         });
 
-        // `display_engine` is locked before `mm`.
+        // `display_engine` is locked before `copy` and `mm`.
         drop(mm);
+        drop(copy);
         *this.display_engine.lock() = Some(DisplayOutput {
             engine,
             scanout,
@@ -1170,6 +1213,201 @@ impl<'gpu> Gpu<'gpu> {
         self.gr.as_ref().map(|gr| *gr.info()).ok_or(ENODEV)
     }
 
+    /// Allocates a buffer of at least `size` bytes of VRAM, zeroed by the copy engine, with a
+    /// window in BAR1 for the CPU if `cpu_visible`.
+    ///
+    /// Its size is rounded up to [`VRAM_BUFFER_ALIGN`], the size of the GPU's large pages. Fails
+    /// with `ENODEV` if the kernel's copy channel isn't set up.
+    pub(crate) fn alloc_vram(&self, size: usize, cpu_visible: bool) -> Result<VramBuffer> {
+        let size = size
+            .checked_next_multiple_of(VRAM_BUFFER_ALIGN)
+            .filter(|&size| size != 0)
+            .ok_or(EINVAL)?;
+        let pdev = self.gsp_resources.device;
+
+        // `copy` is locked before `mm`.
+        let mut copy = self.copy.lock();
+        let copy = Option::as_mut(&mut *copy).ok_or(ENODEV)?;
+        let mut mm = self.mm.lock();
+
+        let blocks = KBox::pin_init(
+            mm.buddy().alloc_blocks(
+                GpuBuddyAllocMode::Simple,
+                size.into_safe_cast(),
+                Alignment::new::<VRAM_BUFFER_ALIGN>(),
+                GpuBuddyAllocFlags::default(),
+            ),
+            GFP_KERNEL,
+        )?;
+        let mut buffer = VramBuffer::new(blocks, size);
+        let pfns = buffer.pfns()?;
+
+        Self::fill_pages(
+            copy,
+            &mut mm,
+            self.gsp_resources.bar,
+            &pfns,
+            Memory::Vram,
+            0,
+        )?;
+
+        if cpu_visible {
+            let mapped = self.bar_user.map_vram_pages(&mut mm, &pfns)?;
+            let bar1 = pdev.resource_start(crate::driver::bar1_resource_index(pdev)?)?;
+            match bar1.checked_add(mapped.start().into_raw()) {
+                Some(phys) => buffer.set_window(mapped, phys),
+                None => {
+                    let _ = self.bar_user.unmap(&mut mm, mapped);
+                    return Err(EOVERFLOW);
+                }
+            }
+        }
+
+        Ok(buffer)
+    }
+
+    /// Self-test of buffers: the GPU reaches the memory of VRAM and system memory buffers, which
+    /// the CPU reaches too, through BAR1 or the kernel's mapping. The copy engine fills a buffer of
+    /// each, which the CPU then reads; a new VRAM buffer reads zeroed first.
+    #[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
+    fn test_buffers(&self) -> Result {
+        const SIZE: usize = 2 * VRAM_BUFFER_ALIGN;
+        const VRAM_VALUE: u32 = 0x5a5a_5a5a;
+        const SYSTEM_VALUE: u32 = 0xa5a5_a5a5;
+        let dev = self.gsp_resources.device.as_ref();
+        let bar = self.gsp_resources.bar;
+
+        // Checks that the `SIZE` bytes `read` reads, a 32-bit word at a time, are all `value`.
+        let check = |what: &str, value: u32, read: &dyn Fn(usize) -> Result<u32>| -> Result {
+            for offset in (0..SIZE).step_by(4) {
+                let read = read(offset)?;
+                if read != value {
+                    dev_err!(
+                        dev,
+                        "buffers: {} reads {:#x} at {:#x}, not {:#x}\n",
+                        what,
+                        read,
+                        offset,
+                        value
+                    );
+                    return Err(EIO);
+                }
+            }
+
+            Ok(())
+        };
+
+        let vram = self.alloc_vram(SIZE, true)?;
+        let checked = (|| {
+            let window = vram.window().ok_or(EINVAL)?;
+            let read = |offset| self.bar_user.read32(window, offset);
+            check("a new VRAM buffer", 0, &read)?;
+
+            {
+                let mut copy = self.copy.lock();
+                let copy = Option::as_mut(&mut *copy).ok_or(ENODEV)?;
+                let mut mm = self.mm.lock();
+                let pfns = vram.pfns()?;
+                Self::fill_pages(copy, &mut mm, bar, &pfns, Memory::Vram, VRAM_VALUE)?;
+            }
+            check("a VRAM buffer filled by the copy engine", VRAM_VALUE, &read)
+        })();
+        self.free_vram(vram);
+        checked?;
+
+        let system = self.alloc_system(SIZE)?;
+        {
+            let mut copy = self.copy.lock();
+            let copy = Option::as_mut(&mut *copy).ok_or(ENODEV)?;
+            let mut mm = self.mm.lock();
+            let pfns = system.dma_pfns()?;
+            Self::fill_pages(
+                copy,
+                &mut mm,
+                bar,
+                &pfns,
+                Memory::SystemCoherent,
+                SYSTEM_VALUE,
+            )?;
+        }
+        let read = |offset: usize| -> Result<u32> {
+            // SAFETY: `offset` is a 4-byte aligned offset in the `SIZE` bytes of the buffer, which
+            // the kernel's mapping maps. The GPU wrote them, coherently with the CPU's caches.
+            Ok(unsafe {
+                system
+                    .vaddr()
+                    .as_ptr()
+                    .add(offset)
+                    .cast::<u32>()
+                    .read_volatile()
+            })
+        };
+        check(
+            "a system memory buffer filled by the copy engine",
+            SYSTEM_VALUE,
+            &read,
+        )?;
+
+        dev_info!(
+            dev,
+            "buffers: the GPU and the CPU reach VRAM and system memory buffers\n"
+        );
+        Ok(())
+    }
+
+    /// Fills the pages `pfns` of `memory` with the 32-bit `value`, with the kernel's copy channel
+    /// `copy`. Their size must be a multiple of [`VRAM_BUFFER_ALIGN`].
+    fn fill_pages(
+        copy: &mut CopyChannel<'_>,
+        mm: &mut GpuMm<'_>,
+        bar: Bar0<'_>,
+        pfns: &[Pfn],
+        memory: Memory,
+        value: u32,
+    ) -> Result {
+        // Filled in lines of `LINE` bytes.
+        const LINE: usize = VRAM_BUFFER_ALIGN;
+        let size = pfns.len().checked_mul(PAGE_SIZE).ok_or(EOVERFLOW)?;
+        if size % LINE != 0 {
+            return Err(EINVAL);
+        }
+
+        let mapped = copy.map_pages(mm, pfns, memory)?;
+        let filled = copy.fill(
+            bar,
+            mm,
+            mapped.start(),
+            LINE.try_into()?,
+            (LINE / 4).try_into()?,
+            (size / LINE).try_into()?,
+            value,
+        );
+
+        copy.unmap(mm, mapped).and(filled)
+    }
+
+    /// Frees `buffer`, tearing down its window in BAR1.
+    pub(crate) fn free_vram(&self, mut buffer: VramBuffer) {
+        if let Some(mapped) = buffer.take_window() {
+            let mut mm = self.mm.lock();
+            let _ = self
+                .bar_user
+                .unmap(&mut mm, mapped)
+                .inspect_err(|e| pr_err!("failed to unmap a VRAM buffer from BAR1: {:?}\n", e));
+        }
+    }
+
+    /// Allocates a zeroed buffer of at least `size` bytes of system memory, which the GPU accesses
+    /// coherently with the CPU's caches. Its size is rounded up to the page size.
+    pub(crate) fn alloc_system(&self, size: usize) -> Result<SystemBuffer> {
+        let size = size
+            .checked_next_multiple_of(PAGE_SIZE)
+            .filter(|&size| size != 0)
+            .ok_or(EINVAL)?;
+
+        SystemBuffer::new(self.gsp_resources.device.as_ref(), size)
+    }
+
     /// Runs self-tests on the constructed [`Gpu`], logging failures without failing probe.
     #[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
     pub(crate) fn run_selftests(self: Pin<&mut Self>, pdev: &pci::Device<device::Bound>) {
@@ -1211,8 +1449,9 @@ impl PinnedDrop for Gpu<'_> {
     fn drop(self: Pin<&mut Self>) {
         let this = self.project();
 
-        // `display_engine` is locked before `mm`.
+        // `display_engine` is locked before `copy`, and `copy` before `mm`.
         let output = this.display_engine.lock().take();
+        let copy = this.copy.lock().take();
         let mut mm = this.mm.lock();
 
         // Before any field is dropped: unmapping needs `mm`, `bar_user` and a running GSP.
@@ -1253,6 +1492,10 @@ impl PinnedDrop for Gpu<'_> {
             let _ = display
                 .free(dev, &gsp_resources.gsp.cmdq)
                 .inspect_err(|e| dev_err!(dev, "failed to free the display objects: {:?}\n", e));
+        }
+
+        if let Some(mut copy) = copy {
+            copy.free(dev, &gsp_resources.gsp.cmdq, &mut mm);
         }
 
         // Last, as every other RM object is allocated under it.

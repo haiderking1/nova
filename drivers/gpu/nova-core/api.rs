@@ -16,6 +16,11 @@ use kernel::{
 };
 
 pub use crate::{
+    buffer::{
+        SystemBuffer,
+        VramBuffer,
+        VRAM_BUFFER_ALIGN, //
+    },
     channel::{
         gr::GraphicsInfo,
         hal::Classes, //
@@ -180,6 +185,25 @@ impl NovaCoreApi<'_> {
     /// Fails with `ENODEV` if the graphics engine isn't set up.
     pub fn graphics_info(&self) -> Result<GraphicsInfo> {
         self.gpu.graphics_info()
+    }
+
+    /// Allocates a buffer of at least `size` bytes of VRAM, zeroed, with a window in BAR1 for the
+    /// CPU if `cpu_visible`. Its size is rounded up to [`VRAM_BUFFER_ALIGN`].
+    ///
+    /// It must be given back to [`NovaCoreApi::free_vram`].
+    pub fn alloc_vram(&self, size: usize, cpu_visible: bool) -> Result<VramBuffer> {
+        self.gpu.alloc_vram(size, cpu_visible)
+    }
+
+    /// Frees `buffer`, tearing down its window in BAR1.
+    pub fn free_vram(&self, buffer: VramBuffer) {
+        self.gpu.free_vram(buffer)
+    }
+
+    /// Allocates a zeroed buffer of at least `size` bytes of system memory, which the GPU
+    /// accesses coherently with the CPU's caches. Its size is rounded up to the page size.
+    pub fn alloc_system(&self, size: usize) -> Result<SystemBuffer> {
+        self.gpu.alloc_system(size)
     }
 }
 
