@@ -298,6 +298,64 @@ TEST_F(nova, gem_invalid)
 	EXPECT_EQ(-EINVAL, nova_gem_create(self->fd, 0, 0));
 }
 
+/*
+ * Shares an object with @flags from @fd with another file as a dma-buf: the importer gets the same
+ * object, under one handle however often it imports it, and keeps it once the exporter's handle
+ * is closed.
+ */
+static void gem_share(struct __test_metadata *_metadata, int fd, __u32 flags)
+{
+	struct drm_prime_handle export = { .flags = DRM_CLOEXEC | DRM_RDWR };
+	struct drm_prime_handle import = {}, again = {};
+	struct drm_nova_gem_info info, imported;
+	__u32 *map;
+	int handle, other;
+
+	other = nova_open("renderD", RENDER_NODE_FIRST);
+	ASSERT_LE(0, other);
+
+	handle = nova_gem_create(fd, 64 << 10, flags);
+	ASSERT_LE(0, handle);
+	ASSERT_EQ(0, nova_gem_info(fd, handle, &info));
+	map = nova_gem_mmap(fd, info.mmap_offset, info.size);
+	ASSERT_NE(NULL, map);
+	write_pattern(map, info.size);
+	ASSERT_EQ(0, munmap(map, info.size));
+
+	export.handle = handle;
+	ASSERT_EQ(0, ioctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &export));
+	EXPECT_EQ((off_t)info.size, lseek(export.fd, 0, SEEK_END));
+	nova_gem_close(fd, handle);
+
+	import.fd = export.fd;
+	ASSERT_EQ(0, ioctl(other, DRM_IOCTL_PRIME_FD_TO_HANDLE, &import));
+	again.fd = export.fd;
+	ASSERT_EQ(0, ioctl(other, DRM_IOCTL_PRIME_FD_TO_HANDLE, &again));
+	EXPECT_EQ(import.handle, again.handle);
+	close(export.fd);
+
+	ASSERT_EQ(0, nova_gem_info(other, import.handle, &imported));
+	EXPECT_EQ(info.size, imported.size);
+	EXPECT_EQ(info.flags, imported.flags);
+	map = nova_gem_mmap(other, imported.mmap_offset, imported.size);
+	ASSERT_NE(NULL, map);
+	EXPECT_EQ(-1, check_pattern(map, imported.size));
+	ASSERT_EQ(0, munmap(map, imported.size));
+
+	nova_gem_close(other, import.handle);
+	close(other);
+}
+
+TEST_F(nova, gem_share_system)
+{
+	gem_share(_metadata, self->fd, 0);
+}
+
+TEST_F(nova, gem_share_vram)
+{
+	gem_share(_metadata, self->fd, DRM_NOVA_GEM_VRAM | DRM_NOVA_GEM_CPU_VISIBLE);
+}
+
 /* Dumb buffers, which the CPU draws into for display, are on the primary node. */
 TEST(dumb)
 {
