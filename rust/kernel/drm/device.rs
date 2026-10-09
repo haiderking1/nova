@@ -221,6 +221,9 @@ impl<T: drm::Driver> UnregisteredDevice<T> {
         if T::FEAT_RENDER {
             features |= drm::driver::FEAT_RENDER;
         }
+        if T::FEAT_SYNCOBJ {
+            features |= drm::driver::FEAT_SYNCOBJ | drm::driver::FEAT_SYNCOBJ_TIMELINE;
+        }
         if Device::<T>::has_kms() {
             features |= drm::driver::FEAT_MODESET | drm::driver::FEAT_ATOMIC;
         }

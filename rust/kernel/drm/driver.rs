@@ -29,6 +29,12 @@ pub(crate) const FEAT_MODESET: u32 = bindings::drm_driver_feature_DRIVER_MODESET
 /// The driver supports atomic modesetting.
 pub(crate) const FEAT_ATOMIC: u32 = bindings::drm_driver_feature_DRIVER_ATOMIC;
 
+/// The driver supports synchronization objects.
+pub(crate) const FEAT_SYNCOBJ: u32 = bindings::drm_driver_feature_DRIVER_SYNCOBJ;
+
+/// The driver supports the timelines of synchronization objects.
+pub(crate) const FEAT_SYNCOBJ_TIMELINE: u32 = bindings::drm_driver_feature_DRIVER_SYNCOBJ_TIMELINE;
+
 /// Information data for a DRM Driver.
 pub struct DriverInfo {
     /// Driver major version.
@@ -162,6 +168,14 @@ pub trait Driver {
     /// usable from the render node (i.e. marked DRM_RENDER_ALLOW), whereas
     /// userspace processes using the master node can invoke any ioctl.
     const FEAT_RENDER: bool = false;
+
+    /// Sets the `DRIVER_SYNCOBJ` and `DRIVER_SYNCOBJ_TIMELINE` features for this driver.
+    ///
+    /// When enabled, userspace can create synchronization objects, binary and with timelines,
+    /// wait for them and transfer fences between them with the core ioctls. The driver takes
+    /// the fences it waits for from them, and gives them the fences of the work it runs (see
+    /// [`drm::syncobj`]).
+    const FEAT_SYNCOBJ: bool = false;
 }
 
 /// The registration type of a `drm::Device`.

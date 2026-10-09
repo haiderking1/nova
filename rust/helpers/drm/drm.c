@@ -7,4 +7,5 @@
 
 #include "gem.c"
 #include "gpuvm.c"
+#include "syncobj.c"
 #include "vma_manager.c"
