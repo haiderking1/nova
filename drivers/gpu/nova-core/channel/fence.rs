@@ -23,6 +23,7 @@ use kernel::{
         FenceContext,
         FenceContextOps, //
     },
+    impl_has_hr_timer,
     new_spinlock_irq,
     page::PAGE_SIZE,
     prelude::*,
@@ -32,6 +33,20 @@ use kernel::{
         Arc,
         SetOnce,
         SpinLockIrq, //
+    },
+    time::{
+        hrtimer::{
+            HrTimer,
+            HrTimerCallback,
+            HrTimerCallbackContext,
+            HrTimerRestart,
+            PinHrTimerHandle,
+            RelativeMode,
+            UnsafeHrTimerPointer, //
+        },
+        Delta,
+        Instant,
+        Monotonic, //
     }, //
 };
 
@@ -88,11 +103,27 @@ struct Pending<'a> {
     fences: KVec<(u32, DriverFence<'a, ChannelFences>)>,
     /// Set once the channel runs no more work: the error its fences signal with.
     error: Option<Error>,
+    /// While fences are pending, the semaphore's value as the watchdog last saw it, and when it
+    /// last saw it change.
+    progress: Option<(u32, Instant<Monotonic>)>,
+}
+
+impl Pending<'_> {
+    /// Has the fences pending, and those added later, signal `err`.
+    fn fail(&mut self, err: Error) {
+        self.error = Some(err);
+        self.progress = None;
+        for (_, fence) in self.fences.drain_all() {
+            fence.signal(Err(err));
+        }
+    }
 }
 
 /// The fences of a channel, and the semaphore that its submissions release.
 #[pin_data]
 pub(crate) struct Timeline<'a> {
+    /// The ID of the channel, for logging.
+    chid: u32,
     context: &'a ChannelFenceContext,
     /// The page whose first 4 bytes are the semaphore, which the GPU writes coherently with the
     /// CPU's caches.
@@ -102,19 +133,23 @@ pub(crate) struct Timeline<'a> {
 }
 
 impl<'a> Timeline<'a> {
-    /// Creates the timeline of a channel, on `context`, with a new semaphore, which holds 0.
+    /// Creates the timeline of a channel, channel `chid`, on `context`, with a new semaphore, which
+    /// holds 0.
     pub(crate) fn new(
         dev: &'a device::Device<device::Bound>,
         context: &'a ChannelFenceContext,
+        chid: u32,
     ) -> Result<Arc<Self>> {
         Arc::pin_init(
             try_pin_init!(Self {
+                chid,
                 context,
                 semaphore: Coherent::<u8>::zeroed_slice(dev, PAGE_SIZE, GFP_KERNEL)?,
                 pending <- new_spinlock_irq!(
                     Pending {
                         fences: KVec::new(),
                         error: None,
+                        progress: None,
                     },
                     "nova_channel_fences"
                 ),
@@ -209,10 +244,33 @@ impl<'a> Timeline<'a> {
 
     /// Has the fences pending, and those added later, signal `err`: the channel runs no more work.
     pub(crate) fn fail(&self, err: Error) {
+        self.pending.lock().fail(err);
+    }
+
+    /// Has the fences pending signal `-ETIMEDOUT`, and the channel run no more work, if the
+    /// semaphore made no progress for `timeout` while they were pending, as of `now`.
+    ///
+    /// Returns whether it did. Takes no sleeping lock, for the watchdog's timer.
+    fn check_progress(&self, now: Instant<Monotonic>, timeout: Delta) -> bool {
+        let value = self.completed();
         let mut pending = self.pending.lock();
-        pending.error = Some(err);
-        for (_, fence) in pending.fences.drain_all() {
-            fence.signal(Err(err));
+        if pending.error.is_some() || pending.fences.is_empty() {
+            pending.progress = None;
+            return false;
+        }
+
+        match pending.progress {
+            Some((last, since)) if last == value => {
+                if now - since < timeout {
+                    return false;
+                }
+                pending.fail(ETIMEDOUT);
+                true
+            }
+            _ => {
+                pending.progress = Some((value, now));
+                false
+            }
         }
     }
 }
@@ -253,5 +311,79 @@ impl<'a> Timelines<'a> {
         for timeline in self.active.lock().iter() {
             timeline.signal_completed();
         }
+    }
+}
+
+impl Timelines<'_> {
+    /// Fails the channels whose semaphore made no progress for `timeout` while fences were
+    /// pending: their work is hung.
+    ///
+    /// Takes no sleeping lock, for the watchdog's timer.
+    fn check_progress(&self, timeout: Delta) {
+        let now = Instant::now();
+        for timeline in self.active.lock().iter() {
+            if timeline.check_progress(now, timeout) {
+                pr_err!(
+                    "client channel {}: no progress for {} ms, runs no more work\n",
+                    timeline.chid,
+                    timeout.as_millis()
+                );
+            }
+        }
+    }
+}
+
+/// How often the watchdog checks the progress of the work of channels.
+const WATCHDOG_PERIOD: Delta = Delta::from_secs(1);
+
+/// How long the work of a channel may make no progress before it is considered hung: much longer
+/// than a frame.
+pub(crate) const PROGRESS_TIMEOUT: Delta = Delta::from_secs(5);
+
+/// The watchdog of the work of channels, which fails those whose work makes no progress for
+/// [`PROGRESS_TIMEOUT`]: their fences signal `-ETIMEDOUT`, so that their waiters don't wait
+/// forever, and they run no more work.
+#[pin_data]
+pub(crate) struct Watchdog<'a> {
+    #[pin]
+    timer: HrTimer<Self>,
+    timelines: &'a Timelines<'a>,
+}
+
+impl<'a> Watchdog<'a> {
+    /// Creates the watchdog of `timelines`, not started.
+    pub(crate) fn new(timelines: &'a Timelines<'a>) -> impl PinInit<Self> {
+        pin_init!(Self {
+            timer <- HrTimer::new(),
+            timelines,
+        })
+    }
+
+    /// Starts the watchdog, which runs until the returned handle drops.
+    pub(crate) fn start(self: Pin<&'a Self>) -> PinHrTimerHandle<'a, Self> {
+        // SAFETY: The handle borrows `self` for as long as it exists, and stops the timer, waiting
+        // for its callback to return, when it drops.
+        unsafe { UnsafeHrTimerPointer::start(self, WATCHDOG_PERIOD) }
+    }
+}
+
+impl<'a> HrTimerCallback for Watchdog<'a> {
+    type Pointer<'b>
+        = Pin<&'b Watchdog<'a>>
+    where
+        Self: 'b;
+
+    fn run(this: Pin<&Self>, mut ctx: HrTimerCallbackContext<'_, Self>) -> HrTimerRestart {
+        this.timelines.check_progress(PROGRESS_TIMEOUT);
+        ctx.forward_now(WATCHDOG_PERIOD);
+
+        HrTimerRestart::Restart
+    }
+}
+
+impl_has_hr_timer! {
+    impl{'a} HasHrTimer<Self> for Watchdog<'a> {
+        mode: RelativeMode<Monotonic>,
+        field: self.timer
     }
 }

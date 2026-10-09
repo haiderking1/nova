@@ -46,7 +46,8 @@ use super::{
     copy,
     fence::{
         ChannelFenceContext,
-        Timeline, //
+        Timeline,
+        PROGRESS_TIMEOUT, //
     },
     gpfifo::{
         Channel,
@@ -98,10 +99,6 @@ pub enum ChannelEngine {
 /// Number of push buffers a client's channel runs at once: those of the GPFIFO ring but the
 /// kernel's push buffer and the one entry a full ring keeps free.
 pub const PUSH_MAX: u32 = GPFIFO_ENTRIES - 2;
-
-/// How long a channel may make no progress on the work submitted before it's considered hung: much
-/// longer than a frame.
-const PROGRESS_TIMEOUT: Delta = Delta::from_secs(5);
 
 /// A push buffer of a client.
 #[derive(Clone, Copy, Debug)]
@@ -157,7 +154,7 @@ impl<'a> ClientChannel<'a> {
                 (info, Some(info.copy_engine_index().ok_or(ENODEV)?))
             }
         };
-        let timeline = Timeline::new(dev, fence_context)?;
+        let timeline = Timeline::new(dev, fence_context, chid)?;
 
         let channel = Channel::new(
             dev,
@@ -385,7 +382,7 @@ impl<'a> ClientChannel<'a> {
     /// channel runs no more work, such as once its work didn't finish in time.
     pub(crate) fn fail(&mut self, err: Error) {
         pr_err!(
-            "nova-core: client channel {}: runs no more work ({:?})\n",
+            "client channel {}: runs no more work ({:?})\n",
             self.channel.chid(),
             err
         );

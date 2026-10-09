@@ -30,6 +30,7 @@ use kernel::{
         Mutex,
         SetOnce, //
     },
+    time::hrtimer::PinHrTimerHandle,
     uapi, //
 };
 
@@ -51,7 +52,8 @@ use crate::{
         copy::CopyChannel,
         fence::{
             FenceContexts,
-            Timelines, //
+            Timelines,
+            Watchdog, //
         },
         gr::{
             GrContext,
@@ -569,6 +571,17 @@ pub(crate) struct Gpu<'gpu> {
     notification_vectors: SetOnce<NotificationVectors<'gpu>>,
     /// Borrow of `notification_vectors` that `_gsp_subtree` holds, taken by hand like `tree_ref`.
     notification_vectors_ref: &'gpu SetOnce<NotificationVectors<'gpu>>,
+    /// The running watchdog of the work of channels, stopped when it drops.
+    ///
+    /// Must be kept declared *before* `watchdog`, which it borrows.
+    _watchdog_timer: PinHrTimerHandle<'gpu, Watchdog<'gpu>>,
+    /// The watchdog of the work of channels.
+    ///
+    /// Must be kept declared *before* `timelines`, which it borrows.
+    #[pin]
+    watchdog: Watchdog<'gpu>,
+    /// Borrow of `watchdog`, taken by hand like `tree_ref`.
+    watchdog_ref: &'gpu Watchdog<'gpu>,
     /// The timelines of the channels whose fences the notification vectors' service signals.
     ///
     /// Must be kept declared *after* `notification_vectors` and `client_channels`, which hold
@@ -688,6 +701,15 @@ impl<'gpu> Gpu<'gpu> {
             // SAFETY: `timelines` is initialized above, is pinned at a stable address, and is
             // dropped after every field that uses `timelines_ref` (struct field drop order).
             timelines_ref: unsafe { &*core::ptr::from_ref(timelines.as_ref().get_ref()) },
+
+            watchdog <- Watchdog::new(timelines_ref),
+
+            // SAFETY: `watchdog` is initialized above, is pinned at a stable address, and is
+            // dropped after every field that uses `watchdog_ref` (struct field drop order).
+            watchdog_ref: unsafe { &*core::ptr::from_ref(watchdog.as_ref().get_ref()) },
+
+            // SAFETY: `watchdog` is pinned, as its borrow `watchdog_ref` is.
+            _watchdog_timer: unsafe { Pin::new_unchecked(*watchdog_ref) }.start(),
 
             notification_vectors: SetOnce::new(),
 
