@@ -291,6 +291,13 @@ config DRM_SCHED
 	tristate
 	depends on DRM
 
+config RUST_DRM_SCHED
+	bool
+	depends on DRM
+	select DRM_SCHED
+	help
+	  Choose this if you need the GPU scheduler in Rust
+
 # Separate option as not all DRM drivers use it
 config DRM_PANEL_BACKLIGHT_QUIRKS
 	tristate
