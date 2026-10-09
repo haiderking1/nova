@@ -18,6 +18,7 @@ use crate::{
         },
     },
     error::to_result,
+    mm::virt::VmaNew,
     prelude::*,
     sync::aref::{
         ARef,
@@ -105,6 +106,167 @@ pub trait DriverObject: Sync + Send + Sized + 'static {
 
     /// Close a handle to an existing object, associated with a File.
     fn close(_obj: &DriverAllocImpl<Self>, _file: &DriverFile<Self>) {}
+
+    /// Whether [`Object`]s have no shmem file backing them (`drm_gem_private_object_init()`): the
+    /// driver provides their memory, and maps it with [`DriverObject::mmap`] and
+    /// [`DriverObject::vmap`].
+    ///
+    /// Only used by [`Object`].
+    const PRIVATE: bool = false;
+
+    /// Maps `obj` into the address space of a process, with `vma`, which spans at most its size.
+    ///
+    /// Each mapping holds a reference to `obj`. Only used by [`Object`].
+    fn mmap(_obj: &Object<Self>, _vma: &VmaNew) -> Result {
+        Err(ENODEV)
+    }
+
+    /// Maps the memory of `obj` into the kernel's address space, until [`DriverObject::vunmap`].
+    ///
+    /// Only used by [`Object`].
+    fn vmap(_obj: &Object<Self>) -> Result<KernelMapping> {
+        Err(EOPNOTSUPP)
+    }
+
+    /// Ends `map`, a mapping returned by [`DriverObject::vmap`].
+    ///
+    /// Only used by [`Object`].
+    fn vunmap(_obj: &Object<Self>, _map: KernelMapping) {}
+
+    /// Returns the arguments of the object of a dumb buffer of `size` bytes, a buffer the CPU
+    /// draws into for display, or fails if the driver has no dumb buffers.
+    ///
+    /// Only used by [`Object`].
+    fn dumb_args(_dev: &drm::Device<Self::Driver>, _size: usize) -> Result<Self::Args> {
+        Err(EOPNOTSUPP)
+    }
+}
+
+/// A mapping of the memory of a GEM object into the kernel's address space.
+#[derive(Clone, Copy, Debug)]
+pub enum KernelMapping {
+    /// Of system memory.
+    System(NonNull<u8>),
+    /// Of I/O memory, such as a PCI BAR showing the memory of a device.
+    Io(NonNull<u8>),
+}
+
+/// The operations of the vmas mapping [`Object`]s.
+struct VmOps(bindings::vm_operations_struct);
+
+// SAFETY: The operations are never written, and their pointers are null.
+unsafe impl Sync for VmOps {}
+
+/// The operations of the vmas mapping [`Object`]s: each holds a reference to its object, like the
+/// vmas of the objects of DRM's GEM helpers.
+static VM_OPS: VmOps = VmOps(bindings::vm_operations_struct {
+    open: Some(bindings::drm_gem_vm_open),
+    close: Some(bindings::drm_gem_vm_close),
+    ..pin_init::zeroed()
+});
+
+extern "C" fn mmap_callback<T: DriverObject>(
+    raw_obj: *mut bindings::drm_gem_object,
+    raw_vma: *mut bindings::vm_area_struct,
+) -> core::ffi::c_int {
+    // SAFETY: `mmap_callback` is only in the functions of `Object<T>`, so `raw_obj` is contained
+    // within an `Object<T>`.
+    let obj: &Object<T> = unsafe { IntoGEMObject::from_raw(raw_obj) };
+
+    // SAFETY: DRM calls `mmap` from `drm_gem_mmap_obj()`, in the `mmap` file operation, while the
+    // vma is set up.
+    let vma = unsafe { VmaNew::from_raw(raw_vma) };
+
+    // `drm_gem_mmap_obj()` checked that the vma spans at most the object, which it must keep to.
+    vma.set_dontexpand();
+
+    match T::mmap(obj, vma) {
+        Ok(()) => 0,
+        Err(e) => e.to_errno(),
+    }
+}
+
+extern "C" fn vmap_callback<T: DriverObject>(
+    raw_obj: *mut bindings::drm_gem_object,
+    map: *mut bindings::iosys_map,
+) -> core::ffi::c_int {
+    // SAFETY: `vmap_callback` is only in the functions of `Object<T>`, so `raw_obj` is contained
+    // within an `Object<T>`.
+    let obj: &Object<T> = unsafe { IntoGEMObject::from_raw(raw_obj) };
+
+    let (vaddr, is_iomem) = match T::vmap(obj) {
+        Ok(KernelMapping::System(vaddr)) => (vaddr, false),
+        Ok(KernelMapping::Io(vaddr)) => (vaddr, true),
+        Err(e) => return e.to_errno(),
+    };
+
+    // SAFETY: DRM passes a valid `map` to fill in. Both members of its union are pointers.
+    unsafe {
+        map.write(bindings::iosys_map {
+            is_iomem,
+            __bindgen_anon_1: bindings::iosys_map__bindgen_ty_1 {
+                vaddr: vaddr.as_ptr().cast(),
+            },
+        })
+    };
+
+    0
+}
+
+extern "C" fn vunmap_callback<T: DriverObject>(
+    raw_obj: *mut bindings::drm_gem_object,
+    map: *mut bindings::iosys_map,
+) {
+    // SAFETY: `vunmap_callback` is only in the functions of `Object<T>`, so `raw_obj` is contained
+    // within an `Object<T>`.
+    let obj: &Object<T> = unsafe { IntoGEMObject::from_raw(raw_obj) };
+
+    // SAFETY: DRM passes the valid `map` `vmap_callback` filled in. Both members of its union are
+    // pointers.
+    let (vaddr, is_iomem) = unsafe { ((*map).__bindgen_anon_1.vaddr, (*map).is_iomem) };
+    let Some(vaddr) = NonNull::new(vaddr.cast()) else {
+        return;
+    };
+
+    T::vunmap(
+        obj,
+        if is_iomem {
+            KernelMapping::Io(vaddr)
+        } else {
+            KernelMapping::System(vaddr)
+        },
+    );
+}
+
+unsafe extern "C" fn dumb_create_callback<T: DriverObject>(
+    raw_file: *mut bindings::drm_file,
+    raw_dev: *mut bindings::drm_device,
+    args: *mut bindings::drm_mode_create_dumb,
+) -> core::ffi::c_int {
+    // SAFETY: DRM passes valid pointers. The device is the one of the driver of `T`, whose objects
+    // are `Object<T>`s, as `dumb_create_callback` is only in their `AllocOps`.
+    let dev: &drm::Device<T::Driver> = unsafe { drm::Device::from_raw(raw_dev) };
+
+    let create = || -> Result {
+        // SAFETY: DRM passes valid pointers.
+        to_result(unsafe { bindings::drm_mode_size_dumb(raw_dev, args, 0, 0) })?;
+        // SAFETY: `args` is valid, and `drm_mode_size_dumb()` filled in its size.
+        let size = usize::try_from(unsafe { (*args).size })?;
+
+        let obj = Object::<T>::new(dev, size, T::dumb_args(dev, size)?)?;
+        let mut handle = 0;
+        // SAFETY: `raw_file` and the object are valid. The handle holds its own reference.
+        to_result(unsafe { bindings::drm_gem_handle_create(raw_file, obj.as_raw(), &mut handle) })?;
+        // SAFETY: `args` is valid.
+        unsafe { (*args).handle = handle };
+
+        Ok(())
+    };
+
+    match create() {
+        Ok(()) => 0,
+        Err(e) => e.to_errno(),
+    }
 }
 
 /// Trait that represents a GEM object subtype
@@ -271,11 +433,11 @@ impl<T: DriverObject, Ctx: DeviceContext> Object<T, Ctx> {
         pin: None,
         unpin: None,
         get_sg_table: None,
-        vmap: None,
-        vunmap: None,
-        mmap: None,
+        vmap: Some(vmap_callback::<T>),
+        vunmap: Some(vunmap_callback::<T>),
+        mmap: Some(mmap_callback::<T>),
         status: None,
-        vm_ops: core::ptr::null_mut(),
+        vm_ops: &raw const VM_OPS.0,
         evict: None,
         rss: None,
     };
@@ -331,7 +493,10 @@ impl<T: DriverObject> Object<T> {
 
         // INVARIANT: `dev` and the GEM object are in the same state at the moment, and upgrading
         // the typestate in `dev` will not carry over to the GEM object.
-        if let Err(err) =
+        if T::PRIVATE {
+            // SAFETY: The arguments are all valid per the type invariants.
+            unsafe { bindings::drm_gem_private_object_init(dev.as_raw(), obj.obj.get(), size) };
+        } else if let Err(err) =
             // SAFETY: The arguments are all valid per the type invariants.
             to_result(unsafe {
                 bindings::drm_gem_object_init(dev.as_raw(), obj.obj.get(), size)
@@ -379,11 +544,12 @@ impl<T: DriverObject, Ctx: DeviceContext> AllocImpl for Object<T, Ctx> {
         prime_fd_to_handle: None,
         gem_prime_import: None,
         gem_prime_import_sg_table: None,
-        dumb_create: None,
+        dumb_create: Some(dumb_create_callback::<T>),
         dumb_map_offset: None,
+        // The CPU maps the objects with `vmap`, which the shadow buffer of fbdev is copied to.
         #[cfg(CONFIG_DRM_FBDEV_EMULATION = "y")]
         fbdev_probe: if drm::Device::<T::Driver>::has_kms() {
-            Some(bindings::drm_fbdev_dma_driver_fbdev_probe)
+            Some(bindings::drm_fbdev_shadow_driver_fbdev_probe)
         } else {
             None
         },
