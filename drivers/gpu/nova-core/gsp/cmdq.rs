@@ -405,6 +405,15 @@ impl<'a> DmaGspMem<'a> {
             (slice_1.as_flattened_mut(), slice_2.as_flattened_mut())
         };
 
+        // GSP-RM checksums an element in 64-bit words, reading up to 7 bytes past its end, and
+        // expects them to be zero (`_checkSum32` in NVIDIA's `message_queue_priv.h`). The ring
+        // still holds what earlier elements left there, so clear the element and its padding.
+        // Elements take whole pages, so the padding fits in the space that was waited for.
+        let padded = (size_of::<GspMsgElement>() + size).next_multiple_of(size_of::<u64>());
+        let first = padded.min(slice_1.len());
+        slice_1[..first].fill(0);
+        slice_2.get_mut(..padded - first).ok_or(EIO)?.fill(0);
+
         // Extract area for the `GspMsgElement`.
         let (header, slice_1) = GspMsgElement::from_bytes_mut_prefix(slice_1).ok_or(EIO)?;
 
