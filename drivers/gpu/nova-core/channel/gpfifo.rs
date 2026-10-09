@@ -302,6 +302,19 @@ impl<'a> Channel<'a> {
             .map_vram_aligned(mm, range, alignment, access)
     }
 
+    /// Like [`Channel::map_vram_aligned`], for the page-aligned range `dma` of DMA addresses of
+    /// coherent system memory.
+    pub(crate) fn map_sysmem_aligned(
+        &mut self,
+        mm: &mut GpuMm<'_>,
+        dma: Range<u64>,
+        alignment: u64,
+        access: Access,
+    ) -> Result<MappedRange> {
+        self.address_space
+            .map_sysmem_aligned(mm, dma, alignment, access)
+    }
+
     /// Tears down a mapping made by [`Channel::map_vram`] or [`Channel::map_vram_aligned`].
     pub(crate) fn unmap(&mut self, mm: &mut GpuMm<'_>, mapped: MappedRange) -> Result {
         self.address_space.unmap(mm, mapped)

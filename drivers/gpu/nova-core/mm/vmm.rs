@@ -28,6 +28,7 @@ use crate::{
                 WalkResult, //
             },
             Access,
+            AperturePte,
             MmuVersion, //
         },
         GpuMm,
@@ -41,6 +42,25 @@ use crate::{
         IntoSafeCast, //
     },
 };
+
+/// Memory pages are mapped from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Memory {
+    /// VRAM: frame numbers are VRAM addresses shifted right by 12.
+    Vram,
+    /// System memory the GPU accesses coherently with the CPU caches: frame numbers are DMA
+    /// addresses shifted right by 12.
+    SystemCoherent,
+}
+
+impl Memory {
+    fn aperture(self) -> AperturePte {
+        match self {
+            Self::Vram => AperturePte::VideoMemory,
+            Self::SystemCoherent => AperturePte::SystemCoherent,
+        }
+    }
+}
 
 /// Multi-page prepared mapping -- VA range allocated, ready for execute.
 ///
@@ -298,6 +318,18 @@ impl Vmm {
         pfns: &[Pfn],
         access: Access,
     ) -> Result<MappedRange> {
+        self.execute_map_memory(mm, prepared, pfns, access, Memory::Vram)
+    }
+
+    /// Like [`Vmm::execute_map()`], for pages of `memory`.
+    pub(crate) fn execute_map_memory(
+        &mut self,
+        mm: &mut GpuMm<'_>,
+        prepared: PreparedMapping,
+        pfns: &[Pfn],
+        access: Access,
+        memory: Memory,
+    ) -> Result<MappedRange> {
         if pfns.len() != prepared.num_pages {
             self.free_vfn(prepared.vfn_start);
             return Err(EINVAL);
@@ -317,6 +349,7 @@ impl Vmm {
             vfn_start,
             pfns,
             access,
+            memory.aperture(),
         ) {
             self.free_vfn(vfn_start);
             return Err(e);
@@ -341,6 +374,18 @@ impl Vmm {
         va_range: Option<Range<u64>>,
         access: Access,
     ) -> Result<MappedRange> {
+        self.map_memory(mm, pfns, va_range, access, Memory::Vram)
+    }
+
+    /// Like [`Vmm::map_pages()`], for pages of `memory`.
+    pub(crate) fn map_memory(
+        &mut self,
+        mm: &mut GpuMm<'_>,
+        pfns: &[Pfn],
+        va_range: Option<Range<u64>>,
+        access: Access,
+        memory: Memory,
+    ) -> Result<MappedRange> {
         if pfns.is_empty() {
             return Err(EINVAL);
         }
@@ -359,7 +404,7 @@ impl Vmm {
         }
 
         let prepared = self.prepare_map(mm, pfns.len(), va_range)?;
-        self.execute_map(mm, prepared, pfns, access)
+        self.execute_map_memory(mm, prepared, pfns, access, memory)
     }
 
     /// Unmap all pages in a [`MappedRange`] with a single TLB flush.

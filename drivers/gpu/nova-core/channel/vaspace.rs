@@ -42,6 +42,7 @@ use crate::{
         },
         vmm::{
             MappedRange,
+            Memory,
             Vmm, //
         },
         ContiguousVram,
@@ -215,7 +216,12 @@ impl AddressSpace {
         range: Range<VramAddress>,
         access: Access,
     ) -> Result<MappedRange> {
-        self.vmm.map_pages(mm, &Self::pfns(range)?, None, access)
+        self.vmm.map_pages(
+            mm,
+            &Self::pfns(range.start.into_raw()..range.end.into_raw())?,
+            None,
+            access,
+        )
     }
 
     /// Like [`AddressSpace::map_vram`], but at a virtual address aligned to `alignment`, a power
@@ -227,6 +233,37 @@ impl AddressSpace {
         range: Range<VramAddress>,
         alignment: u64,
         access: Access,
+    ) -> Result<MappedRange> {
+        self.map_aligned(
+            mm,
+            range.start.into_raw()..range.end.into_raw(),
+            alignment,
+            access,
+            Memory::Vram,
+        )
+    }
+
+    /// Like [`AddressSpace::map_vram_aligned`], for the page-aligned range `dma` of DMA addresses
+    /// of coherent system memory.
+    pub(crate) fn map_sysmem_aligned(
+        &mut self,
+        mm: &mut GpuMm<'_>,
+        dma: Range<u64>,
+        alignment: u64,
+        access: Access,
+    ) -> Result<MappedRange> {
+        self.map_aligned(mm, dma, alignment, access, Memory::SystemCoherent)
+    }
+
+    /// Maps the page-aligned `range` of addresses of `memory` at a virtual address aligned to
+    /// `alignment`.
+    fn map_aligned(
+        &mut self,
+        mm: &mut GpuMm<'_>,
+        range: Range<u64>,
+        alignment: u64,
+        access: Access,
+        memory: Memory,
     ) -> Result<MappedRange> {
         if !alignment.is_power_of_two() {
             return Err(EINVAL);
@@ -241,15 +278,17 @@ impl AddressSpace {
             .filter(|&end| end <= VA_SIZE)
             .ok_or(ENOSPC)?;
 
-        let mapped = self.vmm.map_pages(mm, &pfns, Some(start..end), access)?;
+        let mapped = self
+            .vmm
+            .map_memory(mm, &pfns, Some(start..end), access, memory)?;
         self.next_aligned = end;
 
         Ok(mapped)
     }
 
-    /// Returns the frames of the page-aligned VRAM `range`.
-    fn pfns(range: Range<VramAddress>) -> Result<KVec<Pfn>> {
-        let (start, end) = (range.start.into_raw(), range.end.into_raw());
+    /// Returns the frames of the page-aligned address `range`.
+    fn pfns(range: Range<u64>) -> Result<KVec<Pfn>> {
+        let (start, end) = (range.start, range.end);
         let page_size = u64::try_from(PAGE_SIZE)?;
         if start % page_size != 0 || end % page_size != 0 || start >= end {
             return Err(EINVAL);

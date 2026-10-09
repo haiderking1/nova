@@ -196,6 +196,7 @@ impl<M: MmuConfig> PtMapInner<M> {
         vfn_start: Vfn,
         pfns: &[Pfn],
         access: Access,
+        aperture: AperturePte,
     ) -> Result {
         {
             let pramin = mm.pramin_mut();
@@ -231,7 +232,7 @@ impl<M: MmuConfig> PtMapInner<M> {
 
                 match result {
                     WalkResult::Unmapped { pte_addr } | WalkResult::Mapped { pte_addr, .. } => {
-                        let pte = M::Pte::new(AperturePte::VideoMemory, pfn, access);
+                        let pte = M::Pte::new(aperture, pfn, access);
                         pte.write(pramin, pte_addr)?;
                     }
                     WalkResult::PageTableMissing => {
@@ -327,10 +328,19 @@ impl PtMap {
         vfn_start: Vfn,
         pfns: &[Pfn],
         access: Access,
+        aperture: AperturePte,
     ) -> Result {
         pt_map_dispatch!(
             self,
-            install_mappings(mm, pt_pages, page_table_allocs, vfn_start, pfns, access)
+            install_mappings(
+                mm,
+                pt_pages,
+                page_table_allocs,
+                vfn_start,
+                pfns,
+                access,
+                aperture
+            )
         )
     }
 
