@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 
 #include <linux/dma-fence.h>
+#include <linux/dma-fence-chain.h>
 
 __rust_helper void rust_helper_dma_fence_get(struct dma_fence *f)
 {
@@ -46,4 +47,14 @@ __rust_helper void rust_helper_dma_fence_unlock_irqrestore(struct dma_fence *f,
 __rust_helper void rust_helper_dma_fence_set_error(struct dma_fence *f, int error)
 {
 	dma_fence_set_error(f, error);
+}
+
+__rust_helper struct dma_fence_chain *rust_helper_dma_fence_chain_alloc(void)
+{
+	return dma_fence_chain_alloc();
+}
+
+__rust_helper void rust_helper_dma_fence_chain_free(struct dma_fence_chain *chain)
+{
+	dma_fence_chain_free(chain);
 }

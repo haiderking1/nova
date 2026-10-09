@@ -544,6 +544,30 @@ impl Fence {
         Ok(ret > 0)
     }
 
+    /// Waits for the fence to be signaled.
+    ///
+    /// A waiter that is `interruptible` returns early with `ERESTARTSYS` on a signal.
+    ///
+    /// This may sleep, so it must not be called in atomic context.
+    pub fn wait(&self, interruptible: bool) -> Result {
+        // SAFETY: `self.as_raw()` is a valid, initialized `struct dma_fence`, which stays valid
+        // for the duration of the call as `self` holds a reference to it.
+        let ret = unsafe {
+            bindings::dma_fence_wait_timeout(
+                self.as_raw(),
+                interruptible,
+                crate::task::MAX_SCHEDULE_TIMEOUT,
+            )
+        };
+        if ret < 0 {
+            return Err(Error::from_errno(
+                i32::try_from(ret).unwrap_or(EINVAL.to_errno()),
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Waits for the fence to be signaled, for at most `timeout`, rounded up to jiffies.
     ///
     /// Returns whether the fence was signaled: `false` once `timeout` elapsed first. A waiter
@@ -590,7 +614,7 @@ impl Fence {
         unsafe { (*self.as_raw()).seqno }
     }
 
-    fn as_raw(&self) -> *mut bindings::dma_fence {
+    pub(crate) fn as_raw(&self) -> *mut bindings::dma_fence {
         self.inner.get()
     }
 
@@ -1063,3 +1087,47 @@ unsafe extern "C" fn drop_driver_fence_data<T: Send + Sync + FenceContextOps>(
     // The actual memory the data associated with a `DriverFence` lives in
     // gets freed by the C dma_fence backend once the fence's refcount reaches 0.
 }
+
+/// A node of a fence chain, allocated ahead of being used, such as by
+/// [`SyncObj::add_point`](crate::drm::syncobj::SyncObj::add_point): adding a timeline point
+/// must not fail.
+///
+/// # Invariants
+///
+/// `ptr` points to a `struct dma_fence_chain` allocated by `dma_fence_chain_alloc()`, which isn't
+/// initialized and which nothing else owns.
+pub struct FenceChain {
+    ptr: NonNull<bindings::dma_fence_chain>,
+}
+
+impl FenceChain {
+    /// Allocates a node.
+    pub fn new() -> Result<Self> {
+        // SAFETY: `dma_fence_chain_alloc()` has no preconditions.
+        let ptr = unsafe { bindings::dma_fence_chain_alloc() };
+
+        // INVARIANT: `ptr` was just allocated by `dma_fence_chain_alloc()`.
+        Ok(Self {
+            ptr: NonNull::new(ptr).ok_or(ENOMEM)?,
+        })
+    }
+
+    /// Returns the node, whose ownership passes to the caller.
+    pub(crate) fn into_raw(self) -> *mut bindings::dma_fence_chain {
+        let ptr = self.ptr.as_ptr();
+        core::mem::forget(self);
+
+        ptr
+    }
+}
+
+impl Drop for FenceChain {
+    fn drop(&mut self) {
+        // SAFETY: By the type invariants, `self.ptr` was allocated by `dma_fence_chain_alloc()`
+        // and was never initialized nor published.
+        unsafe { bindings::dma_fence_chain_free(self.ptr.as_ptr()) };
+    }
+}
+
+// SAFETY: An unused node is plain memory, which any thread may free.
+unsafe impl Send for FenceChain {}

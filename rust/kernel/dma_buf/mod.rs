@@ -9,6 +9,7 @@ pub use self::dma_fence::{
     Fence,
     FenceCallback,
     FenceCallbackRegistration,
+    FenceChain,
     FenceContext,
     FenceContextOps, //
 };
