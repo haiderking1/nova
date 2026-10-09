@@ -189,6 +189,15 @@ impl ModeStatus {
     /// The mode can be driven.
     pub const OK: Self = Self(bindings::drm_mode_status_MODE_OK);
 
+    /// The mode can't be driven, for an unspecified reason.
+    pub const BAD: Self = Self(bindings::drm_mode_status_MODE_BAD);
+
+    /// The pixel clock of the mode is too high.
+    pub const CLOCK_HIGH: Self = Self(bindings::drm_mode_status_MODE_CLOCK_HIGH);
+
+    /// The mode is interlaced, which isn't supported.
+    pub const NO_INTERLACE: Self = Self(bindings::drm_mode_status_MODE_NO_INTERLACE);
+
     /// Wrap a status returned by C.
     pub(crate) fn from_raw(status: bindings::drm_mode_status) -> Self {
         Self(status)
