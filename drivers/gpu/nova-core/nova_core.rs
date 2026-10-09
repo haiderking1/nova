@@ -35,6 +35,7 @@ mod selftest;
 mod shader;
 mod vbios;
 mod vgpu;
+mod vm;
 
 pub(crate) const MODULE_NAME: &core::ffi::CStr = <LocalModule as kernel::ModuleMetadata>::NAME;
 

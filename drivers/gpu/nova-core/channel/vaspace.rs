@@ -12,7 +12,10 @@ use kernel::{
     device,
     prelude::*,
     ptr::Alignment,
-    sizes::SZ_4K, //
+    sizes::{
+        SZ_2M,
+        SZ_4K, //
+    },
 };
 
 use crate::{
@@ -56,7 +59,7 @@ use crate::{
 };
 
 /// Size of the address spaces of channels: plenty for kernel channels.
-const VA_SIZE: u64 = 1 << 40;
+pub const VA_SIZE: u64 = 1 << 40;
 /// Start of the addresses mapped: those below are left unmapped, so that null pointers fault.
 const VA_START: u64 = 1 << 16;
 /// Start of the addresses of aligned mappings, away from the other mappings, which take the
@@ -75,6 +78,16 @@ pub(crate) enum Mode {
     Split,
 }
 
+/// Which addresses of an address space Nova maps its own buffers at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum VaLayout {
+    /// All of them, as in the address spaces of kernel channels.
+    Kernel,
+    /// Those of the range, as in the address spaces of clients, which map at the other addresses
+    /// themselves, with [`AddressSpace::map_at`].
+    Client(Range<u64>),
+}
+
 /// A GPU virtual address space whose page tables Nova owns.
 ///
 /// It must be released with [`AddressSpace::free`] while the GSP is running.
@@ -89,10 +102,13 @@ pub(crate) struct AddressSpace {
     vmm: Vmm,
     /// Where the next aligned mapping may start.
     next_aligned: u64,
+    /// The addresses Nova maps its own buffers at.
+    layout: VaLayout,
 }
 
 impl AddressSpace {
-    /// Allocates an empty address space named `handle` in `mode` under `device` of `client`.
+    /// Allocates an empty address space named `handle` in `mode` under `device` of `client`, in
+    /// which Nova maps its own buffers as `layout` says.
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         dev: &device::Device,
@@ -103,13 +119,44 @@ impl AddressSpace {
         device: Handle<Device>,
         handle: u32,
         mode: Mode,
+        layout: VaLayout,
     ) -> Result<Self> {
+        let page_size = num::usize_as_u64(PAGE_SIZE);
+        let next_aligned = match &layout {
+            VaLayout::Kernel => ALIGNED_VA_START,
+            VaLayout::Client(kernel) => {
+                // GSP-RM's part of split address spaces is Nova's.
+                if mode != Mode::ClientOwned
+                    || kernel.start < VA_START
+                    || kernel.end > VA_SIZE
+                    || kernel.start >= kernel.end
+                    || kernel.start % page_size != 0
+                    || kernel.end % page_size != 0
+                {
+                    return Err(EINVAL);
+                }
+
+                // Aligned mappings in the upper half, away from the others.
+                (kernel.start + (kernel.end - kernel.start) / 2)
+                    .next_multiple_of(num::usize_as_u64(SZ_2M))
+            }
+        };
+
         // An empty root page directory: no mappings.
         let pdb = mm.alloc_contiguous(SZ_4K, Alignment::new::<SZ_4K>())?;
         mm.clear_vram(pdb.range())?;
         let pdb_addr = pdb.range().start;
         let vmm = Vmm::new(pdb_addr, mmu_version, VA_SIZE)?;
-        vmm.reserve(0..VA_START)?;
+        match &layout {
+            VaLayout::Kernel => vmm.reserve(0..VA_START)?,
+            // Nova's mappings stay in the client's kernel range.
+            VaLayout::Client(kernel) => {
+                vmm.reserve(0..kernel.start)?;
+                if kernel.end < VA_SIZE {
+                    vmm.reserve(kernel.end..VA_SIZE)?;
+                }
+            }
+        }
 
         let handle = match mode {
             Mode::ClientOwned => {
@@ -151,7 +198,8 @@ impl AddressSpace {
             mmu_version,
             _pdb: pdb,
             vmm,
-            next_aligned: ALIGNED_VA_START,
+            next_aligned,
+            layout,
         })
     }
 
@@ -318,6 +366,56 @@ impl AddressSpace {
     /// Tears down a mapping made by [`AddressSpace::map_vram`].
     pub(crate) fn unmap(&mut self, mm: &mut GpuMm<'_>, mapped: MappedRange) -> Result {
         self.vmm.unmap_pages(mm, mapped)
+    }
+
+    /// Maps the pages `pfns` of `memory`, in order, with `access` at the page-aligned virtual
+    /// address `start`, replacing what the client mapped there.
+    ///
+    /// Fails with `EINVAL` unless the address space is a client's, and the pages are outside its
+    /// kernel range.
+    pub(crate) fn map_at(
+        &mut self,
+        mm: &mut GpuMm<'_>,
+        start: u64,
+        pfns: &[Pfn],
+        memory: Memory,
+        access: Access,
+    ) -> Result {
+        self.check_client_range(start, pfns.len())?;
+
+        self.vmm
+            .map_at(mm, VirtualAddress::from_raw(start), pfns, access, memory)
+    }
+
+    /// Tears down the `num_pages` pages the client mapped from the page-aligned virtual address
+    /// `start`.
+    pub(crate) fn unmap_at(&mut self, mm: &mut GpuMm<'_>, start: u64, num_pages: usize) -> Result {
+        self.check_client_range(start, num_pages)?;
+
+        self.vmm
+            .unmap_at(mm, VirtualAddress::from_raw(start), num_pages)
+    }
+
+    /// Checks that the `num_pages` pages from `start` are the client's to map.
+    fn check_client_range(&self, start: u64, num_pages: usize) -> Result {
+        let VaLayout::Client(kernel) = &self.layout else {
+            return Err(EINVAL);
+        };
+        let page_size = num::usize_as_u64(PAGE_SIZE);
+        let end = num::usize_as_u64(num_pages)
+            .checked_mul(page_size)
+            .and_then(|size| start.checked_add(size))
+            .ok_or(EINVAL)?;
+
+        if num_pages == 0
+            || start % page_size != 0
+            || end > VA_SIZE
+            || (start < kernel.end && kernel.start < end)
+        {
+            return Err(EINVAL);
+        }
+
+        Ok(())
     }
 
     /// Releases the address space from GSP-RM. Its page tables are freed when it is dropped, so

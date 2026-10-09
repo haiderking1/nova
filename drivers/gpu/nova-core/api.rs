@@ -3,7 +3,10 @@
 //! Nova-core auxbus data. Contains all the methods used by the auxbus drivers
 //! to interact with nova-core.
 
-use core::pin::Pin;
+use core::{
+    ops::Range,
+    pin::Pin, //
+};
 
 use kernel::{
     auxiliary,
@@ -33,6 +36,11 @@ pub use crate::{
     },
     gpu::Spec,
     gsp::ConnectorType, //
+    vm::{
+        BufferRef,
+        ClientVm,
+        VA_SIZE, //
+    },
 };
 
 use crate::{
@@ -198,6 +206,42 @@ impl NovaCoreApi<'_> {
     /// Frees `buffer`, tearing down its window in BAR1.
     pub fn free_vram(&self, buffer: VramBuffer) {
         self.gpu.free_vram(buffer)
+    }
+
+    /// Allocates an empty GPU virtual address space of [`VA_SIZE`] bytes for a client, which maps
+    /// its buffers itself but in `kernel`, the range where nova-core maps the buffers it needs for
+    /// the client.
+    ///
+    /// It must be given back to [`NovaCoreApi::free_vm`].
+    pub fn create_vm(&self, kernel: Range<u64>) -> Result<ClientVm> {
+        self.gpu.create_vm(kernel)
+    }
+
+    /// Frees `vm`, which nothing may use anymore.
+    pub fn free_vm(&self, vm: ClientVm) {
+        self.gpu.free_vm(vm)
+    }
+
+    /// Maps the `size` bytes of `buffer` from `offset` at the virtual address `addr` of `vm`, as
+    /// memory of the PTE kind `kind`, replacing what was mapped there.
+    ///
+    /// The addresses, `offset` and `size` must be page aligned, and outside the kernel range of
+    /// `vm`. Compressible kinds are mapped as their uncompressed equivalent.
+    pub fn vm_map(
+        &self,
+        vm: &mut ClientVm,
+        addr: u64,
+        buffer: BufferRef<'_>,
+        offset: u64,
+        size: u64,
+        kind: u8,
+    ) -> Result {
+        self.gpu.vm_map(vm, addr, buffer, offset, size, kind)
+    }
+
+    /// Tears down the `size` bytes mapped from the virtual address `addr` of `vm`.
+    pub fn vm_unmap(&self, vm: &mut ClientVm, addr: u64, size: u64) -> Result {
+        self.gpu.vm_unmap(vm, addr, size)
     }
 
     /// Allocates a zeroed buffer of at least `size` bytes of system memory, which the GPU

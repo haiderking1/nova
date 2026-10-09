@@ -243,6 +243,57 @@ impl Vmm {
         Ok(self.virt_alloc.insert_range(start..end, (), GFP_KERNEL)?)
     }
 
+    /// Maps the pages `pfns` of `memory`, in order, with `access` at the page-aligned virtual
+    /// address `start`, replacing what was mapped there.
+    ///
+    /// For ranges [`Vmm::reserve`]d from the allocator, whose owner places mappings itself: the
+    /// mapping isn't tracked, and must be torn down with [`Vmm::unmap_at`].
+    pub(crate) fn map_at(
+        &mut self,
+        mm: &mut GpuMm<'_>,
+        start: VirtualAddress,
+        pfns: &[Pfn],
+        access: Access,
+        memory: Memory,
+    ) -> Result {
+        if pfns.is_empty() || start.offset() != 0 {
+            return Err(EINVAL);
+        }
+        let vfn_start = Vfn::from(start);
+
+        self.pt_map.prepare_map(
+            mm,
+            vfn_start,
+            pfns.len(),
+            &mut self.page_table_allocs,
+            &mut self.pt_pages,
+        )?;
+        self.pt_map.install_mappings(
+            mm,
+            &mut self.pt_pages,
+            &mut self.page_table_allocs,
+            vfn_start,
+            pfns,
+            access,
+            memory.aperture(),
+        )
+    }
+
+    /// Tears down the `num_pages` pages mapped from the page-aligned virtual address `start` by
+    /// [`Vmm::map_at`].
+    pub(crate) fn unmap_at(
+        &mut self,
+        mm: &mut GpuMm<'_>,
+        start: VirtualAddress,
+        num_pages: usize,
+    ) -> Result {
+        if start.offset() != 0 {
+            return Err(EINVAL);
+        }
+
+        self.pt_map.invalidate_ptes(mm, Vfn::from(start), num_pages)
+    }
+
     /// Free a virtual frame number range back to the maple tree.
     fn free_vfn(&self, vfn: Vfn) {
         let vfn_index: usize = vfn.raw().into_safe_cast();

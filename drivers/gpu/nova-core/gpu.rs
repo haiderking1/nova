@@ -11,6 +11,7 @@ use kernel::{
         GpuBuddyAllocMode,
         GpuBuddyParams, //
     },
+    id_pool::IdPool,
     io::Io,
     new_mutex,
     num::Bounded,
@@ -112,6 +113,11 @@ use crate::{
     },
     num::IntoSafeCast,
     vgpu::VgpuManager, //
+    vm::{
+        self,
+        BufferRef,
+        ClientVm, //
+    },
 };
 
 mod hal;
@@ -484,6 +490,9 @@ pub(crate) struct Gpu<'gpu> {
     /// `display_engine` and before `mm` when they are.
     #[pin]
     copy: Mutex<Option<CopyChannel<'gpu>>>,
+    /// The IDs of the address spaces of clients.
+    #[pin]
+    vm_ids: Mutex<IdPool>,
     /// GPU memory manager owning memory management resources.
     ///
     /// Must be kept declared *before* `gsp_resources`, so that its components are dropped while
@@ -750,6 +759,8 @@ impl<'gpu> Gpu<'gpu> {
 
             // Set up by `Gpu::init_copy()`, after the graphics engine's golden context.
             copy <- new_mutex!(None, "nova_copy"),
+
+            vm_ids <- new_mutex!(IdPool::with_capacity(vm::MAX_VMS, GFP_KERNEL)?, "nova_vm_ids"),
 
             // Create GPU memory manager owning memory management resources.
             mm <- new_mutex!({
@@ -1395,6 +1406,67 @@ impl<'gpu> Gpu<'gpu> {
                 .unmap(&mut mm, mapped)
                 .inspect_err(|e| pr_err!("failed to unmap a VRAM buffer from BAR1: {:?}\n", e));
         }
+    }
+
+    /// Allocates an empty GPU virtual address space for a client, whose kernel range is `kernel`.
+    ///
+    /// Fails with `EINVAL` if `kernel` isn't a page-aligned range of [`vm::VA_SIZE`] bytes of
+    /// address space, and with `ENOSPC` if clients have too many address spaces.
+    pub(crate) fn create_vm(&self, kernel: Range<u64>) -> Result<ClientVm> {
+        let gsp_resources = &self.gsp_resources;
+        let rm = self.rm.as_ref().ok_or(ENODEV)?;
+
+        let id = self
+            .vm_ids
+            .lock()
+            .find_unused_id(0)
+            .ok_or(ENOSPC)?
+            .acquire();
+        let vm = ClientVm::new(
+            gsp_resources.device.as_ref(),
+            &gsp_resources.gsp.cmdq,
+            &mut self.mm.lock(),
+            self.spec.chipset,
+            rm,
+            kernel,
+            id,
+        );
+        if vm.is_err() {
+            self.vm_ids.lock().release_id(id);
+        }
+
+        vm
+    }
+
+    /// Frees `vm`, which nothing may use anymore.
+    pub(crate) fn free_vm(&self, vm: ClientVm) {
+        let gsp_resources = &self.gsp_resources;
+        let _ = vm
+            .free(gsp_resources.device.as_ref(), &gsp_resources.gsp.cmdq)
+            .inspect_err(|e| pr_err!("failed to free a client's address space: {:?}\n", e));
+        // Its page tables are freed with it.
+        let id = vm.id();
+        drop(vm);
+        self.vm_ids.lock().release_id(id);
+    }
+
+    /// Maps the `size` bytes of `buffer` from `offset` at the virtual address `addr` of `vm`, as
+    /// memory of the PTE kind `kind`. See [`ClientVm::map`].
+    pub(crate) fn vm_map(
+        &self,
+        vm: &mut ClientVm,
+        addr: u64,
+        buffer: BufferRef<'_>,
+        offset: u64,
+        size: u64,
+        kind: u8,
+    ) -> Result {
+        vm.map(&mut self.mm.lock(), addr, buffer, offset, size, kind)
+    }
+
+    /// Tears down the `size` bytes mapped from the virtual address `addr` of `vm`.
+    pub(crate) fn vm_unmap(&self, vm: &mut ClientVm, addr: u64, size: u64) -> Result {
+        vm.unmap(&mut self.mm.lock(), addr, size)
     }
 
     /// Allocates a zeroed buffer of at least `size` bytes of system memory, which the GPU accesses

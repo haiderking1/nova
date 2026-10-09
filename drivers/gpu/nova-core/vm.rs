@@ -1,0 +1,160 @@
+// SPDX-License-Identifier: GPL-2.0
+
+//! GPU virtual address spaces of nova-core's clients, such as the userspace drivers nova-drm
+//! serves.
+//!
+//! A client maps its buffers itself, at the addresses it chooses, but in the kernel range it
+//! gives when creating the address space: there, Nova maps the buffers it needs for the client,
+//! such as those of the client's channels.
+
+use core::ops::Range;
+
+use kernel::{
+    device,
+    prelude::*, //
+};
+
+use crate::{
+    buffer::{
+        SystemBuffer,
+        VramBuffer, //
+    },
+    channel::vaspace::{
+        AddressSpace,
+        Mode,
+        VaLayout, //
+    },
+    gpu::Chipset,
+    gsp::{
+        cmdq::Cmdq,
+        rm::device::RmDevice, //
+    },
+    mm::{
+        pagetable::{
+            kind,
+            Access, //
+        },
+        vmm::Memory,
+        GpuMm,
+        PAGE_SIZE, //
+    },
+    num,
+};
+
+pub use crate::channel::vaspace::VA_SIZE;
+
+/// Handle of the address space of a client, after those of channels, completed with its ID.
+const VA_SPACE_HANDLE: u32 = 0x90f1_8000;
+
+/// Number of address spaces clients may have at once: the IDs completing their handles.
+pub(crate) const MAX_VMS: usize = 0x8000;
+
+/// A buffer of a client, to map into a [`ClientVm`].
+#[derive(Clone, Copy)]
+pub enum BufferRef<'a> {
+    /// A buffer in VRAM.
+    Vram(&'a VramBuffer),
+    /// A buffer in system memory.
+    System(&'a SystemBuffer),
+}
+
+/// A GPU virtual address space of a client.
+///
+/// It must be given back to [`NovaCoreApi::free_vm`](crate::api::NovaCoreApi::free_vm) while
+/// nova-core is bound.
+pub struct ClientVm {
+    space: AddressSpace,
+    /// The ID completing the handle of the address space.
+    id: usize,
+}
+
+impl ClientVm {
+    /// Allocates an empty address space whose kernel range is `kernel`, with the ID `id`, under
+    /// the device of `rm`.
+    pub(crate) fn new(
+        dev: &device::Device,
+        cmdq: &Cmdq<'_>,
+        mm: &mut GpuMm<'_>,
+        chipset: Chipset,
+        rm: &RmDevice,
+        kernel: Range<u64>,
+        id: usize,
+    ) -> Result<Self> {
+        let space = AddressSpace::new(
+            dev,
+            cmdq,
+            mm,
+            chipset.mmu_version(),
+            rm.client(),
+            rm.device(),
+            VA_SPACE_HANDLE | u32::try_from(id)?,
+            Mode::ClientOwned,
+            VaLayout::Client(kernel),
+        )?;
+
+        Ok(Self { space, id })
+    }
+
+    /// Returns the ID completing the handle of the address space.
+    pub(crate) fn id(&self) -> usize {
+        self.id
+    }
+
+    /// Maps the `size` bytes of `buffer` from `offset` at the virtual address `addr`, as memory of
+    /// the PTE kind `kind`, replacing what was mapped there. `addr`, `offset` and `size` must be
+    /// page aligned, and the addresses outside the kernel range.
+    ///
+    /// Compressible kinds are mapped as their uncompressed equivalent. Fails with `EINVAL` if
+    /// `kind` isn't a kind.
+    pub(crate) fn map(
+        &mut self,
+        mm: &mut GpuMm<'_>,
+        addr: u64,
+        buffer: BufferRef<'_>,
+        offset: u64,
+        size: u64,
+        kind: u8,
+    ) -> Result {
+        let kind = kind::uncompressed(kind).ok_or(EINVAL)?;
+        let page_size = num::usize_as_u64(PAGE_SIZE);
+        let buffer_size = num::usize_as_u64(match buffer {
+            BufferRef::Vram(buffer) => buffer.size(),
+            BufferRef::System(buffer) => buffer.size(),
+        });
+        let end = offset.checked_add(size).ok_or(EINVAL)?;
+        if size == 0 || offset % page_size != 0 || size % page_size != 0 || end > buffer_size {
+            return Err(EINVAL);
+        }
+
+        let (pfns, memory) = match buffer {
+            BufferRef::Vram(buffer) => (buffer.pfns()?, Memory::Vram),
+            BufferRef::System(buffer) => (buffer.dma_pfns()?, Memory::SystemCoherent),
+        };
+        let pages = usize::try_from(offset / page_size)?..usize::try_from(end / page_size)?;
+        let access = Access {
+            writable: true,
+            privileged: false,
+            kind,
+        };
+
+        self.space
+            .map_at(mm, addr, pfns.get(pages).ok_or(EINVAL)?, memory, access)
+    }
+
+    /// Tears down the `size` bytes mapped from the virtual address `addr`, which must be page
+    /// aligned and outside the kernel range.
+    pub(crate) fn unmap(&mut self, mm: &mut GpuMm<'_>, addr: u64, size: u64) -> Result {
+        let page_size = num::usize_as_u64(PAGE_SIZE);
+        if size % page_size != 0 {
+            return Err(EINVAL);
+        }
+
+        self.space
+            .unmap_at(mm, addr, usize::try_from(size / page_size)?)
+    }
+
+    /// Releases the address space from GSP-RM. Its page tables are freed when it is dropped.
+    pub(crate) fn free(&self, dev: &device::Device, cmdq: &Cmdq<'_>) -> Result {
+        self.space.free(dev, cmdq)
+    }
+}

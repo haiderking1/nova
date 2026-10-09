@@ -70,7 +70,8 @@ use super::{
     },
     vaspace::{
         AddressSpace,
-        Mode, //
+        Mode,
+        VaLayout, //
     },
 };
 
@@ -167,6 +168,7 @@ impl<'a> Channel<'a> {
             device,
             VA_SPACE_HANDLE | chid,
             mode,
+            VaLayout::Kernel,
         )?;
 
         let mut channel = Self {
