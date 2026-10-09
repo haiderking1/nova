@@ -1599,6 +1599,27 @@ impl NocatRecord {
         c_string(AsBytes::as_bytes(&self.0.faultingEngine))
     }
 
+    /// Returns, for the record of a GSP-RM timeout, the source line it was detected on and the
+    /// address of the code that detected it.
+    ///
+    /// The error code of assert records is the line in bits 63:32, and the address of the code in
+    /// bits 31:0 (`_rcdbNocatReportAssert()` in RM). GSP-RM only gives the line for timeouts
+    /// (`gpuCheckTimeout()`): its other asserts have line 0.
+    /// Returns, for the record of an assert GSP-RM ran into, the address of the code it is in.
+    pub(crate) fn assert(&self) -> Option<u32> {
+        // CAST: the address is in the low 32 bits of the error code.
+        (u32::from(self.0.recType) == bindings::NV2080_NOCAT_JOURNAL_REC_TYPE_ASSERT)
+            .then_some(self.0.errorCode as u32)
+    }
+
+    pub(crate) fn timeout(&self) -> Option<(u32, u32)> {
+        // CAST: the error code is split into its high and low 32 bits.
+        let (line, address) = ((self.0.errorCode >> 32) as u32, self.0.errorCode as u32);
+
+        (u32::from(self.0.recType) == bindings::NV2080_NOCAT_JOURNAL_REC_TYPE_ASSERT && line != 0)
+            .then_some((line, address))
+    }
+
     /// Returns the diagnostic data of the record.
     pub(crate) fn diagnostics(&self) -> &[u8] {
         let len = usize::try_from(self.0.diagBufferLen).unwrap_or(0);

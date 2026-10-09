@@ -988,29 +988,41 @@ impl CmdqInner<'_> {
                 ),
                 None => dev_err!(&self.dev, "GSP reported an OS error (seq {})\n", seq),
             },
+            // Like kernel RM, which files NOCAT records in its journal without reporting them:
+            // GSP-RM posts them for conditions it handles itself. Its timeouts are worth a
+            // warning, its asserts a note.
             Ok(MsgFunction::GspPostNoCat) => match Self::payload::<NocatRecord>(message) {
                 Some(record) => {
-                    dev_err!(
+                    if let Some((line, address)) = record.timeout() {
+                        dev_warn!(
+                            &self.dev,
+                            "GSP-RM timed out (seq {}): line {}, code at {:#x}\n",
+                            seq,
+                            line,
+                            address
+                        );
+                    } else if let Some(address) = record.assert() {
+                        dev_info!(
+                            &self.dev,
+                            "GSP-RM ran into an assert (seq {}), code at {:#x}\n",
+                            seq,
+                            address
+                        );
+                    }
+                    dev_dbg!(
                         &self.dev,
-                        "GSP reported an error (seq {}): {}, type {}, bugcheck {:#x}, subsystem {}, code {:#x}, engine {}\n",
+                        "GSP NOCAT record (seq {}): {}, type {}, bugcheck {:#x}, subsystem {}, code {:#x}, engine {}, diagnostics {:02x?}\n",
                         seq,
                         record.source(),
                         record.record_type(),
                         record.bugcheck(),
                         record.subsystem(),
                         record.error_code(),
-                        record.faulting_engine()
+                        record.faulting_engine(),
+                        record.diagnostics()
                     );
-                    for (i, chunk) in record.diagnostics().chunks(32).enumerate() {
-                        dev_err!(
-                            &self.dev,
-                            "GSP error diagnostics +{:#05x}: {:02x?}\n",
-                            i * 32,
-                            chunk
-                        );
-                    }
                 }
-                None => dev_err!(&self.dev, "GSP reported an error (seq {})\n", seq),
+                None => dev_dbg!(&self.dev, "GSP NOCAT record (seq {})\n", seq),
             },
             Ok(MsgFunction::RcTriggered) => {
                 dev_err!(
