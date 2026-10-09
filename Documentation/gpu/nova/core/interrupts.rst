@@ -271,9 +271,9 @@ MSI satisfies this with its single message. MSI-X needs one allocated entry per
 serviced subtree, and a PCI allocation cannot be sparse, so nova-core requests
 entries 0 through the highest serviced subtree::
 
-    MSI-X, with subtree 2 serviced:
+    MSI-X, with subtrees 0 and 2 serviced:
 
-      subtree 0  ->  entry 0   allocated, no handler, stays masked
+      subtree 0  ->  entry 0   handler here, and its rearm covers subtree 0
       subtree 1  ->  entry 1   allocated, no handler, stays masked
       subtree 2  ->  entry 2   handler here, and its rearm covers subtree 2
 
@@ -285,10 +285,18 @@ entries 0 through the highest serviced subtree::
 An allocated entry whose subtree nova-core does not service costs nothing. The
 entry stays masked, and a disabled subtree raises no interrupt.
 
-nova-core services one subtree. The GSP event, vector 155, is in leaf 4, which
+nova-core services two subtrees. The GSP event, vector 155, is in leaf 4, which
 is in subtree 2. OpenRM's headers place its UVM_SHARED interrupt category in
 subtree 2 on every chipset that nova-core supports. The self-test doorbell,
 vector 129, is in the same leaf, and the test allocates its own vectors for it.
+The display vector that GSP-RM reports is in subtree 2 too.
+
+The engines' notification (non-stall) vectors, which channels raise once their
+work is done, are in subtree 0: OpenRM maps its
+ESCHED_DRIVEN_ENGINE_NOTIFICATION category there on every chipset that
+nova-core supports. With MSI, the GSP event handler services them as well, so
+that the one PCI vector is rearmed once per interrupt. With MSI-X, subtree 0
+has a handler of its own.
 
 Rearming PCI interrupt delivery
 -------------------------------
@@ -373,9 +381,9 @@ before probe had no handler to rearm it, so the tree reset rearms explicitly
 after the drain. A TOP-enable rearm leaves the serviced subtrees enabled, so
 the reset then disables them again.
 
-nova-core does not serialize access to the tree. The GSP event handler
-touches only its own leaf, and the drain runs during probe, before that handler
-is registered.
+nova-core does not serialize access to the tree. Each handler touches only the
+bits of its own vectors, which no other handler services, and the drain runs
+during probe, before any handler is registered.
 
 Per-architecture differences
 ============================

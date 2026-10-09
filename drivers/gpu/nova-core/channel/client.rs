@@ -6,7 +6,8 @@
 //! control memory and context buffers, in the client's kernel range. It isn't privileged. Its
 //! work is the client's push buffers, at the client's virtual addresses: the kernel lists them in
 //! the channel's GPFIFO ring, then a push buffer of its own, which releases a semaphore in system
-//! memory once they are done.
+//! memory once they are done and raises the engine's notification interrupt, on which the
+//! submission's fence signals (see [`super::fence`]).
 //!
 //! On the graphics engine, the channel has the 3D, compute, 2D and inline-to-memory objects the client asks for, on
 //! a copy engine a copy object, which the client binds to subchannels itself. Channels on the
@@ -14,11 +15,13 @@
 
 use kernel::{
     device,
-    dma::Coherent,
-    io::poll::read_poll_timeout,
+    dma_buf::Fence,
     page::PAGE_SIZE,
     prelude::*,
-    time::Delta, //
+    sync::{
+        aref::ARef,
+        Arc, //
+    }, //
 };
 
 use crate::{
@@ -39,6 +42,10 @@ use crate::{
 
 use super::{
     copy,
+    fence::{
+        ChannelFenceContext,
+        Timeline, //
+    },
     gpfifo::{
         Channel,
         NewSpace,
@@ -108,20 +115,18 @@ pub(crate) struct ClientChannel<'a> {
     engine: ChannelEngine,
     /// The context buffers of channels on the graphics engine.
     context: Option<ChannelContext>,
-    /// The semaphore the channel releases once work is done, in system memory: waiting for it
-    /// takes no lock.
-    fence: Coherent<'a, [u8]>,
+    /// The fences of the channel's submissions, and the semaphore they release.
+    timeline: Arc<Timeline<'a>>,
     /// The mapping of the semaphore into the client's address space.
     fence_mapped: Option<MappedRange>,
     /// The value released by the last work submitted.
     sequence: u32,
-    /// Whether work didn't finish in time: the channel's state is unknown, so it runs no more.
-    dead: bool,
 }
 
 impl<'a> ClientChannel<'a> {
     /// Allocates channel `chid` on `engine`, under the device of `rm`, in `space`, the client's
-    /// address space. `gr` is the context of the graphics engine, which channels on it need.
+    /// address space, with its fences on `fence_context`. `gr` is the context of the graphics
+    /// engine, which channels on it need.
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         dev: &'a device::Device<device::Bound>,
@@ -133,6 +138,7 @@ impl<'a> ClientChannel<'a> {
         space: &mut AddressSpace,
         chid: u32,
         engine: ChannelEngine,
+        fence_context: &'a ChannelFenceContext,
     ) -> Result<Self> {
         let (engine_info, copy_index) = match engine {
             ChannelEngine::Graphics(_) => (gr.ok_or(ENODEV)?.engine(), None),
@@ -141,7 +147,7 @@ impl<'a> ClientChannel<'a> {
                 (info, Some(info.copy_engine_index().ok_or(ENODEV)?))
             }
         };
-        let fence = Coherent::<u8>::zeroed_slice(dev, PAGE_SIZE, GFP_KERNEL)?;
+        let timeline = Timeline::new(dev, fence_context)?;
 
         let channel = Channel::new(
             dev,
@@ -158,10 +164,9 @@ impl<'a> ClientChannel<'a> {
             channel,
             engine,
             context: None,
-            fence,
+            timeline,
             fence_mapped: None,
             sequence: 0,
-            dead: false,
         };
 
         match client.set_up(dev, cmdq, mm, rm, gr, space, copy_index) {
@@ -184,8 +189,9 @@ impl<'a> ClientChannel<'a> {
         space: &mut AddressSpace,
         copy_index: Option<u32>,
     ) -> Result {
-        let start = self.fence.dma_address();
-        let end = start + num::usize_as_u64(self.fence.size());
+        let semaphore = self.timeline.semaphore();
+        let start = semaphore.dma_address();
+        let end = start + num::usize_as_u64(semaphore.size());
         self.fence_mapped = Some(space.map_sysmem_aligned(
             mm,
             start..end,
@@ -239,20 +245,16 @@ impl<'a> ClientChannel<'a> {
         Ok(())
     }
 
-    /// Has the channel run the push buffers `pushes`, in order, and returns the value its
-    /// semaphore takes once they are done, to [`ClientChannel::wait`] for.
+    /// Has the channel run the push buffers `pushes`, in order, and returns the fence that
+    /// signals once they are done.
     ///
-    /// The work submitted before must be done. Fails with `ENODEV` if work didn't finish in time
-    /// before: the channel runs no more.
+    /// Fails with `ENODEV` once the channel runs no more work.
     pub(crate) fn submit(
         &mut self,
         bar: Bar0<'_>,
         mm: &mut GpuMm<'_>,
         pushes: &[PushBuffer],
-    ) -> Result<u32> {
-        if self.dead {
-            return Err(ENODEV);
-        }
+    ) -> Result<ARef<Fence>> {
         let hal = self.channel.hal();
 
         let mut entries: KVec<GpEntry> = KVec::with_capacity(pushes.len(), GFP_KERNEL)?;
@@ -261,7 +263,7 @@ impl<'a> ClientChannel<'a> {
         }
 
         // Once the client's work is done and its memory writes are visible, release the
-        // semaphore.
+        // semaphore, then tell the CPU.
         let sequence = self.sequence.wrapping_add(1);
         let mut tail = KVec::new();
         hal.push_release(
@@ -271,41 +273,33 @@ impl<'a> ClientChannel<'a> {
                 payload: sequence,
             },
         )?;
-        self.channel.submit(bar, mm, &entries, &tail)?;
+        hal.push_notify(&mut tail)?;
+
+        // Before the submission, so that its notification finds the fence.
+        let fence = self.timeline.add(sequence)?;
+        if let Err(err) = self.channel.submit(bar, mm, &entries, &tail) {
+            self.timeline.cancel(sequence, err);
+            return Err(err);
+        }
         self.sequence = sequence;
 
-        Ok(sequence)
+        Ok(fence)
     }
 
-    /// Returns the value the channel's semaphore holds.
-    fn fence_value(&self) -> u32 {
-        // SAFETY: The semaphore is the first 4 bytes of the page `fence` owns, which the GPU
-        // writes coherently with the CPU's caches.
-        unsafe { self.fence.as_ptr().cast::<u32>().read_volatile() }
-    }
-
-    /// Waits for the channel's semaphore to take `sequence`, for at most `timeout`. Takes no
-    /// lock.
-    ///
-    /// Fails with `ETIMEDOUT` if it doesn't: the channel then runs no more work.
-    pub(crate) fn wait(&mut self, sequence: u32, timeout: Delta) -> Result {
-        let result = read_poll_timeout(
-            || Ok(self.fence_value()),
-            |&value| value == sequence,
-            Delta::from_micros(10),
-            timeout,
+    /// Has the fences of the work submitted, and of the work submitted later, signal `err`: the
+    /// channel runs no more work, such as once its work didn't finish in time.
+    pub(crate) fn fail(&mut self, err: Error) {
+        pr_err!(
+            "nova-core: client channel {}: runs no more work ({:?})\n",
+            self.channel.chid(),
+            err
         );
-        if result.is_err() {
-            pr_err!(
-                "nova-core: client channel {}: work not done, semaphore {}, expected {}\n",
-                self.channel.chid(),
-                self.fence_value(),
-                sequence
-            );
-            self.dead = true;
-        }
+        self.timeline.fail(err);
+    }
 
-        result.map(|_| ())
+    /// Returns the fences of the channel's submissions.
+    pub(crate) fn timeline(&self) -> &Arc<Timeline<'a>> {
+        &self.timeline
     }
 
     /// Frees the channel in GSP-RM, with the objects allocated on it, and forgets its mappings:
@@ -318,6 +312,9 @@ impl<'a> ClientChannel<'a> {
         if let Some(mapped) = self.fence_mapped.take() {
             mapped.forget();
         }
+        // The work done before counts, the rest never will be.
+        self.timeline.signal_completed();
+        self.timeline.fail(ECANCELED);
     }
 
     /// Frees the channel, with the objects allocated on it, and unmaps its memory from `space`,
@@ -338,5 +335,8 @@ impl<'a> ClientChannel<'a> {
             let _ = space.unmap(mm, mapped);
         }
         self.channel.free(dev, cmdq, mm, Some(space));
+        // The work done before counts, the rest never will be.
+        self.timeline.signal_completed();
+        self.timeline.fail(ECANCELED);
     }
 }

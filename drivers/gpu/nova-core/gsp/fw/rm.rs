@@ -922,6 +922,20 @@ unsafe impl FromBytes for DeviceInfoTableParams {}
 // SAFETY: Padding is explicit and will not contain uninitialized data.
 unsafe impl AsBytes for DeviceInfoTableParams {}
 
+/// `NV_INTR_VECTOR_INVALID`: the vector of a unit whose interrupts GSP-RM doesn't leave to the CPU.
+const NV_INTR_VECTOR_INVALID: u32 = u32::MAX;
+
+/// The interrupt vectors that GSP-RM leaves to the CPU of the units nova-core services.
+#[derive(Debug)]
+pub(crate) struct KernelIntrVectors {
+    /// The display engine's stall vector, on which the CPU services its interrupts, such as
+    /// those of head timing.
+    pub(crate) display: Option<u32>,
+    /// The notification (non-stall) vectors of the graphics and copy engines, without duplicates,
+    /// which channels on them raise with `NON_STALL_INTERRUPT`.
+    pub(crate) notifications: KVec<u32>,
+}
+
 /// Parameters of `NV2080_CTRL_CMD_INTERNAL_INTR_GET_KERNEL_TABLE`: the interrupt vectors of the
 /// units whose interrupts the CPU services, rather than GSP-RM.
 #[repr(transparent)]
@@ -935,20 +949,30 @@ impl IntrKernelTableParams {
         Self(Default::default())
     }
 
-    /// Returns the vector of the display engine's interrupts, as GSP-RM reports it: possibly
-    /// `NV_INTR_VECTOR_INVALID` (`u32::MAX`), out of the range of every interrupt tree.
-    ///
-    /// The display engine's interrupts that the CPU services, such as those of head timing, are
-    /// stalling interrupts, on the stall vector.
-    pub(crate) fn display_vector(&self) -> Option<u32> {
+    /// Returns the vectors that nova-core services, as GSP-RM reports them.
+    pub(crate) fn vectors(&self) -> Result<KernelIntrVectors> {
         let len = usize::try_from(self.0.tableLen).unwrap_or(0);
+        let entries = || self.0.table.iter().take(len);
 
-        self.0
-            .table
-            .iter()
-            .take(len)
-            .find(|entry| u32::from(entry.engineIdx) == bindings::MC_ENGINE_IDX_DISP)
-            .map(|entry| entry.vectorStall)
+        let mut notifications = KVec::new();
+        for entry in entries().filter(|entry| {
+            let engine = u32::from(entry.engineIdx);
+            (bindings::MC_ENGINE_IDX_GR0..=bindings::MC_ENGINE_IDX_GR7).contains(&engine)
+                || (bindings::MC_ENGINE_IDX_CE0..=bindings::MC_ENGINE_IDX_CE16).contains(&engine)
+        }) {
+            let vector = entry.vectorNonStall;
+            if vector != NV_INTR_VECTOR_INVALID && !notifications.contains(&vector) {
+                notifications.push(vector, GFP_KERNEL)?;
+            }
+        }
+
+        Ok(KernelIntrVectors {
+            display: entries()
+                .find(|entry| u32::from(entry.engineIdx) == bindings::MC_ENGINE_IDX_DISP)
+                .map(|entry| entry.vectorStall)
+                .filter(|&vector| vector != NV_INTR_VECTOR_INVALID),
+            notifications,
+        })
     }
 }
 

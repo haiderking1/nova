@@ -1158,8 +1158,8 @@ rm_control!(
 /// RM control command querying the interrupt vectors of the units whose interrupts the CPU
 /// services, rather than GSP-RM.
 ///
-/// Sent to GSP-RM's internal subdevice. The reply is the vector of the display engine's
-/// interrupts, if the GPU has a display engine.
+/// Sent to GSP-RM's internal subdevice. The reply is the vectors of the interrupts nova-core
+/// services.
 pub(crate) struct IntrGetKernelTable(IntrKernelTableParams);
 
 impl IntrGetKernelTable {
@@ -1174,8 +1174,8 @@ rm_control!(
     Subdevice,
     InternalIntrGetKernelTable,
     IntrKernelTableParams,
-    Option<u32>,
-    |p| p.display_vector()
+    KernelIntrVectors,
+    |p| p.vectors()?
 );
 
 /// RM control command querying the mask of the enabled GPCs, sent to GSP-RM's internal subdevice.

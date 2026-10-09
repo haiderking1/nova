@@ -9,12 +9,13 @@
 //!
 //! See `Documentation/gpu/nova/core/interrupts.rst`.
 
+pub(crate) mod display;
 #[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
 pub(crate) mod doorbell_test;
-pub(crate) mod display;
 pub(crate) mod gsp;
 mod hal;
 pub(crate) mod interrupt_tree;
+pub(crate) mod notification;
 mod regs;
 
 /// The message-signaled interrupt type that Linux granted.

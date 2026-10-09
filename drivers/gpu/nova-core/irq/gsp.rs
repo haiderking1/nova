@@ -11,6 +11,8 @@
 //!
 //! The handler also services the display vector, in the same subtree, once it is set up: see
 //! [`DisplayVector`].
+//! With MSI, it services the engines' notification vectors too, whose subtree then shares its PCI
+//! vector: see [`NotificationVectors`].
 
 use kernel::{
     device,
@@ -27,6 +29,10 @@ use super::{
         LeafEnableGuard,
         Subtree,
         Tree, //
+    },
+    notification::{
+        NotificationVectors,
+        NOTIFICATION_SUBTREE, //
     },
 };
 use crate::{
@@ -63,6 +69,8 @@ pub(crate) struct GspInterrupt<'a> {
     tree: &'a Tree<'a>,
     /// The display vector, once set up.
     display: &'a SetOnce<DisplayVector<'a>>,
+    /// The notification vectors, once set up, if they share this handler's PCI vector.
+    notifications: &'a SetOnce<NotificationVectors<'a>>,
     /// For logging.
     dev: &'a device::Device,
 }
@@ -93,8 +101,9 @@ impl GspInterrupt<'_> {
 }
 
 impl irq::ThreadedHandler for GspInterrupt<'_> {
-    /// Top half, in hard interrupt context. Services the display vector, then the GSP vector,
-    /// and rearms the PCI vector once both are serviced. Other vectors pending in the same
+    /// Top half, in hard interrupt context. Services the display vector, the notification vectors if
+    /// they share the PCI vector, then the GSP vector, and rearms the PCI vector once all are
+    /// serviced. Other vectors pending in the same
     /// leaves stay pending.
     fn handle(&self) -> irq::ThreadedIrqReturn {
         let display = self.display.as_ref().and_then(|display| {
@@ -105,12 +114,19 @@ impl irq::ThreadedHandler for GspInterrupt<'_> {
                 .then(|| display.service(&leaf))
         });
 
+        let notified = !self.tree.has_own_pci_vector(NOTIFICATION_SUBTREE)
+            && self
+                .notifications
+                .as_ref()
+                .is_some_and(|notifications| notifications.service(self.tree));
+
         let leaf = self.tree.read_pending(GSP_INTR_0_VECTOR.leaf_index());
         if !leaf.vectors().contains(GSP_INTR_0_VECTOR.leaf_mask()) {
             self.tree.rearm_pci_irq(GSP_SUBTREE);
-            return match display {
-                Some(()) => irq::ThreadedIrqReturn::Handled,
-                None => irq::ThreadedIrqReturn::None,
+            return if display.is_some() || notified {
+                irq::ThreadedIrqReturn::Handled
+            } else {
+                irq::ThreadedIrqReturn::None
             };
         }
         leaf.clear_vectors(GSP_INTR_0_VECTOR.leaf_mask());
@@ -194,6 +210,7 @@ impl<'a> GspIrq<'a> {
         falcon: &'a Falcon<'a, GspFalcon>,
         cmdq: &'a Cmdq<'a>,
         display: &'a SetOnce<DisplayVector<'a>>,
+        notifications: &'a SetOnce<NotificationVectors<'a>>,
     ) -> impl PinInit<Self, Error> + 'a {
         let dev = pdev.as_ref();
 
@@ -210,6 +227,7 @@ impl<'a> GspIrq<'a> {
                         cmdq,
                         tree,
                         display,
+                        notifications,
                         dev,
                     }),
                 )

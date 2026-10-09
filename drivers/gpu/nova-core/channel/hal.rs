@@ -134,6 +134,10 @@ pub(crate) trait ChannelHal: Sync {
     /// Appends to `push` the methods doing `release` once the channel's engine is idle.
     fn push_release(&self, push: &mut KVec<u32>, release: Release) -> Result;
 
+    /// Appends to `push` the methods raising the non-stall interrupt of the channel's engine, once
+    /// the methods before are processed: after a release, to tell the CPU it happened.
+    fn push_notify(&self, push: &mut KVec<u32>) -> Result;
+
     /// Tells the GPU that channel `chid`, on `engine`, has new work.
     fn ring_doorbell(&self, bar: Bar0<'_>, engine: &EngineInfo, chid: u32) -> Result;
 

@@ -155,6 +155,15 @@ impl ChannelHal for Ga102 {
         Ok(())
     }
 
+    fn push_notify(&self, push: &mut KVec<u32>) -> Result {
+        // The release must be visible to the CPU once the interrupt is, like nouveau orders them
+        // (`gv100_fence_emit32()`).
+        push.extend_from_slice(&host_c56f::sys_membar()?, GFP_KERNEL)?;
+        push.extend_from_slice(&host_c56f::non_stall_interrupt()?, GFP_KERNEL)?;
+
+        Ok(())
+    }
+
     fn ring_doorbell(&self, bar: Bar0<'_>, engine: &EngineInfo, chid: u32) -> Result {
         bar.write_reg(
             regs::NV_VIRTUAL_FUNCTION_DOORBELL::zeroed()

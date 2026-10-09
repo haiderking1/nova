@@ -9,6 +9,7 @@ pub(crate) mod client;
 #[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
 pub(crate) mod compute_test;
 pub(crate) mod copy;
+pub(crate) mod fence;
 pub(crate) mod gpfifo;
 pub(crate) mod gr;
 pub(crate) mod hal;

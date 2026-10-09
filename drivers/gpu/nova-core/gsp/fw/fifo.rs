@@ -27,10 +27,24 @@ pub(crate) mod host_c56f {
     /// Returns the methods waiting for the channel's engine to be idle, then for the memory it
     /// wrote to be visible to the rest of the system, CPU included.
     pub(crate) fn wait_idle_and_flush() -> Result<[u32; 7]> {
+        let membar = sys_membar()?;
         Ok([
             // Any subchannel runs the channel's own methods.
             methods(0, bindings::NVC56F_WFI, 1)?,
             bindings::NVC56F_WFI_SCOPE_ALL,
+            membar[0],
+            membar[1],
+            membar[2],
+            membar[3],
+            membar[4],
+        ])
+    }
+
+    /// Returns the methods waiting for the memory the channel wrote before to be visible to the
+    /// rest of the system, CPU included.
+    pub(crate) fn sys_membar() -> Result<[u32; 5]> {
+        Ok([
+            // Any subchannel runs the channel's own methods.
             methods(0, bindings::NVC56F_MEM_OP_A, 4)?,
             0,
             0,
@@ -65,6 +79,17 @@ pub(crate) mod host_c56f {
             bindings::NVC56F_SEM_EXECUTE_OPERATION_RELEASE
                 | bindings::NVC56F_SEM_EXECUTE_RELEASE_WFI_EN << 20
                 | bindings::NVC56F_SEM_EXECUTE_PAYLOAD_SIZE_32BIT << 24,
+        ])
+    }
+
+    /// Returns the methods raising the non-stall interrupt of the channel's engine, on the
+    /// vector GSP-RM programmed for it, once the methods before are processed.
+    pub(crate) fn non_stall_interrupt() -> Result<[u32; 2]> {
+        Ok([
+            // Any subchannel runs the channel's own methods.
+            methods(0, bindings::NVC56F_NON_STALL_INTERRUPT, 1)?,
+            // `NVC56F_NON_STALL_INTERRUPT_HANDLE`, which the interrupt doesn't report.
+            0,
         ])
     }
 

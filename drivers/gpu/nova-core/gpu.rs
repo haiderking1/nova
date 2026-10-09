@@ -40,14 +40,18 @@ use crate::{
         VramBuffer,
         VRAM_BUFFER_ALIGN, //
     },
-    channel::client::{
-        ChannelEngine,
-        ClientChannel,
-        PushBuffer, //
-    },
     channel::{
         self,
+        client::{
+            ChannelEngine,
+            ClientChannel,
+            PushBuffer, //
+        },
         copy::CopyChannel,
+        fence::{
+            FenceContexts,
+            Timelines, //
+        },
         gr::{
             GrContext,
             GraphicsInfo, //
@@ -105,9 +109,15 @@ use crate::{
         gsp::GspIrq,
         interrupt_tree::{
             LeafEnableGuard,
+            SubtreeSet,
             TopEnableGuard,
             Tree, //
         }, //
+        notification::{
+            NotificationIrq,
+            NotificationVectors,
+            NOTIFICATION_SUBTREE, //
+        },
     },
     mm::{
         bar_user::BarUser,
@@ -425,6 +435,9 @@ struct GspResources<'gpu> {
 struct GspSubtree<'a> {
     #[pin]
     irq: GspIrq<'a>,
+    /// The handler of the engines' notification vectors, if their subtree has a PCI vector of its
+    /// own. Must be kept declared *before* `_top`, like `irq`.
+    _notification_irq: Option<Pin<KBox<NotificationIrq<'a>>>>,
     /// Must be kept declared *after* `irq`. A handler still in flight enables the subtree again
     /// through its rearm.
     _top: TopEnableGuard<'a>,
@@ -444,11 +457,14 @@ impl<'a> GspSubtree<'a> {
         falcon: &'a Falcon<'a, GspFalcon>,
         cmdq: &'a Cmdq<'a>,
         display: &'a SetOnce<DisplayVector<'a>>,
+        notifications: &'a SetOnce<NotificationVectors<'a>>,
     ) -> impl PinInit<Self, Error> + 'a {
         try_pin_init!(Self {
             // SAFETY: this function's caller must not leak the `GspSubtree` that owns this
             // registration, so the registration's `Drop` runs.
-            irq <- unsafe { GspIrq::new(pdev, tree, falcon, cmdq, display) },
+            irq <- unsafe { GspIrq::new(pdev, tree, falcon, cmdq, display, notifications) },
+            // SAFETY: as for `irq`, and the box is dropped with the `GspSubtree`.
+            _notification_irq: unsafe { NotificationIrq::new(tree, notifications)? },
             _top: tree.enable_top_guarded(),
         })
     }
@@ -481,6 +497,8 @@ pub(crate) struct Gpu<'gpu> {
     /// The enable of the display vector at its leaf, if the GPU has a display engine whose
     /// interrupt the CPU services: the GSP event's handler services it.
     _display_leaf: Option<LeafEnableGuard<'gpu>>,
+    /// The enables of the engines' notification vectors, which signal the fences of channels.
+    _notification_leaves: Option<KVec<LeafEnableGuard<'gpu>>>,
     /// Static GPU information as provided by the GSP.
     pub(crate) gsp_static_info: GetGspStaticInfoReply,
     /// Nova's RM client, which its other RM objects are allocated under, if it could be allocated.
@@ -547,6 +565,26 @@ pub(crate) struct Gpu<'gpu> {
     display_vector: SetOnce<DisplayVector<'gpu>>,
     /// Borrow of `display_vector` that `_gsp_subtree` holds, taken by hand like `tree_ref`.
     display_vector_ref: &'gpu SetOnce<DisplayVector<'gpu>>,
+    /// The engines' notification vectors, once GSP-RM reported them.
+    ///
+    /// Must be kept declared *after* `_gsp_subtree`, which holds a borrow of it.
+    notification_vectors: SetOnce<NotificationVectors<'gpu>>,
+    /// Borrow of `notification_vectors` that `_gsp_subtree` holds, taken by hand like `tree_ref`.
+    notification_vectors_ref: &'gpu SetOnce<NotificationVectors<'gpu>>,
+    /// The timelines of the channels whose fences the notification vectors' service signals.
+    ///
+    /// Must be kept declared *after* `notification_vectors` and `client_channels`, which hold
+    /// borrows of it.
+    #[pin]
+    timelines: Timelines<'gpu>,
+    /// Borrow of `timelines`, taken by hand like `tree_ref`.
+    timelines_ref: &'gpu Timelines<'gpu>,
+    /// The fence contexts of channels.
+    ///
+    /// Must be kept declared *after* `timelines` and `client_channels`, whose fences borrow them.
+    fence_contexts: FenceContexts,
+    /// Borrow of `fence_contexts`, taken by hand like `tree_ref`.
+    fence_contexts_ref: &'gpu FenceContexts,
     /// The handler of vblanks that a client registered, which the display vector's service calls.
     ///
     /// Must be kept declared *after* `display_vector`, which holds a borrow of it.
@@ -614,7 +652,12 @@ impl<'gpu> Gpu<'gpu> {
             // Mapped by `Gpu::map_boot_display()` once the GPU is up.
             boot_scanout <- new_mutex!(None, "nova_boot_scanout"),
 
-            tree: Tree::new(pdev, bar, spec.chipset, irq::gsp::GSP_SUBTREE.into())?,
+            tree: Tree::new(
+                pdev,
+                bar,
+                spec.chipset,
+                SubtreeSet::from(irq::gsp::GSP_SUBTREE).union(NOTIFICATION_SUBTREE.into()),
+            )?,
 
             // SAFETY: `tree` is initialized above, is pinned at a stable address, and is dropped
             // after every field that uses `tree_ref` (struct field drop order).
@@ -634,6 +677,26 @@ impl<'gpu> Gpu<'gpu> {
             // address, and is dropped after every field that uses `display_vector_ref` (struct
             // field drop order).
             display_vector_ref: unsafe { &*core::ptr::from_ref(&*display_vector) },
+
+            fence_contexts: FenceContexts::new(num::u32_as_usize(CHANNEL_IDS))?,
+
+            // SAFETY: `fence_contexts` is initialized above, is in `Gpu`, pinned at a stable
+            // address, and is dropped after every field that uses `fence_contexts_ref` (struct
+            // field drop order).
+            fence_contexts_ref: unsafe { &*core::ptr::from_ref(&*fence_contexts) },
+
+            timelines <- Timelines::new(),
+
+            // SAFETY: `timelines` is initialized above, is pinned at a stable address, and is
+            // dropped after every field that uses `timelines_ref` (struct field drop order).
+            timelines_ref: unsafe { &*core::ptr::from_ref(timelines.as_ref().get_ref()) },
+
+            notification_vectors: SetOnce::new(),
+
+            // SAFETY: `notification_vectors` is initialized above, is in `Gpu`, pinned at a stable
+            // address, and is dropped after every field that uses `notification_vectors_ref`
+            // (struct field drop order).
+            notification_vectors_ref: unsafe { &*core::ptr::from_ref(&*notification_vectors) },
 
             _: {
                 let dma_mask = hal::gpu_hal(spec.chipset).dma_mask();
@@ -702,6 +765,7 @@ impl<'gpu> Gpu<'gpu> {
                     &*core::ptr::from_ref(&gsp_resources.gsp_falcon),
                     &*core::ptr::from_ref(&gsp_resources.gsp.cmdq),
                     display_vector_ref,
+                    notification_vectors_ref,
                 )
             },
 
@@ -779,6 +843,20 @@ impl<'gpu> Gpu<'gpu> {
                 .and_then(|()| display_vector_ref.as_ref())
                 .map(|vector| vector.enable(tree_ref)),
 
+            // Not fatal: only the fences of the work of channels need them. The vectors are enabled
+            // once the handler of their subtree services them.
+            _notification_leaves: Self::notification_vectors(
+                dev,
+                &gsp_resources.gsp.cmdq,
+                gsp_static_info,
+                timelines_ref,
+            )
+            .inspect_err(|e| dev_warn!(dev, "can't service channel notifications: {:?}\n", e))
+            .ok()
+            .and_then(|vectors| notification_vectors_ref.populate(vectors).then_some(()))
+            .and_then(|()| notification_vectors_ref.as_ref())
+            .and_then(|vectors| vectors.enable(tree_ref).ok()),
+
             // Set up by `Gpu::init_display_engine()`, which needs to allocate VRAM.
             display_engine <- new_mutex!(None, "nova_display_engine"),
 
@@ -850,10 +928,27 @@ impl<'gpu> Gpu<'gpu> {
         let hal = display::hal::display_hal(chipset).ok_or(ENOTSUPP)?;
         let vector = RmControl::new(info.client(), info.subdevice(), IntrGetKernelTable::new())
             .send(dev, cmdq)?
+            .display
             .ok_or(ENODEV)?;
         dev_dbg!(dev, "display: interrupt vector {}\n", vector);
 
         DisplayVector::new(dev, bar, hal, vector, handler)
+    }
+
+    /// Returns the notification vectors of the engines that channels run on, as GSP-RM reports
+    /// them, which signal the fences of `timelines`.
+    fn notification_vectors(
+        dev: &'gpu device::Device,
+        cmdq: &Cmdq<'_>,
+        info: &GetGspStaticInfoReply,
+        timelines: &'gpu Timelines<'gpu>,
+    ) -> Result<NotificationVectors<'gpu>> {
+        let vectors = RmControl::new(info.client(), info.subdevice(), IntrGetKernelTable::new())
+            .send(dev, cmdq)?
+            .notifications;
+        dev_dbg!(dev, "channels: notification vectors {:?}\n", vectors);
+
+        NotificationVectors::new(dev, &vectors, timelines)
     }
 
     /// Waits for GFW, the GPU's boot firmware, to report completion.
@@ -1523,9 +1618,11 @@ impl<'gpu> Gpu<'gpu> {
             let chid = u32::try_from(chid)?;
             // The channel is under the device of the address space's own RM client.
             let (rm, space) = vm.rm_and_space_mut();
-            let channel = ClientChannel::new(
-                gsp_resources.device.as_ref(),
-                &gsp_resources.gsp.cmdq,
+            let dev = gsp_resources.device.as_ref();
+            let cmdq = &gsp_resources.gsp.cmdq;
+            let mut channel = ClientChannel::new(
+                dev,
+                cmdq,
                 &mut self.mm.lock(),
                 self.spec.chipset,
                 rm,
@@ -1533,10 +1630,19 @@ impl<'gpu> Gpu<'gpu> {
                 space,
                 chid,
                 engine,
+                self.fence_contexts_ref.get(chid)?,
             )?;
+            let timeline = channel.timeline().clone();
+            if let Err(err) = self.timelines_ref.add(timeline.clone()) {
+                channel.free(dev, cmdq, &mut self.mm.lock(), space);
+                return Err(err);
+            }
             let channel =
                 Arc::pin_init(new_mutex!(Some(channel), "nova_client_channel"), GFP_KERNEL)
-                    .inspect_err(|_| pr_err!("can't track client channel {}: leaked\n", chid))?;
+                    .inspect_err(|_| {
+                        self.timelines_ref.remove(&timeline);
+                        pr_err!("can't track client channel {}: leaked\n", chid)
+                    })?;
             *self
                 .client_channels
                 .lock()
@@ -1571,6 +1677,7 @@ impl<'gpu> Gpu<'gpu> {
                 &mut self.mm.lock(),
                 vm.space_mut(),
             );
+            self.timelines_ref.remove(channel.timeline());
         }
         self.chids.lock().release_id(index);
 
@@ -1591,11 +1698,21 @@ impl<'gpu> Gpu<'gpu> {
             .clone()
             .ok_or(ENOENT)?;
 
-        let mut channel = channel.lock();
-        let channel = Option::as_mut(&mut *channel).ok_or(ENOENT)?;
-        let sequence = channel.submit(self.gsp_resources.bar, &mut self.mm.lock(), pushes)?;
-        // Without `mm` locked: other work goes on meanwhile.
-        channel.wait(sequence, CLIENT_WORK_TIMEOUT)
+        let fence = Option::as_mut(&mut *channel.lock()).ok_or(ENOENT)?.submit(
+            self.gsp_resources.bar,
+            &mut self.mm.lock(),
+            pushes,
+        )?;
+
+        // Without the channel locked: other work is submitted meanwhile.
+        if fence.wait_timeout(false, CLIENT_WORK_TIMEOUT)? {
+            return fence.status().map(|_| ());
+        }
+        if let Some(channel) = Option::as_mut(&mut *channel.lock()) {
+            channel.fail(ETIMEDOUT);
+        }
+
+        Err(ETIMEDOUT)
     }
 
     /// Allocates a zeroed buffer of at least `size` bytes of system memory, which the GPU accesses

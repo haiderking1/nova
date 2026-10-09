@@ -145,6 +145,16 @@ impl LeafMask {
     pub(super) const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
+
+    /// Returns the vectors in this mask or in `other`.
+    pub(super) const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Returns the vectors in both this mask and `other`.
+    pub(super) const fn intersection(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
 }
 
 impl From<Bounded<u32, 32>> for LeafMask {
@@ -199,6 +209,11 @@ impl SubtreeSet {
 
     pub(super) const fn intersection(self, other: Self) -> Self {
         Self(self.0 & other.0)
+    }
+
+    /// Returns the subtrees in this set or in `other`.
+    pub(crate) const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
     }
 
     /// Returns one more than the highest index in this set, or `0` for an empty set. An MSI-X
@@ -378,6 +393,12 @@ impl<'a> Tree<'a> {
         };
 
         self.vectors.index(entry).map(Into::into)
+    }
+
+    /// Returns whether `subtree`, a serviced subtree, has a PCI vector of its own, with MSI-X:
+    /// with MSI, every subtree shares the one PCI vector, whose handler serves them all.
+    pub(super) fn has_own_pci_vector(&self, subtree: Subtree) -> bool {
+        self.msi_type == MsiType::MsiX && self.serviced.contains(subtree)
     }
 
     /// Rearms PCI interrupt delivery to the CPU after servicing `subtree`, the one subtree that
@@ -647,6 +668,12 @@ mod tests {
 
         // The GSP needs no subtree above 2, so an MSI-X request covers entries 0 through 2.
         assert_eq!(SubtreeSet::from(gsp).span(), 3);
+
+        // Engine notifications, in subtree 0, add no entry beyond those the GSP needs.
+        let notifications = GinVector::new::<0>().subtree();
+        let both = SubtreeSet::from(gsp).union(notifications.into());
+        assert!(both.contains(gsp) && both.contains(notifications));
+        assert_eq!(both.span(), 3);
 
         // A 16-leaf tree implements every subtree that an 8-leaf tree does.
         assert_eq!(
