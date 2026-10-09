@@ -511,7 +511,7 @@ impl<'a> Tree<'a> {
 }
 
 /// The pending bits of one leaf as they were read, and the handle that clears them.
-pub(super) struct LeafPending<'a> {
+pub(crate) struct LeafPending<'a> {
     bar: Bar0<'a>,
     leaf: LeafIndex,
     pending: LeafMask,
@@ -539,7 +539,7 @@ impl LeafPending<'_> {
 }
 
 /// Disables a set of vectors in one leaf when dropped.
-pub(super) struct LeafEnableGuard<'a> {
+pub(crate) struct LeafEnableGuard<'a> {
     bar: Bar0<'a>,
     leaf: LeafIndex,
     vectors: LeafMask,

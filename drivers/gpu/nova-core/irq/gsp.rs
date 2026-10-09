@@ -8,19 +8,26 @@
 //! and the IRQ thread drains the queue.
 //!
 //! See "The GSP event" in `Documentation/gpu/nova/core/interrupts.rst`.
+//!
+//! The handler also services the display vector, in the same subtree, once it is set up: see
+//! [`DisplayVector`].
 
 use kernel::{
     device,
     irq,
     pci,
-    prelude::*, //
+    prelude::*,
+    sync::SetOnce, //
 };
 
-use super::interrupt_tree::{
-    GinVector,
-    LeafEnableGuard,
-    Subtree,
-    Tree, //
+use super::{
+    display::DisplayVector,
+    interrupt_tree::{
+        GinVector,
+        LeafEnableGuard,
+        Subtree,
+        Tree, //
+    },
 };
 use crate::{
     falcon::{
@@ -54,6 +61,8 @@ pub(crate) struct GspInterrupt<'a> {
     falcon: &'a Falcon<'a, GspFalcon>,
     cmdq: &'a Cmdq<'a>,
     tree: &'a Tree<'a>,
+    /// The display vector, once set up.
+    display: &'a SetOnce<DisplayVector<'a>>,
     /// For logging.
     dev: &'a device::Device,
 }
@@ -84,13 +93,25 @@ impl GspInterrupt<'_> {
 }
 
 impl irq::ThreadedHandler for GspInterrupt<'_> {
-    /// Top half, in hard interrupt context. Services the GSP vector only, so another vector
-    /// pending in the same leaf stays pending.
+    /// Top half, in hard interrupt context. Services the display vector, then the GSP vector,
+    /// and rearms the PCI vector once both are serviced. Other vectors pending in the same
+    /// leaves stay pending.
     fn handle(&self) -> irq::ThreadedIrqReturn {
+        let display = self.display.as_ref().and_then(|display| {
+            let vector = display.vector();
+            let leaf = self.tree.read_pending(vector.leaf_index());
+            leaf.vectors()
+                .contains(vector.leaf_mask())
+                .then(|| display.service(&leaf))
+        });
+
         let leaf = self.tree.read_pending(GSP_INTR_0_VECTOR.leaf_index());
         if !leaf.vectors().contains(GSP_INTR_0_VECTOR.leaf_mask()) {
             self.tree.rearm_pci_irq(GSP_SUBTREE);
-            return irq::ThreadedIrqReturn::None;
+            return match display {
+                Some(()) => irq::ThreadedIrqReturn::Handled,
+                None => irq::ThreadedIrqReturn::None,
+            };
         }
         leaf.clear_vectors(GSP_INTR_0_VECTOR.leaf_mask());
 
@@ -172,6 +193,7 @@ impl<'a> GspIrq<'a> {
         tree: &'a Tree<'a>,
         falcon: &'a Falcon<'a, GspFalcon>,
         cmdq: &'a Cmdq<'a>,
+        display: &'a SetOnce<DisplayVector<'a>>,
     ) -> impl PinInit<Self, Error> + 'a {
         let dev = pdev.as_ref();
 
@@ -181,10 +203,15 @@ impl<'a> GspIrq<'a> {
             reg <- unsafe {
                 irq::ThreadedRegistration::new(
                     tree.request_for(GSP_SUBTREE)?,
-                    // Shared with the display vector, in the same subtree.
-                    irq::Flags::SHARED,
+                    irq::Flags::TRIGGER_NONE,
                     c"nova-core",
-                    Ok(GspInterrupt { falcon, cmdq, tree, dev }),
+                    Ok(GspInterrupt {
+                        falcon,
+                        cmdq,
+                        tree,
+                        display,
+                        dev,
+                    }),
                 )
             },
             _leaf_guard: tree.enable_leaf_guarded(

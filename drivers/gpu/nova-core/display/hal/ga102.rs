@@ -45,7 +45,8 @@ use super::{
         engine::{
             armed,
             assembly,
-            InternalHandles, //
+            InternalHandles,
+            PresentMode, //
         },
         mode::HeadRaster,
         regs,
@@ -155,8 +156,13 @@ impl DisplayHal for Ga102 {
                 SET_NOTIFIER_CONTROL,
                 NOTIFIER_MODE_WRITE | image.notifier_offset,
             ),
-            // At most one new surface per frame, switching between frames.
-            (SET_PRESENT_CONTROL, 1),
+            (
+                SET_PRESENT_CONTROL,
+                match image.present {
+                    PresentMode::Vsync => PRESENT_VSYNC,
+                    PresentMode::Immediate => PRESENT_IMMEDIATE,
+                },
+            ),
             (SET_SIZE, size),
             // Pitch-linear.
             (SET_STORAGE, 0),

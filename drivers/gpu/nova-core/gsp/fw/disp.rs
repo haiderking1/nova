@@ -163,6 +163,12 @@ pub(crate) mod window_c67e {
         bindings::NVC67E_SET_COMPOSITION_CONTROL_BYPASS_ENABLE << 16;
     /// Presentation: minimum interval in bits 3:0, begin mode (0: without tearing) in bits 6:4.
     pub(crate) const SET_PRESENT_CONTROL: u32 = bindings::NVC67E_SET_PRESENT_CONTROL;
+    /// [`SET_PRESENT_CONTROL`]: at most one new surface per frame, switching between frames.
+    pub(crate) const PRESENT_VSYNC: u32 =
+        1 | bindings::NVC67E_SET_PRESENT_CONTROL_BEGIN_MODE_NON_TEARING << 4;
+    /// [`SET_PRESENT_CONTROL`]: a new surface right away, switching amid a frame.
+    pub(crate) const PRESENT_IMMEDIATE: u32 =
+        bindings::NVC67E_SET_PRESENT_CONTROL_BEGIN_MODE_IMMEDIATE << 4;
     /// Channels and cursors this window's updates wait for.
     pub(crate) const SET_INTERLOCK_FLAGS: u32 = bindings::NVC67E_SET_INTERLOCK_FLAGS;
     /// Windows this window's updates wait for.

@@ -83,6 +83,7 @@ use nova_core::api::{
     ConnectorType,
     ModeTimings,
     NovaCoreApi,
+    PresentMode,
     VblankHandler, //
 };
 
@@ -149,6 +150,11 @@ impl KmsDriver for NovaDriver {
             max_cursor: (0, 0),
             preferred_depth: 24,
             preferred_fourcc: Some(XRGB888),
+            // Flips of nova-core's scanout may tear, if userspace asks.
+            async_page_flip: drm
+                .boot_display
+                .as_ref()
+                .is_some_and(|display| display.scanout.is_some()),
         })
     }
 
@@ -294,7 +300,7 @@ impl plane::DriverPlane for NovaPlane {
 
     fn atomic_update(commit: plane::PlaneAtomicCommit<'_, Self>) {
         let drm = commit.plane().drm_dev();
-        let (old_state, mut new_state) = commit.take_old_new_state();
+        let (state, old_state, mut new_state) = commit.take_all();
 
         let scanout = drm
             .boot_display
@@ -304,8 +310,13 @@ impl plane::DriverPlane for NovaPlane {
         // frame shows from, which the commit's event then carries.
         let crtc = new_state.crtc().map(Crtc::from_opaque);
         let _vblank = crtc.and_then(|crtc| crtc.vblank_get().ok());
+        // An asynchronous flip, which userspace asked for, takes effect right away, tearing.
+        let present = match crtc.and_then(|crtc| state.get_new_crtc_state(crtc)) {
+            Some(crtc_state) if crtc_state.async_flip() => PresentMode::Immediate,
+            _ => PresentMode::Vsync,
+        };
         let result = if scanout {
-            draw_to_scanout(drm, old_state, &mut new_state)
+            draw_to_scanout(drm, old_state, &mut new_state, present)
         } else {
             copy_to_boot_display(drm, old_state, &new_state)
         };
@@ -315,7 +326,8 @@ impl plane::DriverPlane for NovaPlane {
     }
 }
 
-/// Draws the frame of `new_state` into the back buffer of nova-core's scanout, and flips it.
+/// Draws the frame of `new_state` into the back buffer of nova-core's scanout, and flips it as
+/// `present` says.
 ///
 /// The back buffer holds the frame before the one shown: the parts of the framebuffer that changed
 /// since either are drawn.
@@ -323,6 +335,7 @@ fn draw_to_scanout(
     drm: &NovaDevice,
     old_state: &PlaneState<NovaPlaneState>,
     new_state: &mut PlaneStateMutator<'_, PlaneState<NovaPlaneState>>,
+    present: PresentMode,
 ) -> Result {
     // Without a framebuffer, the last frame stays on screen.
     if new_state.framebuffer().is_none() {
@@ -376,7 +389,7 @@ fn draw_to_scanout(
                 draw(&previous, &mut row_buf)?;
             }
 
-            api.flip_scanout()
+            api.flip_scanout(present)
         })
     })?;
 

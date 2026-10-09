@@ -28,6 +28,7 @@ use super::{
     channel::PushBuffer,
     engine::{
         InternalHandles,
+        PresentMode,
         Surface, //
     },
     mode::HeadRaster,
@@ -47,6 +48,8 @@ pub(crate) struct WindowImage<'a> {
     pub(super) notifier_offset: u32,
     /// Whether the update waits for the next core channel update, to take effect with it.
     pub(super) interlock_with_core: bool,
+    /// When the update takes effect.
+    pub(super) present: PresentMode,
 }
 
 pub(crate) trait DisplayHal: Sync {

@@ -26,6 +26,7 @@ use crate::{
 
 use super::{
     DisplayEngine,
+    PresentMode,
     Surface, //
 };
 
@@ -153,10 +154,15 @@ impl Scanout {
         bar_user.write(&self.framebuffers[self.back].mapped, offset, data)
     }
 
-    /// Shows the back buffer from the next frame on, and returns once the framebuffer shown
-    /// before isn't read anymore: it is the back buffer from then on.
-    pub(crate) fn flip(&mut self, engine: &mut DisplayEngine<'_>, bar: Bar0<'_>) -> Result {
-        self.show_back(|surface| engine.show(bar, surface))
+    /// Shows the back buffer from the next frame on, or right away as `present` says, and returns
+    /// once the framebuffer shown before isn't read anymore: it is the back buffer from then on.
+    pub(crate) fn flip(
+        &mut self,
+        engine: &mut DisplayEngine<'_>,
+        bar: Bar0<'_>,
+        present: PresentMode,
+    ) -> Result {
+        self.show_back(|surface| engine.show(bar, surface, present))
     }
 
     /// Has `show` show the back buffer, which it returns once the framebuffer shown before isn't

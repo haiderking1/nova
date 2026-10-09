@@ -38,6 +38,7 @@ pub(crate) use fw::{
         EngineInfo,
         GrContextBuffer,
         PromoteEntry,
+        PromoteInit,
         ServerReservedLevel,
         DISP_PUSHBUFFER_SIZE,
         GR_CONTEXT_BUFFERS,

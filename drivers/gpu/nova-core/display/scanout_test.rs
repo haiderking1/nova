@@ -14,7 +14,9 @@ use kernel::{
     sizes::SZ_64K,
     time::{
         delay::fsleep,
-        Delta, //
+        Delta,
+        Instant,
+        Monotonic, //
     }, //
 };
 
@@ -35,6 +37,7 @@ use crate::{
 
 use super::{
     DisplayEngine,
+    PresentMode,
     Surface, //
 };
 
@@ -126,11 +129,30 @@ pub(crate) fn run(
             "solid red, filled by the CPU"
         }
     );
-    let shown = engine.show(bar, &test);
+    let shown = engine.show(bar, &test, PresentMode::Vsync);
     if shown.is_ok() {
         fsleep(SHOW_TIME);
+
+        // Flips of the surface shown, which the window takes on the next frame, or right away.
+        match (
+            time_flips(bar, engine, &test, PresentMode::Vsync),
+            time_flips(bar, engine, &test, PresentMode::Immediate),
+        ) {
+            (Ok(vsync), Ok(immediate)) => dev_info!(
+                dev,
+                "display: a flip takes {} us with vsync, {} us immediate\n",
+                vsync,
+                immediate
+            ),
+            (vsync, immediate) => dev_err!(
+                dev,
+                "display: flips failed: vsync {:?}, immediate {:?}\n",
+                vsync,
+                immediate
+            ),
+        }
     }
-    let restored = engine.show(bar, &back);
+    let restored = engine.show(bar, &back, PresentMode::Vsync);
     // The test surface may be read until the next frame starts.
     fsleep(Delta::from_millis(100));
 
@@ -145,6 +167,25 @@ pub(crate) fn run(
     }
 
     shown.and(restored)
+}
+
+/// Number of flips [`time_flips`] times.
+const TIMED_FLIPS: i64 = 20;
+
+/// Returns how long a flip to `surface` takes on average, presented as `present`, in
+/// microseconds: from sending it to the window taking it.
+fn time_flips(
+    bar: Bar0<'_>,
+    engine: &mut DisplayEngine<'_>,
+    surface: &Surface,
+    present: PresentMode,
+) -> Result<i64> {
+    let start = Instant::<Monotonic>::now();
+    for _ in 0..TIMED_FLIPS {
+        engine.show(bar, surface, present)?;
+    }
+
+    Ok(start.elapsed().as_micros_ceil() / TIMED_FLIPS)
 }
 
 /// Draws [`shader::pattern`] on `surface`, which is in the VRAM `range`, with a compute shader on

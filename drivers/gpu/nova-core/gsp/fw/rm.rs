@@ -1040,6 +1040,8 @@ pub(crate) struct GrContextBuffer {
     pub(crate) init: bool,
     /// Whether the graphics engine only reads the buffer.
     pub(crate) read_only: bool,
+    /// Whether the buffer is in coherent system memory rather than VRAM.
+    pub(crate) sysmem: bool,
 }
 
 impl GrContextBuffer {
@@ -1076,6 +1078,7 @@ pub(crate) const GR_CONTEXT_BUFFERS: [GrContextBuffer; 8] = {
         global: bool,
         init: bool,
         read_only: bool,
+        sysmem: bool,
     ) -> GrContextBuffer {
         GrContextBuffer {
             engine_id,
@@ -1084,6 +1087,7 @@ pub(crate) const GR_CONTEXT_BUFFERS: [GrContextBuffer; 8] = {
             global,
             init,
             read_only,
+            sysmem,
         }
     }
 
@@ -1094,6 +1098,7 @@ pub(crate) const GR_CONTEXT_BUFFERS: [GrContextBuffer; 8] = {
             false,
             true,
             false,
+            false,
         ),
         buffer(
             bindings::NV0080_CTRL_FIFO_GET_ENGINE_CONTEXT_PROPERTIES_ENGINE_ID_GRAPHICS_PATCH,
@@ -1101,11 +1106,13 @@ pub(crate) const GR_CONTEXT_BUFFERS: [GrContextBuffer; 8] = {
             false,
             true,
             false,
+            false,
         ),
         buffer(
             bindings::NV0080_CTRL_FIFO_GET_ENGINE_CONTEXT_PROPERTIES_ENGINE_ID_GRAPHICS_BUNDLE_CB,
             bindings::NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ID_BUFFER_BUNDLE_CB,
             true,
+            false,
             false,
             false,
         ),
@@ -1115,11 +1122,13 @@ pub(crate) const GR_CONTEXT_BUFFERS: [GrContextBuffer; 8] = {
             true,
             false,
             false,
+            false,
         ),
         buffer(
             bindings::NV0080_CTRL_FIFO_GET_ENGINE_CONTEXT_PROPERTIES_ENGINE_ID_GRAPHICS_ATTRIBUTE_CB,
             bindings::NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ID_ATTRIBUTE_CB,
             true,
+            false,
             false,
             false,
         ),
@@ -1129,6 +1138,7 @@ pub(crate) const GR_CONTEXT_BUFFERS: [GrContextBuffer; 8] = {
             true,
             false,
             false,
+            false,
         ),
         buffer(
             bindings::NV0080_CTRL_FIFO_GET_ENGINE_CONTEXT_PROPERTIES_ENGINE_ID_GRAPHICS_FECS_EVENT,
@@ -1136,6 +1146,9 @@ pub(crate) const GR_CONTEXT_BUFFERS: [GrContextBuffer; 8] = {
             true,
             true,
             false,
+            // In system memory, kernel RM's default for it (`kgraphicsConstructEngine()`: "FECS
+            // event buffer defaults to cached SYSMEM").
+            true,
         ),
         buffer(
             bindings::NV0080_CTRL_FIFO_GET_ENGINE_CONTEXT_PROPERTIES_ENGINE_ID_GRAPHICS_PRIV_ACCESS_MAP,
@@ -1143,6 +1156,7 @@ pub(crate) const GR_CONTEXT_BUFFERS: [GrContextBuffer; 8] = {
             true,
             true,
             true,
+            false,
         ),
     ]
 };
@@ -1197,14 +1211,30 @@ pub(crate) struct PromoteEntry {
     pub(crate) promote_id: u16,
     /// GPU virtual address of the buffer in the channel's address space, if mapped there.
     pub(crate) gpu_va: Option<u64>,
-    /// VRAM address and size of the buffer, if GSP-RM is to initialize it.
-    pub(crate) init: Option<(u64, u64)>,
+    /// Where the buffer is and its size, if GSP-RM is to initialize it.
+    pub(crate) init: Option<PromoteInit>,
 }
 
-/// `physAttr` of initialized buffers: in VRAM, not cached by the GPU (`NV2080_CTRL_GPU_INITIALIZE_CTX_*`,
-/// aperture in bits 1:0, `GPU_CACHEABLE` in bit 2).
+/// A context buffer GSP-RM initializes when given it with [`PromoteCtxParams`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PromoteInit {
+    /// VRAM address of the buffer, or its DMA address if `sysmem`.
+    pub(crate) addr: u64,
+    /// Size in bytes.
+    pub(crate) size: u64,
+    /// Whether the buffer is in coherent system memory.
+    pub(crate) sysmem: bool,
+}
+
+/// `physAttr` of initialized buffers in VRAM, not cached by the GPU
+/// (`NV2080_CTRL_GPU_INITIALIZE_CTX_*`, aperture in bits 1:0, `GPU_CACHEABLE` in bit 2).
 const PROMOTE_PHYS_ATTR_VIDMEM_UNCACHED: u32 =
     bindings::NV2080_CTRL_GPU_INITIALIZE_CTX_APERTURE_VIDMEM
+        | bindings::NV2080_CTRL_GPU_INITIALIZE_CTX_GPU_CACHEABLE_NO << 2;
+/// `physAttr` of initialized buffers in coherent system memory, not cached by the GPU, as kernel
+/// RM gives them (`kgrctxPrepareInitializeCtxBuffer()`).
+const PROMOTE_PHYS_ATTR_COH_SYS_UNCACHED: u32 =
+    bindings::NV2080_CTRL_GPU_INITIALIZE_CTX_APERTURE_COH_SYS
         | bindings::NV2080_CTRL_GPU_INITIALIZE_CTX_GPU_CACHEABLE_NO << 2;
 
 /// Wrapper for [`bindings::NV2080_CTRL_GPU_PROMOTE_CTX_PARAMS`].
@@ -1237,11 +1267,15 @@ impl PromoteCtxParams {
             bNonmapped: u8::from(entry.gpu_va.is_none()),
             ..Default::default()
         };
-        if let Some((addr, size)) = entry.init {
+        if let Some(init) = entry.init {
             slot.bInitialize = 1;
-            slot.gpuPhysAddr = addr;
-            slot.size = size;
-            slot.physAttr = PROMOTE_PHYS_ATTR_VIDMEM_UNCACHED;
+            slot.gpuPhysAddr = init.addr;
+            slot.size = init.size;
+            slot.physAttr = if init.sysmem {
+                PROMOTE_PHYS_ATTR_COH_SYS_UNCACHED
+            } else {
+                PROMOTE_PHYS_ATTR_VIDMEM_UNCACHED
+            };
         }
         self.0.entryCount += 1;
 

@@ -109,6 +109,15 @@ pub(crate) struct InternalHandles {
     pub(crate) subdevice: Handle<Subdevice>,
 }
 
+/// When a window update takes effect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresentMode {
+    /// Between frames: the frame shown is whole.
+    Vsync,
+    /// Right away, amid a frame: the frame shown tears, but shows sooner.
+    Immediate,
+}
+
 /// A pitch-linear XRGB8888 surface in VRAM, for a window to show.
 #[derive(Clone, Debug)]
 pub(crate) struct Surface {
@@ -244,12 +253,18 @@ impl<'a> DisplayEngine<'a> {
         self.windows
     }
 
-    /// Shows `surface` on head 0, at the head's current mode, from the next frame on.
+    /// Shows `surface` on head 0, at the head's current mode, from the next frame on or right away
+    /// as `present` says.
     ///
     /// Fails with `ENODEV` if the channels couldn't be set up.
-    pub(crate) fn show(&mut self, bar: Bar0<'_>, surface: &Surface) -> Result {
+    pub(crate) fn show(
+        &mut self,
+        bar: Bar0<'_>,
+        surface: &Surface,
+        present: PresentMode,
+    ) -> Result {
         let channels = self.channels.as_mut().ok_or(ENODEV)?;
-        channels.show(bar, surface)
+        channels.show(bar, surface, present)
     }
 
     /// Has head `head`, driving the display `display_id`, scan out `mode` on the output it has,
@@ -312,7 +327,7 @@ impl<'a> Channels<'a> {
 
         // The window update waits for the core update, which waits for it in turn.
         let window = surface
-            .map(|surface| self.push_window_update(bar, surface, true))
+            .map(|surface| self.push_window_update(bar, surface, true, PresentMode::Vsync))
             .transpose()?;
         let windows = if window.is_some() { 1 << WINDOW } else { 0 };
 
@@ -448,18 +463,20 @@ impl<'a> Channels<'a> {
     ///
     /// The window bypasses composition, as NVIDIA's driver does to show a console. The head keeps
     /// the mode and output it has.
-    fn show(&mut self, bar: Bar0<'_>, surface: &Surface) -> Result {
-        let status_word = self.push_window_update(bar, surface, false)?;
+    fn show(&mut self, bar: Bar0<'_>, surface: &Surface, present: PresentMode) -> Result {
+        let status_word = self.push_window_update(bar, surface, false, present)?;
         self.wait_window_update(status_word)
     }
 
     /// Sends the window update pointing the window at `surface`, waiting for the next core update
-    /// if `interlock_with_core`, and returns the word of the notifier it reports its progress in.
+    /// if `interlock_with_core` and taking effect as `present` says, and returns the word of the
+    /// notifier it reports its progress in.
     fn push_window_update(
         &mut self,
         bar: Bar0<'_>,
         surface: &Surface,
         interlock_with_core: bool,
+        present: PresentMode,
     ) -> Result<usize> {
         surface.check()?;
 
@@ -479,6 +496,7 @@ impl<'a> Channels<'a> {
                 notifier_ctxdma: NOTIFIER_CTXDMA,
                 notifier_offset,
                 interlock_with_core,
+                present,
             },
         )?;
 

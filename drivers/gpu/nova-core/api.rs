@@ -18,6 +18,7 @@ use kernel::{
 pub use crate::{
     display::{
         ModeTimings,
+        PresentMode,
         ScanoutMode,
         VblankHandler, //
     },
@@ -109,13 +110,13 @@ impl NovaCoreApi<'_> {
         self.gpu.write_scanout(offset, data)
     }
 
-    /// Shows the back buffer of Nova's own scanout from the next frame on, and returns once the
-    /// framebuffer shown before is the back buffer: it then holds the frame before the one just
-    /// flipped.
+    /// Shows the back buffer of Nova's own scanout from the next frame on, or right away with
+    /// [`PresentMode::Immediate`], tearing, and returns once the framebuffer shown before is the
+    /// back buffer: it then holds the frame before the one just flipped.
     ///
     /// Fails with `ENODEV` if the scanout isn't set up.
-    pub fn flip_scanout(&self) -> Result {
-        self.gpu.flip_scanout()
+    pub fn flip_scanout(&self, present: PresentMode) -> Result {
+        self.gpu.flip_scanout(present)
     }
 
     /// Enables the vblank interrupt of head `head` if `enable`, or disables it. Doesn't sleep, so

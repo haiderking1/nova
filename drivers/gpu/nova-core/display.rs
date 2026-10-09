@@ -23,6 +23,7 @@ pub(crate) use engine::{
     InternalHandles,
     Surface, //
 };
+pub use engine::PresentMode;
 pub use mode::ModeTimings;
 pub(crate) use scanout::Scanout;
 pub use scanout::ScanoutMode;

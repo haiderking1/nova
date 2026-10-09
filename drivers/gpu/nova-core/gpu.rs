@@ -20,7 +20,8 @@ use kernel::{
     sync::{
         new_spinlock_irq,
         Arc,
-        Mutex, //
+        Mutex,
+        SetOnce, //
     },
     uapi, //
 };
@@ -40,6 +41,7 @@ use crate::{
         DisplayId,
         InternalHandles,
         ModeTimings,
+        PresentMode,
         Scanout,
         ScanoutMode,
         VblankHandler,
@@ -75,9 +77,10 @@ use crate::{
     },
     irq::{
         self,
-        display::DisplayIrq,
+        display::DisplayVector,
         gsp::GspIrq,
         interrupt_tree::{
+            LeafEnableGuard,
             TopEnableGuard,
             Tree, //
         }, //
@@ -404,11 +407,12 @@ impl<'a> GspSubtree<'a> {
         tree: &'a Tree<'a>,
         falcon: &'a Falcon<'a, GspFalcon>,
         cmdq: &'a Cmdq<'a>,
+        display: &'a SetOnce<DisplayVector<'a>>,
     ) -> impl PinInit<Self, Error> + 'a {
         try_pin_init!(Self {
             // SAFETY: this function's caller must not leak the `GspSubtree` that owns this
             // registration, so the registration's `Drop` runs.
-            irq <- unsafe { GspIrq::new(pdev, tree, falcon, cmdq) },
+            irq <- unsafe { GspIrq::new(pdev, tree, falcon, cmdq, display) },
             _top: tree.enable_top_guarded(),
         })
     }
@@ -432,12 +436,9 @@ pub(crate) struct Gpu<'gpu> {
     /// falcon that it reads are freed, and before the GSP is unloaded.
     #[pin]
     _gsp_subtree: GspSubtree<'gpu>,
-    /// Display interrupt registration, if the GPU has a display engine whose interrupt the CPU
-    /// services.
-    ///
-    /// Must be kept declared *before* `gsp_resources`, `vblank_handler` and `tree`, which its
-    /// handler uses.
-    display_irq: Option<Pin<KBox<DisplayIrq<'gpu>>>>,
+    /// The enable of the display vector at its leaf, if the GPU has a display engine whose
+    /// interrupt the CPU services: the GSP event's handler services it.
+    _display_leaf: Option<LeafEnableGuard<'gpu>>,
     /// Static GPU information as provided by the GSP.
     pub(crate) gsp_static_info: GetGspStaticInfoReply,
     /// Nova's RM client, which its other RM objects are allocated under, if it could be allocated.
@@ -458,7 +459,7 @@ pub(crate) struct Gpu<'gpu> {
     #[pin]
     display_engine: Mutex<Option<DisplayOutput<'gpu>>>,
     /// The context of the graphics engine, once set up by [`Gpu::init_graphics()`].
-    gr: Option<GrContext>,
+    gr: Option<GrContext<'gpu>>,
     /// GPU memory manager owning memory management resources.
     ///
     /// Must be kept declared *before* `gsp_resources`, so that its components are dropped while
@@ -479,12 +480,18 @@ pub(crate) struct Gpu<'gpu> {
     /// Must be kept declared *after* `gsp_resources`, as the latter's `PinnedDrop` implementation
     /// requires the sysmem flush page to be in place.
     sysmem_flush: SysmemFlush<'gpu>,
-    /// The handler of vblanks that a client registered, which the display interrupt calls.
+    /// The display vector, once GSP-RM reported it, which the GSP event's handler services.
     ///
-    /// Must be kept declared *after* `display_irq`, which holds a borrow of it.
+    /// Must be kept declared *after* `_gsp_subtree`, which holds a borrow of it.
+    display_vector: SetOnce<DisplayVector<'gpu>>,
+    /// Borrow of `display_vector` that `_gsp_subtree` holds, taken by hand like `tree_ref`.
+    display_vector_ref: &'gpu SetOnce<DisplayVector<'gpu>>,
+    /// The handler of vblanks that a client registered, which the display vector's service calls.
+    ///
+    /// Must be kept declared *after* `display_vector`, which holds a borrow of it.
     #[pin]
     vblank_handler: VblankHandlerSlot,
-    /// Borrow of `vblank_handler` that `display_irq` holds, taken by hand like `tree_ref`.
+    /// Borrow of `vblank_handler` that `display_vector` holds, taken by hand like `tree_ref`.
     vblank_handler_ref: &'gpu VblankHandlerSlot,
     /// Borrow of `tree` that `_gsp_subtree` holds. A field that borrows a sibling field is
     /// self-referential, which `pin_init` cannot express, so the borrow is taken by hand.
@@ -560,6 +567,13 @@ impl<'gpu> Gpu<'gpu> {
                 &*core::ptr::from_ref(vblank_handler.as_ref().get_ref())
             },
 
+            display_vector: SetOnce::new(),
+
+            // SAFETY: `display_vector` is initialized above, is in `Gpu`, pinned at a stable
+            // address, and is dropped after every field that uses `display_vector_ref` (struct
+            // field drop order).
+            display_vector_ref: unsafe { &*core::ptr::from_ref(&*display_vector) },
+
             _: {
                 let dma_mask = hal::gpu_hal(spec.chipset).dma_mask();
 
@@ -626,6 +640,7 @@ impl<'gpu> Gpu<'gpu> {
                     tree_ref,
                     &*core::ptr::from_ref(&gsp_resources.gsp_falcon),
                     &*core::ptr::from_ref(&gsp_resources.gsp.cmdq),
+                    display_vector_ref,
                 )
             },
 
@@ -681,20 +696,27 @@ impl<'gpu> Gpu<'gpu> {
                 output
             }),
 
-            // Not fatal: vblanks are only needed to pace what is shown.
-            display_irq: display.as_ref().and_then(|_| {
-                Self::register_display_irq(
-                    dev,
-                    bar,
-                    &gsp_resources.gsp.cmdq,
-                    gsp_resources.spec.chipset,
-                    gsp_static_info,
-                    tree_ref,
-                    vblank_handler_ref,
-                )
-                .inspect_err(|e| dev_warn!(dev, "can't service display interrupts: {:?}\n", e))
-                .ok()
-            }),
+            // Not fatal: vblanks are only needed to pace what is shown. The vector is enabled
+            // once the GSP event's handler services it.
+            _display_leaf: display
+                .as_ref()
+                .and_then(|_| {
+                    Self::display_vector(
+                        dev,
+                        bar,
+                        &gsp_resources.gsp.cmdq,
+                        gsp_resources.spec.chipset,
+                        gsp_static_info,
+                        vblank_handler_ref,
+                    )
+                    .inspect_err(|e| {
+                        dev_warn!(dev, "can't service display interrupts: {:?}\n", e)
+                    })
+                    .ok()
+                })
+                .and_then(|vector| display_vector_ref.populate(vector).then_some(()))
+                .and_then(|()| display_vector_ref.as_ref())
+                .map(|vector| vector.enable(tree_ref)),
 
             // Set up by `Gpu::init_display_engine()`, which needs to allocate VRAM.
             display_engine <- new_mutex!(None, "nova_display_engine"),
@@ -735,28 +757,23 @@ impl<'gpu> Gpu<'gpu> {
         })
     }
 
-    /// Registers the handler of the display interrupt, on the vector GSP-RM reports for it.
-    #[expect(clippy::too_many_arguments)]
-    fn register_display_irq(
+    /// Returns the display vector, as GSP-RM reports it, whose vblanks are passed to the handler
+    /// in `handler`.
+    fn display_vector(
         dev: &'gpu device::Device,
         bar: Bar0<'gpu>,
         cmdq: &Cmdq<'_>,
         chipset: Chipset,
         info: &GetGspStaticInfoReply,
-        tree: &'gpu Tree<'gpu>,
         handler: &'gpu VblankHandlerSlot,
-    ) -> Result<Pin<KBox<DisplayIrq<'gpu>>>> {
+    ) -> Result<DisplayVector<'gpu>> {
         let hal = display::hal::display_hal(chipset).ok_or(ENOTSUPP)?;
         let vector = RmControl::new(info.client(), info.subdevice(), IntrGetKernelTable::new())
             .send(dev, cmdq)?
             .ok_or(ENODEV)?;
         dev_dbg!(dev, "display: interrupt vector {}\n", vector);
 
-        // SAFETY: the registration is a field of `Gpu`, which is never leaked, so its `Drop` runs.
-        KBox::pin_init(
-            unsafe { DisplayIrq::new(dev, bar, tree, hal, vector, handler)? },
-            GFP_KERNEL,
-        )
+        DisplayVector::new(dev, bar, hal, vector, handler)
     }
 
     /// Waits for GFW, the GPU's boot firmware, to report completion.
@@ -1017,19 +1034,19 @@ impl<'gpu> Gpu<'gpu> {
     /// framebuffer shown before can be drawn into.
     ///
     /// Fails with `ENODEV` if the scanout isn't set up.
-    pub(crate) fn flip_scanout(&self) -> Result {
+    pub(crate) fn flip_scanout(&self, present: PresentMode) -> Result {
         let mut guard = self.display_engine.lock();
         let output = Option::as_mut(&mut guard).ok_or(ENODEV)?;
         let scanout = output.scanout.as_mut().ok_or(ENODEV)?;
 
-        scanout.flip(&mut output.engine, self.gsp_resources.bar)
+        scanout.flip(&mut output.engine, self.gsp_resources.bar, present)
     }
 
     /// Enables the vblank interrupt of head `head` if `enable`, or disables it. Doesn't sleep.
     ///
     /// Fails with `ENODEV` if the display interrupt isn't serviced.
     pub(crate) fn set_vblank_interrupt(&self, head: u32, enable: bool) -> Result {
-        if self.display_irq.is_none() {
+        if self.display_vector.as_ref().is_none() {
             return Err(ENODEV);
         }
         let hal = display::hal::display_hal(self.spec.chipset).ok_or(ENOTSUPP)?;
