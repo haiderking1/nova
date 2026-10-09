@@ -226,11 +226,18 @@ impl PteOps for Pte {
                 return Self::invalid();
             }
         };
-        Self::zeroed()
+        let pte = Self::zeroed()
             .with_valid(true)
             .with_aperture(aperture)
             .with_pcf(pcf.with_privileged(access.privileged))
-            .with_frame_number(pfn)
+            .with_frame_number(pfn);
+        match pte.try_with_kind(access.kind) {
+            Ok(pte) => pte,
+            Err(_) => {
+                kernel::pr_warn!("MMU v3 PTE kind {:#x} not supported\n", access.kind);
+                Self::invalid()
+            }
+        }
     }
 
     fn is_valid(&self) -> bool {

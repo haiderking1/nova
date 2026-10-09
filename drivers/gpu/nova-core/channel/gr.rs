@@ -43,7 +43,10 @@ use crate::{
         GR_CONTEXT_BUFFERS, GR_UNRESTRICTED_PRIV_ACCESS_MAP,
     },
     mm::{
-        pagetable::Access,
+        pagetable::{
+            kind,
+            Access, //
+        },
         vmm::MappedRange,
         ContiguousVram,
         GpuMm,
@@ -76,6 +79,7 @@ fn buffer_access(buffer: &GrContextBuffer) -> Access {
     Access {
         writable: !buffer.read_only,
         privileged: true,
+        kind: kind::PITCH,
     }
 }
 

@@ -101,14 +101,67 @@ pub(crate) struct Access {
     /// Whether only privileged accessors may access the memory, such as the context switch
     /// firmware of the engines.
     pub(crate) privileged: bool,
+    /// The PTE kind: how the memory is laid out, see [`kind`].
+    pub(crate) kind: u8,
 }
 
 impl Access {
-    /// Read and write access, for everyone.
+    /// Read and write access, for everyone, to pitch-linear memory.
     pub(crate) const READ_WRITE: Self = Self {
         writable: true,
         privileged: false,
+        kind: kind::PITCH,
     };
+}
+
+/// PTE kinds: how the memory a PTE maps is laid out, such as pitch-linear, block-linear, or as
+/// depth and stencil surfaces, and whether it is compressed.
+///
+/// They are the same from Turing to Hopper: `NV_MMU_PTE_KIND_*` in the `dev_mmu.h` of TU102 and
+/// GH100 in open-gpu-kernel-modules (`src/common/inc/swref/published`).
+pub(crate) mod kind {
+    /// Pitch-linear memory.
+    pub(crate) const PITCH: u8 = 0x00;
+    /// 16-bit depth.
+    pub(crate) const Z16: u8 = 0x01;
+    /// 8-bit stencil.
+    pub(crate) const S8: u8 = 0x02;
+    /// 8-bit stencil and 24-bit depth.
+    pub(crate) const S8Z24: u8 = 0x03;
+    /// 32-bit float depth and 8-bit stencil.
+    pub(crate) const ZF32_X24S8: u8 = 0x04;
+    /// 24-bit depth and 8-bit stencil.
+    pub(crate) const Z24S8: u8 = 0x05;
+    /// Block-linear memory of any other format.
+    pub(crate) const GENERIC_MEMORY: u8 = 0x06;
+    /// Compressible variants of the kinds above.
+    const GENERIC_MEMORY_COMPRESSIBLE: u8 = 0x08;
+    const GENERIC_MEMORY_COMPRESSIBLE_DISABLE_PLC: u8 = 0x09;
+    const S8_COMPRESSIBLE_DISABLE_PLC: u8 = 0x0a;
+    const Z16_COMPRESSIBLE_DISABLE_PLC: u8 = 0x0b;
+    const S8Z24_COMPRESSIBLE_DISABLE_PLC: u8 = 0x0c;
+    const ZF32_X24S8_COMPRESSIBLE_DISABLE_PLC: u8 = 0x0d;
+    const Z24S8_COMPRESSIBLE_DISABLE_PLC: u8 = 0x0e;
+
+    /// Returns the kind memory of `kind` is mapped with, or `None` if `kind` isn't one.
+    ///
+    /// Memory is never compressed, as compression needs compression tags, which Nova doesn't
+    /// allocate: compressible kinds are mapped as their uncompressed equivalent, like kernel RM's
+    /// `memmgrGetUncompressedKind_TU102()` does.
+    pub(crate) fn uncompressed(kind: u8) -> Option<u8> {
+        Some(match kind {
+            PITCH => PITCH,
+            GENERIC_MEMORY | GENERIC_MEMORY_COMPRESSIBLE | GENERIC_MEMORY_COMPRESSIBLE_DISABLE_PLC => {
+                GENERIC_MEMORY
+            }
+            S8 | S8_COMPRESSIBLE_DISABLE_PLC => S8,
+            Z16 | Z16_COMPRESSIBLE_DISABLE_PLC => Z16,
+            S8Z24 | S8Z24_COMPRESSIBLE_DISABLE_PLC => S8Z24,
+            Z24S8 | Z24S8_COMPRESSIBLE_DISABLE_PLC => Z24S8,
+            ZF32_X24S8 | ZF32_X24S8_COMPRESSIBLE_DISABLE_PLC => ZF32_X24S8,
+            _ => return None,
+        })
+    }
 }
 
 /// Page Table Level hierarchy for MMU v2/v3.

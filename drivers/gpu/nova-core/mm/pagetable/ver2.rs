@@ -136,7 +136,8 @@ impl PteOps for Pte {
             .with_valid(true)
             .with_aperture(aperture)
             .with_read_only(!access.writable)
-            .with_privilege(access.privileged);
+            .with_privilege(access.privileged)
+            .with_kind(access.kind);
         match aperture {
             AperturePte::VideoMemory => base.with_frame_number_vid(pfn),
             // Sysmem PTEs use VOL=1 to bypass L2 for cache coherency.
