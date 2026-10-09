@@ -64,6 +64,12 @@ pub struct ModeConfigInfo {
     pub preferred_depth: u32,
     /// An optional default fourcc format code to be preferred for clients.
     pub preferred_fourcc: Option<u32>,
+    /// Whether page flips may complete without waiting for vertical blanking, at the cost of
+    /// tearing, as userspace asks with `DRM_MODE_PAGE_FLIP_ASYNC`. The driver must then honor
+    /// [`RawCrtcState::async_flip`] for primary planes.
+    ///
+    /// [`RawCrtcState::async_flip`]: crtc::RawCrtcState::async_flip
+    pub async_page_flip: bool,
 }
 
 /// A trait representing a type that can be used for setting up KMS, or a stub.
@@ -390,6 +396,7 @@ impl<T: KmsDriver> private::KmsImpl for T {
                 cursor_width: mode_config_info.max_cursor.0,
                 cursor_height: mode_config_info.max_cursor.1,
                 preferred_depth: mode_config_info.preferred_depth,
+                async_page_flip: mode_config_info.async_page_flip,
                 ..Default::default()
             };
         };

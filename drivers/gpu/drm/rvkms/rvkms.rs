@@ -119,6 +119,7 @@ const MODE_CONFIG_INFO: ModeConfigInfo = ModeConfigInfo {
     max_cursor: (512, 512),
     preferred_depth: 24,
     preferred_fourcc: None,
+    async_page_flip: false,
 };
 
 pub(crate) struct RvkmsModule<'bound> {

@@ -776,6 +776,14 @@ pub trait RawCrtcState: AsRawCrtcState {
         unsafe { (*self.as_raw()).active }
     }
 
+    /// Returns whether the planes of the CRTC are flipped without waiting for vertical blanking in
+    /// this atomic state, as userspace asked with `DRM_MODE_PAGE_FLIP_ASYNC`.
+    fn async_flip(&self) -> bool {
+        // SAFETY: `async_flip` is set when the state is built and invariant beyond that point, so
+        // our interface ensures this access is serialized.
+        unsafe { (*self.as_raw()).async_flip }
+    }
+
     /// Returns the mode the CRTC scans out in this atomic state, as adjusted for the hardware.
     fn adjusted_mode(&self) -> &DisplayMode {
         // SAFETY:
