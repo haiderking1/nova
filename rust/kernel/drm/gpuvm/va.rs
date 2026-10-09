@@ -95,6 +95,12 @@ impl<T: DriverGpuVm> GpuVa<T> {
         // invariants.
         unsafe { GpuVmBo::from_raw((*self.as_raw()).vm_bo) }
     }
+
+    /// Returns the driver's data of this [`GpuVa`].
+    #[inline]
+    pub fn data(&self) -> &T::VaData {
+        &self.data
+    }
 }
 
 /// A pre-allocated [`GpuVa`] object.

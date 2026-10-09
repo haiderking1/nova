@@ -527,6 +527,14 @@ impl_aref_for_gem_obj! {
 
 impl<T: DriverObject, Ctx: DeviceContext> super::private::Sealed for Object<T, Ctx> {}
 
+// SAFETY: All GEM objects are thread-safe, and the driver's data is `Send` by the `DriverObject`
+// bounds.
+unsafe impl<T: DriverObject, Ctx: DeviceContext> Send for Object<T, Ctx> {}
+
+// SAFETY: All GEM objects are thread-safe, and the driver's data is `Sync` by the `DriverObject`
+// bounds.
+unsafe impl<T: DriverObject, Ctx: DeviceContext> Sync for Object<T, Ctx> {}
+
 impl<T: DriverObject, Ctx: DeviceContext> Deref for Object<T, Ctx> {
     type Target = T;
 
