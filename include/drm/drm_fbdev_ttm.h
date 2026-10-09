@@ -3,20 +3,11 @@
 #ifndef DRM_FBDEV_TTM_H
 #define DRM_FBDEV_TTM_H
 
-#include <linux/stddef.h>
+#include <drm/drm_fbdev_shadow.h>
 
-struct drm_fb_helper;
-struct drm_fb_helper_surface_size;
+/* TTM drivers use the generic shadow-buffered fbdev emulation. */
+#define drm_fbdev_ttm_driver_fbdev_probe drm_fbdev_shadow_driver_fbdev_probe
 
-#ifdef CONFIG_DRM_FBDEV_EMULATION
-int drm_fbdev_ttm_driver_fbdev_probe(struct drm_fb_helper *fb_helper,
-				     struct drm_fb_helper_surface_size *sizes);
-
-#define DRM_FBDEV_TTM_DRIVER_OPS \
-	.fbdev_probe = drm_fbdev_ttm_driver_fbdev_probe
-#else
-#define DRM_FBDEV_TTM_DRIVER_OPS \
-	.fbdev_probe = NULL
-#endif
+#define DRM_FBDEV_TTM_DRIVER_OPS DRM_FBDEV_SHADOW_DRIVER_OPS
 
 #endif

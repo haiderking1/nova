@@ -11,10 +11,10 @@
 #include <drm/drm_gem.h>
 #include <drm/drm_print.h>
 
-#include <drm/drm_fbdev_ttm.h>
+#include <drm/drm_fbdev_shadow.h>
 
 /* @user: 1=userspace, 0=fbcon */
-static int drm_fbdev_ttm_fb_open(struct fb_info *info, int user)
+static int drm_fbdev_shadow_fb_open(struct fb_info *info, int user)
 {
 	struct drm_fb_helper *fb_helper = info->par;
 
@@ -25,7 +25,7 @@ static int drm_fbdev_ttm_fb_open(struct fb_info *info, int user)
 	return 0;
 }
 
-static int drm_fbdev_ttm_fb_release(struct fb_info *info, int user)
+static int drm_fbdev_shadow_fb_release(struct fb_info *info, int user)
 {
 	struct drm_fb_helper *fb_helper = info->par;
 
@@ -35,11 +35,11 @@ static int drm_fbdev_ttm_fb_release(struct fb_info *info, int user)
 	return 0;
 }
 
-FB_GEN_DEFAULT_DEFERRED_SYSMEM_OPS(drm_fbdev_ttm,
+FB_GEN_DEFAULT_DEFERRED_SYSMEM_OPS(drm_fbdev_shadow,
 				   drm_fb_helper_damage_range,
 				   drm_fb_helper_damage_area);
 
-static void drm_fbdev_ttm_fb_destroy(struct fb_info *info)
+static void drm_fbdev_shadow_fb_destroy(struct fb_info *info)
 {
 	struct drm_fb_helper *fb_helper = info->par;
 	void *shadow = info->screen_buffer;
@@ -55,16 +55,16 @@ static void drm_fbdev_ttm_fb_destroy(struct fb_info *info)
 	drm_client_release(&fb_helper->client);
 }
 
-static const struct fb_ops drm_fbdev_ttm_fb_ops = {
+static const struct fb_ops drm_fbdev_shadow_fb_ops = {
 	.owner		= THIS_MODULE,
-	.fb_open	= drm_fbdev_ttm_fb_open,
-	.fb_release	= drm_fbdev_ttm_fb_release,
-	FB_DEFAULT_DEFERRED_OPS(drm_fbdev_ttm),
+	.fb_open	= drm_fbdev_shadow_fb_open,
+	.fb_release	= drm_fbdev_shadow_fb_release,
+	FB_DEFAULT_DEFERRED_OPS(drm_fbdev_shadow),
 	DRM_FB_HELPER_DEFAULT_OPS,
-	.fb_destroy	= drm_fbdev_ttm_fb_destroy,
+	.fb_destroy	= drm_fbdev_shadow_fb_destroy,
 };
 
-static void drm_fbdev_ttm_damage_blit_real(struct drm_fb_helper *fb_helper,
+static void drm_fbdev_shadow_damage_blit_real(struct drm_fb_helper *fb_helper,
 					   struct drm_clip_rect *clip,
 					   struct iosys_map *dst)
 {
@@ -103,7 +103,7 @@ static void drm_fbdev_ttm_damage_blit_real(struct drm_fb_helper *fb_helper,
 	}
 }
 
-static int drm_fbdev_ttm_damage_blit(struct drm_fb_helper *fb_helper,
+static int drm_fbdev_shadow_damage_blit(struct drm_fb_helper *fb_helper,
 				     struct drm_clip_rect *clip)
 {
 	struct drm_client_buffer *buffer = fb_helper->buffer;
@@ -128,7 +128,7 @@ static int drm_fbdev_ttm_damage_blit(struct drm_fb_helper *fb_helper,
 		goto out;
 
 	dst = map;
-	drm_fbdev_ttm_damage_blit_real(fb_helper, clip, &dst);
+	drm_fbdev_shadow_damage_blit_real(fb_helper, clip, &dst);
 
 	drm_client_buffer_vunmap_local(buffer);
 
@@ -138,7 +138,7 @@ out:
 	return ret;
 }
 
-static int drm_fbdev_ttm_helper_fb_dirty(struct drm_fb_helper *helper,
+static int drm_fbdev_shadow_helper_fb_dirty(struct drm_fb_helper *helper,
 					 struct drm_clip_rect *clip)
 {
 	struct drm_device *dev = helper->dev;
@@ -148,7 +148,7 @@ static int drm_fbdev_ttm_helper_fb_dirty(struct drm_fb_helper *helper,
 	if (!(clip->x1 < clip->x2 && clip->y1 < clip->y2))
 		return 0;
 
-	ret = drm_fbdev_ttm_damage_blit(helper, clip);
+	ret = drm_fbdev_shadow_damage_blit(helper, clip);
 	if (drm_WARN_ONCE(dev, ret, "Damage blitter failed: ret=%d\n", ret))
 		return ret;
 
@@ -161,15 +161,15 @@ static int drm_fbdev_ttm_helper_fb_dirty(struct drm_fb_helper *helper,
 	return 0;
 }
 
-static const struct drm_fb_helper_funcs drm_fbdev_ttm_helper_funcs = {
-	.fb_dirty = drm_fbdev_ttm_helper_fb_dirty,
+static const struct drm_fb_helper_funcs drm_fbdev_shadow_helper_funcs = {
+	.fb_dirty = drm_fbdev_shadow_helper_fb_dirty,
 };
 
 /*
  * struct drm_driver
  */
 
-int drm_fbdev_ttm_driver_fbdev_probe(struct drm_fb_helper *fb_helper,
+int drm_fbdev_shadow_driver_fbdev_probe(struct drm_fb_helper *fb_helper,
 				     struct drm_fb_helper_surface_size *sizes)
 {
 	struct drm_client_dev *client = &fb_helper->client;
@@ -192,7 +192,7 @@ int drm_fbdev_ttm_driver_fbdev_probe(struct drm_fb_helper *fb_helper,
 	if (IS_ERR(buffer))
 		return PTR_ERR(buffer);
 
-	fb_helper->funcs = &drm_fbdev_ttm_helper_funcs;
+	fb_helper->funcs = &drm_fbdev_shadow_helper_funcs;
 	fb_helper->buffer = buffer;
 	fb_helper->fb = buffer->fb;
 
@@ -205,7 +205,7 @@ int drm_fbdev_ttm_driver_fbdev_probe(struct drm_fb_helper *fb_helper,
 
 	drm_fb_helper_fill_info(info, fb_helper, sizes);
 
-	info->fbops = &drm_fbdev_ttm_fb_ops;
+	info->fbops = &drm_fbdev_shadow_fb_ops;
 
 	/* screen */
 	info->flags |= FBINFO_VIRTFB | FBINFO_READS_FAST;
@@ -231,4 +231,4 @@ err_drm_client_buffer_delete:
 	drm_client_buffer_delete(buffer);
 	return ret;
 }
-EXPORT_SYMBOL(drm_fbdev_ttm_driver_fbdev_probe);
+EXPORT_SYMBOL(drm_fbdev_shadow_driver_fbdev_probe);
