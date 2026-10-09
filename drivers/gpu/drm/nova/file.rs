@@ -5,6 +5,13 @@ use crate::driver::{
     NovaDevice,
     NovaDriver, //
 };
+use nova_core::api::{
+    ChannelEngine,
+    GraphicsObjects,
+    PushBuffer,
+    PUSH_MAX, //
+};
+
 use crate::{
     gem::{
         NovaObject,
@@ -70,6 +77,20 @@ struct VmBindOp(uapi::drm_nova_vm_bind_op);
 
 // SAFETY: `drm_nova_vm_bind_op` only contains integers, for which all bit patterns are valid.
 unsafe impl FromBytes for VmBindOp {}
+
+/// A push buffer, as userspace passes it.
+#[repr(transparent)]
+struct ExecPush(uapi::drm_nova_exec_push);
+
+// SAFETY: `drm_nova_exec_push` only contains integers, for which all bit patterns are valid.
+unsafe impl FromBytes for ExecPush {}
+
+/// Limits of work submission returned to userspace.
+#[repr(transparent)]
+struct ExecInfo(uapi::drm_nova_info_exec);
+
+// SAFETY: `ExecInfo` has no interior mutability, and there are no uninitialized bytes.
+unsafe impl AsBytes for ExecInfo {}
 
 /// Information on the GPU virtual address spaces returned to userspace.
 #[repr(transparent)]
@@ -338,6 +359,119 @@ impl File {
         Ok(0)
     }
 
+    /// IOCTL: channel_create: Create a channel running in the GPU virtual address space of the
+    /// file.
+    pub(crate) fn channel_create(
+        _dev: &NovaDevice<Registered>,
+        reg_data: &DrmRegData<'_>,
+        req: &mut uapi::drm_nova_channel_create,
+        file: &drm::File<File>,
+    ) -> Result<u32> {
+        const CLASSES: u32 = uapi::DRM_NOVA_CLASS_3D
+            | uapi::DRM_NOVA_CLASS_COMPUTE
+            | uapi::DRM_NOVA_CLASS_2D
+            | uapi::DRM_NOVA_CLASS_M2MF;
+        if req.pad != 0 {
+            return Err(EINVAL);
+        }
+        let engine = match (req.engine, req.classes) {
+            (uapi::DRM_NOVA_ENGINE_GRAPHICS, classes)
+                if classes != 0 && classes & !CLASSES == 0 =>
+            {
+                ChannelEngine::Graphics(GraphicsObjects {
+                    three_d: classes & uapi::DRM_NOVA_CLASS_3D != 0,
+                    compute: classes & uapi::DRM_NOVA_CLASS_COMPUTE != 0,
+                    two_d: classes & uapi::DRM_NOVA_CLASS_2D != 0,
+                    inline_to_memory: classes & uapi::DRM_NOVA_CLASS_M2MF != 0,
+                })
+            }
+            (uapi::DRM_NOVA_ENGINE_COPY, 0) => ChannelEngine::Copy,
+            _ => return Err(EINVAL),
+        };
+
+        let inner = file.inner();
+        let mut vm = inner.vm.lock();
+        let vm = Option::as_mut(&mut *vm).ok_or(EINVAL)?;
+        req.channel = reg_data.api.with(|api| vm.create_channel(&api, engine))?;
+
+        Ok(0)
+    }
+
+    /// IOCTL: channel_destroy: Destroy a channel, once the work it runs is done.
+    pub(crate) fn channel_destroy(
+        _dev: &NovaDevice<Registered>,
+        reg_data: &DrmRegData<'_>,
+        req: &mut uapi::drm_nova_channel_destroy,
+        file: &drm::File<File>,
+    ) -> Result<u32> {
+        if req.pad != 0 {
+            return Err(EINVAL);
+        }
+
+        let inner = file.inner();
+        let mut vm = inner.vm.lock();
+        let vm = Option::as_mut(&mut *vm).ok_or(ENOENT)?;
+        reg_data
+            .api
+            .with(|api| vm.destroy_channel(&api, req.channel))?;
+
+        Ok(0)
+    }
+
+    /// IOCTL: exec: Run push buffers on a channel, and return once they are done.
+    pub(crate) fn exec(
+        _dev: &NovaDevice<Registered>,
+        reg_data: &DrmRegData<'_>,
+        req: &mut uapi::drm_nova_exec,
+        file: &drm::File<File>,
+    ) -> Result<u32> {
+        // The channel must be the file's. Work runs without the address space locked, so binds
+        // can go on meanwhile.
+        {
+            let inner = file.inner();
+            let vm = inner.vm.lock();
+            if !Option::as_ref(&*vm).is_some_and(|vm| vm.has_channel(req.channel)) {
+                return Err(ENOENT);
+            }
+        }
+
+        if req.push_count == 0 || req.push_count > PUSH_MAX {
+            return Err(EINVAL);
+        }
+        let count = usize::try_from(req.push_count)?;
+        let mut reader = UserSlice::new(
+            UserPtr::from_addr(req.push_ptr.into_safe_cast_arch()),
+            count.checked_mul(size_of::<ExecPush>()).ok_or(EINVAL)?,
+        )
+        .reader();
+
+        let mut pushes = KVVec::with_capacity(count, GFP_KERNEL)?;
+        for _ in 0..count {
+            let ExecPush(push) = reader.read()?;
+            if push.range == 0
+                || push.range % 4 != 0
+                || push.flags & !uapi::DRM_NOVA_EXEC_PUSH_NO_PREFETCH != 0
+            {
+                return Err(EINVAL);
+            }
+
+            pushes.push(
+                PushBuffer {
+                    addr: push.va,
+                    words: push.range / 4,
+                    wait: push.flags & uapi::DRM_NOVA_EXEC_PUSH_NO_PREFETCH != 0,
+                },
+                GFP_KERNEL,
+            )?;
+        }
+
+        reg_data
+            .api
+            .with(|api| api.channel_exec(req.channel, &pushes))?;
+
+        Ok(0)
+    }
+
     /// IOCTL: info: Query device information.
     pub(crate) fn info(
         _dev: &NovaDevice<Registered>,
@@ -348,6 +482,13 @@ impl File {
         match info.id {
             uapi::DRM_NOVA_INFO_GPU => write_info(info, GpuInfo::new(reg_data)?)?,
             uapi::DRM_NOVA_INFO_GRAPHICS => write_info(info, GraphicsInfo::new(reg_data)?)?,
+            uapi::DRM_NOVA_INFO_EXEC => write_info(
+                info,
+                ExecInfo(uapi::drm_nova_info_exec {
+                    push_max: PUSH_MAX,
+                    pad: 0,
+                }),
+            )?,
             uapi::DRM_NOVA_INFO_VM => write_info(
                 info,
                 VmInfo(uapi::drm_nova_info_vm {

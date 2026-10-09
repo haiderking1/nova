@@ -422,11 +422,164 @@ struct drm_nova_vm_bind {
 	__u64 op_ptr;
 };
 
+/**
+ * DRM_NOVA_INFO_EXEC
+ *
+ * Query the limits of &struct drm_nova_exec. The result is returned in a
+ * &struct drm_nova_info_exec.
+ */
+#define DRM_NOVA_INFO_EXEC		0x03
+
+/**
+ * struct drm_nova_info_exec - work submission information
+ */
+struct drm_nova_info_exec {
+	/**
+	 * @push_max: Number of push buffers &struct drm_nova_exec runs at most
+	 * at once.
+	 */
+	__u32 push_max;
+
+	/**
+	 * @pad: 32 bit padding, 0.
+	 */
+	__u32 pad;
+};
+
+/**
+ * DRM_NOVA_ENGINE_GRAPHICS - the graphics engine
+ *
+ * Its channels have objects of the classes &struct drm_nova_channel_create
+ * asks for, among the 3D, compute, 2D and inline-to-memory classes
+ * (&struct drm_nova_info_graphics), which userspace binds to subchannels
+ * itself.
+ */
+#define DRM_NOVA_ENGINE_GRAPHICS	0x1
+
+/**
+ * DRM_NOVA_ENGINE_COPY - a copy engine
+ *
+ * Its channels have an object of the copy class, which userspace binds to a
+ * subchannel itself.
+ */
+#define DRM_NOVA_ENGINE_COPY		0x2
+
+/*
+ * The classes of the objects of a channel on the graphics engine, for
+ * &struct drm_nova_channel_create.
+ */
+#define DRM_NOVA_CLASS_3D		(1 << 0)
+#define DRM_NOVA_CLASS_COMPUTE		(1 << 1)
+#define DRM_NOVA_CLASS_2D		(1 << 2)
+#define DRM_NOVA_CLASS_M2MF		(1 << 3)
+
+/**
+ * struct drm_nova_channel_create - create a channel
+ *
+ * The channel runs in the GPU virtual address space of the file, which must
+ * have been created with &struct drm_nova_vm_init, and maps its memory in its
+ * kernel managed range.
+ */
+struct drm_nova_channel_create {
+	/**
+	 * @engine: The engine the channel runs on, DRM_NOVA_ENGINE_*.
+	 */
+	__u32 engine;
+
+	/**
+	 * @classes: DRM_NOVA_ENGINE_GRAPHICS: the classes of the objects the
+	 * channel has, DRM_NOVA_CLASS_* flags, not 0. DRM_NOVA_ENGINE_COPY:
+	 * should be 0, the channel has a copy object.
+	 */
+	__u32 classes;
+
+	/**
+	 * @channel: The handle of the new channel.
+	 */
+	__u32 channel;
+
+	/**
+	 * @pad: 32 bit padding, should be 0.
+	 */
+	__u32 pad;
+};
+
+/**
+ * struct drm_nova_channel_destroy - destroy a channel
+ *
+ * The channel is destroyed once the work it runs is done.
+ */
+struct drm_nova_channel_destroy {
+	/**
+	 * @channel: The handle of the channel.
+	 */
+	__u32 channel;
+
+	/**
+	 * @pad: 32 bit padding, should be 0.
+	 */
+	__u32 pad;
+};
+
+/**
+ * DRM_NOVA_EXEC_PUSH_NO_PREFETCH - fetch the push buffer once the work before
+ * it is done, rather than ahead
+ */
+#define DRM_NOVA_EXEC_PUSH_NO_PREFETCH	(1 << 0)
+
+/**
+ * struct drm_nova_exec_push - a push buffer
+ */
+struct drm_nova_exec_push {
+	/**
+	 * @va: GPU virtual address of the push buffer, 4-byte aligned.
+	 */
+	__u64 va;
+
+	/**
+	 * @range: Size of the push buffer in bytes, a multiple of 4, not 0.
+	 */
+	__u32 range;
+
+	/**
+	 * @flags: DRM_NOVA_EXEC_PUSH_* flags.
+	 */
+	__u32 flags;
+};
+
+/**
+ * struct drm_nova_exec - run push buffers on a channel
+ *
+ * The push buffers run in order, and the ioctl returns once they are done.
+ * It fails with -ETIMEDOUT if they take too long, after which the channel runs
+ * no more work: further submissions fail with -ENODEV.
+ */
+struct drm_nova_exec {
+	/**
+	 * @channel: The handle of the channel.
+	 */
+	__u32 channel;
+
+	/**
+	 * @push_count: Number of push buffers at @push_ptr, at most
+	 * &struct drm_nova_info_exec.push_max.
+	 */
+	__u32 push_count;
+
+	/**
+	 * @push_ptr: Pointer to an array of &struct drm_nova_exec_push.
+	 */
+	__u64 push_ptr;
+};
+
 #define DRM_NOVA_INFO			0x00
 #define DRM_NOVA_GEM_CREATE		0x01
 #define DRM_NOVA_GEM_INFO		0x02
 #define DRM_NOVA_VM_INIT		0x03
 #define DRM_NOVA_VM_BIND		0x04
+#define DRM_NOVA_CHANNEL_CREATE		0x05
+#define DRM_NOVA_CHANNEL_DESTROY	0x06
+#define DRM_NOVA_EXEC			0x07
 
 /* Note: this is an enum so that it can be resolved by Rust bindgen. */
 enum {
@@ -440,6 +593,12 @@ enum {
 						  struct drm_nova_vm_init),
 	DRM_IOCTL_NOVA_VM_BIND		= DRM_IOW(DRM_COMMAND_BASE + DRM_NOVA_VM_BIND,
 						  struct drm_nova_vm_bind),
+	DRM_IOCTL_NOVA_CHANNEL_CREATE	= DRM_IOWR(DRM_COMMAND_BASE + DRM_NOVA_CHANNEL_CREATE,
+						   struct drm_nova_channel_create),
+	DRM_IOCTL_NOVA_CHANNEL_DESTROY	= DRM_IOW(DRM_COMMAND_BASE + DRM_NOVA_CHANNEL_DESTROY,
+						  struct drm_nova_channel_destroy),
+	DRM_IOCTL_NOVA_EXEC		= DRM_IOW(DRM_COMMAND_BASE + DRM_NOVA_EXEC,
+						  struct drm_nova_exec),
 };
 
 #if defined(__cplusplus)

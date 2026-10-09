@@ -30,6 +30,7 @@ use kernel::{
 
 use nova_core::api::{
     BufferRef,
+    ChannelEngine,
     ClientVm,
     NovaCoreApi,
     VA_SIZE, //
@@ -194,6 +195,8 @@ pub(crate) struct Vm {
     gpuvm: UniqueRefGpuVm<NovaVm>,
     /// Where nova-core maps what it needs for userspace.
     kernel: Range<u64>,
+    /// The IDs of the channels running in the address space.
+    channels: KVec<u32>,
 }
 
 /// An operation on the mappings of an address space.
@@ -229,7 +232,11 @@ impl Vm {
         ) {
             Ok(mut gpuvm) => {
                 gpuvm.data().vm = Some(vm);
-                Ok(Self { gpuvm, kernel })
+                Ok(Self {
+                    gpuvm,
+                    kernel,
+                    channels: KVec::new(),
+                })
             }
             Err(err) => {
                 api.free_vm(vm);
@@ -296,6 +303,11 @@ impl Vm {
 
     /// Unmaps everything, and frees the address space.
     pub(crate) fn free(mut self, api: &NovaCoreApi<'_>) {
+        // The channels first, which use the address space.
+        while let Some(chid) = self.channels.last().copied() {
+            let _ = self.destroy_channel(api, chid);
+        }
+
         // Below the kernel range, then above it.
         for range in [0..self.kernel.start, self.kernel.end..VA_SIZE] {
             if !range.is_empty() {
@@ -312,5 +324,35 @@ impl Vm {
         if let Some(vm) = self.gpuvm.data().vm.take() {
             api.free_vm(vm);
         }
+    }
+
+    /// Creates a channel on `engine` running in the address space, and returns its ID.
+    pub(crate) fn create_channel(
+        &mut self,
+        api: &NovaCoreApi<'_>,
+        engine: ChannelEngine,
+    ) -> Result<u32> {
+        self.channels.reserve(1, GFP_KERNEL)?;
+        let chid = api.create_channel(self.gpuvm.data().vm()?, engine)?;
+        self.channels.push(chid, GFP_KERNEL)?;
+
+        Ok(chid)
+    }
+
+    /// Destroys the channel `chid` running in the address space, once the work it runs is done.
+    pub(crate) fn destroy_channel(&mut self, api: &NovaCoreApi<'_>, chid: u32) -> Result {
+        let index = self
+            .channels
+            .iter()
+            .position(|&channel| channel == chid)
+            .ok_or(ENOENT)?;
+        self.channels.remove(index)?;
+
+        api.destroy_channel(self.gpuvm.data().vm()?, chid)
+    }
+
+    /// Returns whether the channel `chid` runs in the address space.
+    pub(crate) fn has_channel(&self, chid: u32) -> bool {
+        self.channels.contains(&chid)
     }
 }

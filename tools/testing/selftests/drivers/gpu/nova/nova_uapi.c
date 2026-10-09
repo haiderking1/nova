@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <drm/drm.h>
@@ -471,6 +472,344 @@ TEST_F(nova, vm_keeps_objects)
 
 	nova_gem_close(self->fd, bo);
 	EXPECT_EQ(0, nova_vm_unmap(self->fd, 1ull << 30, 32ull << 30));
+}
+
+/*
+ * Push buffer methods, from NVIDIA's class headers: clc56f.h (host), clc7b5.h
+ * (copy), clc797.h (3D) and cla140.h (inline-to-memory), as Mesa ships them.
+ */
+#define NVC56F_SET_OBJECT			0x0000
+#define NVC7B5_LAUNCH_DMA			0x0300
+#define NVC7B5_OFFSET_OUT_UPPER			0x0408
+#define NVC7B5_PITCH_IN				0x0410
+#define NVC7B5_SET_REMAP_CONST_A		0x0700
+#define NVC797_SET_REPORT_SEMAPHORE_A		0x1b00
+#define NVA140_LINE_LENGTH_IN			0x0180
+#define NVA140_LAUNCH_DMA			0x01b0
+#define NVA140_LOAD_INLINE_DATA			0x01b4
+
+/* NVC7B5_SET_REMAP_COMPONENTS: constant A as a single 4-byte component. */
+#define REMAP_FILL_32		(0x4 | 0x3 << 16 | 0x0 << 24)
+/*
+ * NVC7B5_LAUNCH_DMA: a non-pipelined, flushed fill of pitch-linear lines with
+ * the remapped constant, without PLC.
+ */
+#define LAUNCH_FILL		(0x2 | 1 << 2 | 1 << 7 | 1 << 8 | 1 << 9 | 1 << 10 | 1 << 26)
+/*
+ * NVC797_SET_REPORT_SEMAPHORE_D: release a one-word payload, once all the
+ * pipeline is done.
+ */
+#define REPORT_RELEASE		(0x0 | 0xf << 12 | 1 << 28)
+/* NVA140_LAUNCH_DMA: a flushed write of pitch-linear lines. */
+#define LAUNCH_INLINE		(0x1 | 0x1 << 4)
+
+/* Header of @count methods of @subc from @method on. */
+static __u32 mthd(__u32 subc, __u32 method, __u32 count)
+{
+	return 1u << 29 | count << 16 | subc << 13 | method >> 2;
+}
+
+/* Header of @count values for the method @method of @subc. */
+static __u32 mthd_noninc(__u32 subc, __u32 method, __u32 count)
+{
+	return 3u << 29 | count << 16 | subc << 13 | method >> 2;
+}
+
+/* Subchannels, as NVK binds them. */
+#define SUBC_3D		0
+#define SUBC_COMPUTE	1
+#define SUBC_M2MF	2
+#define SUBC_2D		3
+#define SUBC_COPY	4
+
+/* Addresses the tests map at. */
+#define PUSH_VA		(1ull << 30)
+#define DST_VA		(2ull << 30)
+
+#define ALL_CLASSES	(DRM_NOVA_CLASS_3D | DRM_NOVA_CLASS_COMPUTE | DRM_NOVA_CLASS_2D | \
+			 DRM_NOVA_CLASS_M2MF)
+
+static int nova_channel_create_classes(int fd, __u32 engine, __u32 classes)
+{
+	struct drm_nova_channel_create create = { .engine = engine, .classes = classes };
+
+	if (ioctl(fd, DRM_IOCTL_NOVA_CHANNEL_CREATE, &create))
+		return -errno;
+
+	return create.channel;
+}
+
+/* A channel with all the classes of its engine. */
+static int nova_channel_create(int fd, __u32 engine)
+{
+	return nova_channel_create_classes(fd, engine,
+					   engine == DRM_NOVA_ENGINE_GRAPHICS ? ALL_CLASSES : 0);
+}
+
+static int nova_channel_destroy(int fd, __u32 channel)
+{
+	struct drm_nova_channel_destroy destroy = { .channel = channel };
+
+	return ioctl(fd, DRM_IOCTL_NOVA_CHANNEL_DESTROY, &destroy) ? -errno : 0;
+}
+
+static int nova_exec(int fd, __u32 channel, struct drm_nova_exec_push *pushes, __u32 count)
+{
+	struct drm_nova_exec exec = {
+		.channel = channel,
+		.push_count = count,
+		.push_ptr = (__u64)(uintptr_t)pushes,
+	};
+
+	return ioctl(fd, DRM_IOCTL_NOVA_EXEC, &exec) ? -errno : 0;
+}
+
+/* An object mapped for the CPU and at @va for the GPU. */
+struct mapped_bo {
+	int handle;
+	__u32 *map;
+	__u64 size;
+};
+
+static void mapped_bo_create(struct __test_metadata *_metadata, int fd, struct mapped_bo *bo,
+			     __u64 size, __u32 flags, __u64 va)
+{
+	struct drm_nova_gem_info info;
+
+	bo->handle = nova_gem_create(fd, size, flags | DRM_NOVA_GEM_CPU_VISIBLE);
+	ASSERT_LE(0, bo->handle);
+	ASSERT_EQ(0, nova_gem_info(fd, bo->handle, &info));
+	bo->size = info.size;
+	bo->map = nova_gem_mmap(fd, info.mmap_offset, info.size);
+	ASSERT_NE(NULL, bo->map);
+	ASSERT_EQ(0, nova_vm_map(fd, va, bo->handle, 0, info.size, 0));
+}
+
+static void mapped_bo_destroy(int fd, struct mapped_bo *bo)
+{
+	munmap(bo->map, bo->size);
+	nova_gem_close(fd, bo->handle);
+}
+
+static struct drm_nova_info_graphics graphics_info(int fd)
+{
+	struct drm_nova_info_graphics gr = {};
+
+	nova_info(fd, DRM_NOVA_INFO_GRAPHICS, &gr, sizeof(gr));
+	return gr;
+}
+
+/* Writes the methods of a copy engine fill of @size bytes at @va with @value. */
+static __u32 push_copy_fill(__u32 *push, __u32 class_copy, __u64 va, __u32 size, __u32 value)
+{
+	__u32 n = 0;
+	__u32 line = 4096;
+
+	push[n++] = mthd(SUBC_COPY, NVC56F_SET_OBJECT, 1);
+	push[n++] = class_copy;
+	push[n++] = mthd(SUBC_COPY, NVC7B5_SET_REMAP_CONST_A, 3);
+	push[n++] = value;
+	push[n++] = 0;
+	push[n++] = REMAP_FILL_32;
+	push[n++] = mthd(SUBC_COPY, NVC7B5_OFFSET_OUT_UPPER, 2);
+	push[n++] = va >> 32;
+	push[n++] = va;
+	/* Pitches in and out, line length in 4-byte components, line count. */
+	push[n++] = mthd(SUBC_COPY, NVC7B5_PITCH_IN, 4);
+	push[n++] = line;
+	push[n++] = line;
+	push[n++] = line / 4;
+	push[n++] = size / line;
+	push[n++] = mthd(SUBC_COPY, NVC7B5_LAUNCH_DMA, 1);
+	push[n++] = LAUNCH_FILL;
+
+	return n;
+}
+
+TEST_F(nova, info_exec)
+{
+	struct drm_nova_info_exec exec = {};
+
+	ASSERT_EQ(sizeof(exec), nova_info(self->fd, DRM_NOVA_INFO_EXEC, &exec, sizeof(exec)));
+	TH_LOG("at most %u push buffers per submission", exec.push_max);
+	EXPECT_LE(1, exec.push_max);
+}
+
+/* The copy engine fills memory at the addresses userspace mapped it at. */
+TEST_F(nova, exec_copy)
+{
+	struct drm_nova_info_graphics gr = graphics_info(self->fd);
+	struct mapped_bo push, system, vram;
+	struct drm_nova_exec_push exec[2];
+	__u32 words;
+	int channel;
+
+	ASSERT_EQ(0, nova_vm_init(self->fd, KERNEL_START, KERNEL_SIZE));
+	mapped_bo_create(_metadata, self->fd, &push, 4096, 0, PUSH_VA);
+	mapped_bo_create(_metadata, self->fd, &system, 1 << 20, 0, DST_VA);
+	mapped_bo_create(_metadata, self->fd, &vram, 4 << 20, DRM_NOVA_GEM_VRAM, DST_VA + (1 << 30));
+	channel = nova_channel_create(self->fd, DRM_NOVA_ENGINE_COPY);
+	ASSERT_LE(0, channel);
+
+	/* Two push buffers: one filling system memory, the other VRAM. */
+	words = push_copy_fill(push.map, gr.class_copy, DST_VA, system.size, 0xc0ffee00);
+	exec[0] = (struct drm_nova_exec_push){ .va = PUSH_VA, .range = words * 4 };
+	exec[1].va = PUSH_VA + words * 4;
+	exec[1].range = 4 * push_copy_fill(push.map + words, gr.class_copy, DST_VA + (1 << 30),
+					   vram.size, 0x5eed5eed);
+	exec[1].flags = DRM_NOVA_EXEC_PUSH_NO_PREFETCH;
+	ASSERT_EQ(0, nova_exec(self->fd, channel, exec, 2));
+
+	EXPECT_EQ(-1, find_not(system.map, system.size, 0xc0ffee00));
+	EXPECT_EQ(-1, find_not(vram.map, vram.size, 0x5eed5eed));
+
+	EXPECT_EQ(0, nova_channel_destroy(self->fd, channel));
+	mapped_bo_destroy(self->fd, &push);
+	mapped_bo_destroy(self->fd, &system);
+	mapped_bo_destroy(self->fd, &vram);
+}
+
+/*
+ * A graphics channel has the objects userspace binds: the 3D engine and the
+ * inline-to-memory engine write data from the push buffer to memory.
+ */
+TEST_F(nova, exec_graphics)
+{
+	static const __u32 data[] = { 0x6e6f7661, 0x2e2e2e21, 0x12345678, 0xfeedface };
+	struct drm_nova_info_graphics gr = graphics_info(self->fd);
+	struct drm_nova_exec_push exec;
+	struct mapped_bo push, dst;
+	__u32 *p;
+	int channel;
+
+	ASSERT_EQ(0, nova_vm_init(self->fd, KERNEL_START, KERNEL_SIZE));
+	mapped_bo_create(_metadata, self->fd, &push, 4096, 0, PUSH_VA);
+	mapped_bo_create(_metadata, self->fd, &dst, 64 << 10, DRM_NOVA_GEM_VRAM, DST_VA);
+	channel = nova_channel_create(self->fd, DRM_NOVA_ENGINE_GRAPHICS);
+	ASSERT_LE(0, channel);
+
+	p = push.map;
+	/* Each object the channel has, bound like NVK binds them. */
+	*p++ = mthd(SUBC_3D, NVC56F_SET_OBJECT, 1);
+	*p++ = gr.class_3d;
+	*p++ = mthd(SUBC_COMPUTE, NVC56F_SET_OBJECT, 1);
+	*p++ = gr.class_compute;
+	*p++ = mthd(SUBC_M2MF, NVC56F_SET_OBJECT, 1);
+	*p++ = gr.class_m2mf;
+	*p++ = mthd(SUBC_2D, NVC56F_SET_OBJECT, 1);
+	*p++ = gr.class_2d;
+	/* The 3D pipeline writes each word once the work before is done. */
+	for (int i = 0; i < 4; i++) {
+		__u64 va = DST_VA + i * 4;
+
+		*p++ = mthd(SUBC_3D, NVC797_SET_REPORT_SEMAPHORE_A, 4);
+		*p++ = va >> 32;
+		*p++ = va;
+		*p++ = data[i];
+		*p++ = REPORT_RELEASE;
+	}
+	/* The inline-to-memory engine writes the same words further. */
+	*p++ = mthd(SUBC_M2MF, NVA140_LINE_LENGTH_IN, 4);
+	*p++ = sizeof(data);
+	*p++ = 1;
+	*p++ = (DST_VA + 64) >> 32;
+	*p++ = DST_VA + 64;
+	*p++ = mthd(SUBC_M2MF, NVA140_LAUNCH_DMA, 1);
+	*p++ = LAUNCH_INLINE;
+	*p++ = mthd_noninc(SUBC_M2MF, NVA140_LOAD_INLINE_DATA, 4);
+	for (int i = 0; i < 4; i++)
+		*p++ = data[i];
+
+	exec = (struct drm_nova_exec_push){
+		.va = PUSH_VA,
+		.range = (p - push.map) * 4,
+	};
+	ASSERT_EQ(0, nova_exec(self->fd, channel, &exec, 1));
+	for (int i = 0; i < 4; i++)
+		EXPECT_EQ(data[i], dst.map[i]);
+	EXPECT_EQ(0, dst.map[4]);
+	for (int i = 0; i < 4; i++)
+		EXPECT_EQ(data[i], dst.map[16 + i]);
+	EXPECT_EQ(0, dst.map[20]);
+
+	EXPECT_EQ(0, nova_channel_destroy(self->fd, channel));
+	mapped_bo_destroy(self->fd, &push);
+	mapped_bo_destroy(self->fd, &dst);
+}
+
+/* Submissions in a row on a channel, timed. */
+TEST_F(nova, exec_latency)
+{
+	struct drm_nova_info_graphics gr = graphics_info(self->fd);
+	struct drm_nova_exec_push exec;
+	struct mapped_bo push, dst;
+	struct timespec start, end;
+	const int runs = 200;
+	int channel;
+
+	ASSERT_EQ(0, nova_vm_init(self->fd, KERNEL_START, KERNEL_SIZE));
+	mapped_bo_create(_metadata, self->fd, &push, 4096, 0, PUSH_VA);
+	mapped_bo_create(_metadata, self->fd, &dst, 4096, 0, DST_VA);
+	channel = nova_channel_create(self->fd, DRM_NOVA_ENGINE_COPY);
+	ASSERT_LE(0, channel);
+
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	for (int i = 0; i < runs; i++) {
+		exec = (struct drm_nova_exec_push){
+			.va = PUSH_VA,
+			.range = 4 * push_copy_fill(push.map, gr.class_copy, DST_VA, 4096, i),
+		};
+		ASSERT_EQ(0, nova_exec(self->fd, channel, &exec, 1));
+		ASSERT_EQ(i, dst.map[1023]);
+	}
+	clock_gettime(CLOCK_MONOTONIC, &end);
+	TH_LOG("%d submissions, %ld us each", runs,
+	       ((end.tv_sec - start.tv_sec) * 1000000 + (end.tv_nsec - start.tv_nsec) / 1000) / runs);
+
+	EXPECT_EQ(0, nova_channel_destroy(self->fd, channel));
+	mapped_bo_destroy(self->fd, &push);
+	mapped_bo_destroy(self->fd, &dst);
+}
+
+TEST_F(nova, exec_invalid)
+{
+	struct drm_nova_exec_push exec = { .va = PUSH_VA, .range = 16 };
+	int channel;
+
+	/* Channels need the address space. */
+	EXPECT_EQ(-EINVAL, nova_channel_create(self->fd, DRM_NOVA_ENGINE_COPY));
+	ASSERT_EQ(0, nova_vm_init(self->fd, KERNEL_START, KERNEL_SIZE));
+	EXPECT_EQ(-EINVAL, nova_channel_create(self->fd, 0));
+	EXPECT_EQ(-EINVAL, nova_channel_create(self->fd, 3));
+	/* Graphics channels have objects, copy channels their copy object. */
+	EXPECT_EQ(-EINVAL, nova_channel_create_classes(self->fd, DRM_NOVA_ENGINE_GRAPHICS, 0));
+	EXPECT_EQ(-EINVAL, nova_channel_create_classes(self->fd, DRM_NOVA_ENGINE_GRAPHICS, 1 << 7));
+	EXPECT_EQ(-EINVAL, nova_channel_create_classes(self->fd, DRM_NOVA_ENGINE_COPY,
+						       DRM_NOVA_CLASS_3D));
+	channel = nova_channel_create(self->fd, DRM_NOVA_ENGINE_COPY);
+	ASSERT_LE(0, channel);
+
+	EXPECT_EQ(-ENOENT, nova_exec(self->fd, channel + 1, &exec, 1));
+	EXPECT_EQ(-EINVAL, nova_exec(self->fd, channel, &exec, 0));
+	EXPECT_EQ(-EINVAL, nova_exec(self->fd, channel, &exec, 100000));
+	exec.range = 6;
+	EXPECT_EQ(-EINVAL, nova_exec(self->fd, channel, &exec, 1));
+	exec.range = 16;
+	exec.flags = 1 << 7;
+	EXPECT_EQ(-EINVAL, nova_exec(self->fd, channel, &exec, 1));
+
+	EXPECT_EQ(0, nova_channel_destroy(self->fd, channel));
+	EXPECT_EQ(-ENOENT, nova_channel_destroy(self->fd, channel));
+}
+
+/* Channels left are destroyed with the file. */
+TEST_F(nova, exec_channels_left)
+{
+	ASSERT_EQ(0, nova_vm_init(self->fd, KERNEL_START, KERNEL_SIZE));
+	for (int i = 0; i < 4; i++) {
+		ASSERT_LE(0, nova_channel_create(self->fd, DRM_NOVA_ENGINE_GRAPHICS));
+		ASSERT_LE(0, nova_channel_create(self->fd, DRM_NOVA_ENGINE_COPY));
+	}
 }
 
 TEST_HARNESS_MAIN
