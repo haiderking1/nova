@@ -32,6 +32,7 @@ use crate::{
         self,
         gr::GrContext, //
     },
+    display::mode::HeadRaster,
     display::{
         self,
         Display,
@@ -67,6 +68,7 @@ use crate::{
             device::RmDevice,
         },
         ConnectorType,
+        DpLinkConfig,
         EngineInfo,
         Gsp,
         GspBootContext, //
@@ -461,7 +463,10 @@ pub(crate) struct Gpu<'gpu> {
     ///
     /// Must be kept declared *before* `gsp_resources`, so that its components are dropped while
     /// the GSP is still operational.
-    mm: GpuMm<'gpu>,
+    ///
+    /// Locked after `display_engine` when both are.
+    #[pin]
+    mm: Mutex<GpuMm<'gpu>>,
     /// BAR1 user interface for CPU access to GPU virtual memory.
     #[pin]
     bar_user: BarUser<'gpu>,
@@ -698,7 +703,7 @@ impl<'gpu> Gpu<'gpu> {
             gr: None,
 
             // Create GPU memory manager owning memory management resources.
-            mm: {
+            mm <- new_mutex!({
                 let usable_vram = gsp_static_info.usable_fb_regions.first().ok_or(ENODEV)?;
                 let buddy_params = GpuBuddyParams {
                     base_offset: usable_vram.start,
@@ -712,7 +717,7 @@ impl<'gpu> Gpu<'gpu> {
                     buddy_params,
                     VramAddress::from_raw(gsp_static_info.total_fb_end),
                 )?
-            },
+            }, "nova_gpu_mm"),
 
             // Create BAR1 user interface for CPU access to GPU virtual memory.
             bar_user <- {
@@ -780,6 +785,7 @@ impl<'gpu> Gpu<'gpu> {
         >,
     ) -> Result {
         let this = self.project();
+        let mut mm = this.mm.lock();
         let Some(display) = this.boot_display.as_ref() else {
             return Ok(());
         };
@@ -795,12 +801,12 @@ impl<'gpu> Gpu<'gpu> {
         let vram = display.vram.start..VramAddress::from_raw(end);
 
         let bar_user = this.bar_user.as_ref().get_ref();
-        let mapped = bar_user.map_vram(this.mm, vram)?;
+        let mapped = bar_user.map_vram(&mut mm, vram)?;
 
         #[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
         if let Err(err) = crate::mm::boot_display_test::check_bar1_mapping(
             pdev.as_ref(),
-            this.mm,
+            &mut mm,
             bar_user,
             &mapped,
             display,
@@ -829,6 +835,7 @@ impl<'gpu> Gpu<'gpu> {
     /// Must be done before any other channel is allocated.
     pub(crate) fn init_graphics(self: Pin<&mut Self>) -> Result {
         let this = self.project();
+        let mut mm = this.mm.lock();
         let gsp_resources = this.gsp_resources.as_ref().get_ref();
         let pdev = gsp_resources.device;
         let cmdq = &gsp_resources.gsp.cmdq;
@@ -845,7 +852,7 @@ impl<'gpu> Gpu<'gpu> {
         *this.gr = Some(GrContext::new(
             pdev.as_ref(),
             cmdq,
-            this.mm,
+            &mut mm,
             this.spec.chipset,
             rm,
             &internal,
@@ -861,6 +868,7 @@ impl<'gpu> Gpu<'gpu> {
     /// Fails with `ENOTSUPP` on GPUs whose display engine isn't supported yet.
     pub(crate) fn init_display_engine(self: Pin<&mut Self>) -> Result {
         let this = self.project();
+        let mut mm = this.mm.lock();
         let gsp_resources = this.gsp_resources.as_ref().get_ref();
         let pdev = gsp_resources.device;
         let display = this.display.as_ref().ok_or(ENODEV)?;
@@ -875,7 +883,7 @@ impl<'gpu> Gpu<'gpu> {
             pdev.as_ref(),
             gsp_resources.bar,
             &gsp_resources.gsp.cmdq,
-            this.mm,
+            &mut mm,
             this.spec.chipset,
             display,
             &internal,
@@ -887,12 +895,16 @@ impl<'gpu> Gpu<'gpu> {
             engine.windows()
         );
 
-        if let Some(output) = *this.boot_output {
-            match display.dp_link_config(pdev.as_ref(), &gsp_resources.gsp.cmdq, output) {
-                Ok(link) => dev_info!(pdev, "display: boot display DP link: {:?}\n", link),
-                Err(e) => dev_dbg!(pdev, "display: no DP link for the boot display: {:?}\n", e),
-            }
-        }
+        // Modes are checked against the link the firmware trained, which Nova keeps.
+        let link = this.boot_output.and_then(|output| {
+            display
+                .dp_link_config(pdev.as_ref(), &gsp_resources.gsp.cmdq, output)
+                .inspect(|link| dev_info!(pdev, "display: boot display DP link: {:?}\n", link))
+                .inspect_err(|e| {
+                    dev_dbg!(pdev, "display: no DP link for the boot display: {:?}\n", e)
+                })
+                .ok()
+        });
 
         #[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
         if let Some(boot) = this.boot_display.as_ref() {
@@ -900,7 +912,7 @@ impl<'gpu> Gpu<'gpu> {
             let mut channel = crate::channel::copy::CopyChannel::new(
                 pdev.as_ref(),
                 &gsp_resources.gsp.cmdq,
-                this.mm,
+                &mut mm,
                 this.spec.chipset,
                 this.rm.as_ref().ok_or(ENODEV)?,
             )
@@ -913,7 +925,7 @@ impl<'gpu> Gpu<'gpu> {
                 crate::channel::gr::ComputeChannel::new(
                     pdev.as_ref(),
                     &gsp_resources.gsp.cmdq,
-                    this.mm,
+                    &mut mm,
                     this.spec.chipset,
                     this.rm.as_ref()?,
                     gr,
@@ -928,7 +940,7 @@ impl<'gpu> Gpu<'gpu> {
                 crate::channel::compute_test::run(
                     pdev.as_ref(),
                     gsp_resources.bar,
-                    this.mm,
+                    &mut mm,
                     compute,
                 )
                 .inspect_err(|e| dev_err!(pdev, "compute test failed: {:?}\n", e))
@@ -938,7 +950,7 @@ impl<'gpu> Gpu<'gpu> {
             let _ = crate::display::scanout_test::run(
                 pdev.as_ref(),
                 gsp_resources.bar,
-                this.mm,
+                &mut mm,
                 &mut engine,
                 boot,
                 channel.as_mut(),
@@ -946,17 +958,17 @@ impl<'gpu> Gpu<'gpu> {
             );
 
             if let Some(mut compute) = compute {
-                compute.free(pdev.as_ref(), &gsp_resources.gsp.cmdq, this.mm);
+                compute.free(pdev.as_ref(), &gsp_resources.gsp.cmdq, &mut mm);
             }
             if let Some(mut channel) = channel {
-                channel.free(pdev.as_ref(), &gsp_resources.gsp.cmdq, this.mm);
+                channel.free(pdev.as_ref(), &gsp_resources.gsp.cmdq, &mut mm);
             }
         }
 
         // Nova's own scanout, of the boot display's mode: Nova can't set modes yet.
         let scanout = this.boot_display.as_ref().and_then(|boot| {
             Scanout::new(
-                this.mm,
+                &mut mm,
                 this.bar_user.as_ref().get_ref(),
                 boot.width,
                 boot.height,
@@ -966,7 +978,13 @@ impl<'gpu> Gpu<'gpu> {
             .ok()
         });
 
-        *this.display_engine.lock() = Some(DisplayOutput { engine, scanout });
+        // `display_engine` is locked before `mm`.
+        drop(mm);
+        *this.display_engine.lock() = Some(DisplayOutput {
+            engine,
+            scanout,
+            link,
+        });
 
         Ok(())
     }
@@ -1019,19 +1037,70 @@ impl<'gpu> Gpu<'gpu> {
         hal.set_vblank_interrupt(self.gsp_resources.bar, usize::try_from(head)?, enable)
     }
 
-    /// Has head `head` scan out `mode`, at the resolution it has, and returns once it does.
-    /// Returns whether the head had another mode.
+    /// Checks that the boot display's head can scan out `mode`: that its raster is valid, and
+    /// that the boot display's DisplayPort link, as trained, carries its pixels.
+    pub(crate) fn check_mode(&self, mode: &ModeTimings) -> Result {
+        HeadRaster::new(mode)?;
+
+        let output = self.display_engine.lock();
+        let output = output.as_ref().ok_or(ENODEV)?;
+        if output.scanout.is_none() {
+            return Err(ENODEV);
+        }
+        if let Some(link) = output.link {
+            // Each lane carries `link_bw` * 270 Mb/s, 8 data bits for every 10 sent: 216 kb/s
+            // of 24-bit pixels per unit of `link_bw` and kHz of pixel clock.
+            let capacity = u64::from(link.lanes) * u64::from(link.link_bw) * 216_000;
+            if u64::from(mode.clock_khz) * 24 > capacity {
+                return Err(ERANGE);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Has head `head` scan out `mode`, and returns once it does: whether the head had another
+    /// mode.
+    ///
+    /// A mode of another resolution is shown from a new scanout of its size, cleared to black,
+    /// which replaces Nova's.
     pub(crate) fn set_mode(&self, head: u32, mode: &ModeTimings) -> Result<bool> {
         let dev = self.gsp_resources.device.as_ref();
+        let bar = self.gsp_resources.bar;
         // The head drives the boot display: Nova can't drive others yet.
-        let display = self.boot_output.ok_or(ENODEV)?;
+        let display = self.boot_output.ok_or(ENODEV)?.into_raw();
         let mut output = self.display_engine.lock();
-        let output = Option::as_mut(&mut output).ok_or(ENODEV)?;
+        let DisplayOutput {
+            engine, scanout, ..
+        } = Option::as_mut(&mut output).ok_or(ENODEV)?;
 
-        let changed = output
-            .engine
-            .set_mode(self.gsp_resources.bar, head, display.into_raw(), mode)
-            .inspect_err(|e| dev_err!(dev, "display: can't set head {}'s mode: {:?}\n", head, e))?;
+        let size = (u32::from(mode.hdisplay), u32::from(mode.vdisplay));
+        let resized = scanout
+            .as_ref()
+            .is_some_and(|scanout| (scanout.mode().width, scanout.mode().height) != size);
+        let changed = if resized {
+            let mut mm = self.mm.lock();
+            let mut new = Scanout::new(&mut mm, &self.bar_user, size.0, size.1)?;
+            match new.show_back(|surface| engine.set_mode(bar, head, display, mode, Some(surface)))
+            {
+                Ok(changed) => {
+                    // The window doesn't show the old scanout anymore.
+                    if let Some(old) = scanout.replace(new) {
+                        let _ = old.unmap(&mut mm, &self.bar_user).inspect_err(|e| {
+                            dev_err!(dev, "display: can't unmap the old scanout: {:?}\n", e)
+                        });
+                    }
+                    Ok(changed)
+                }
+                Err(err) => {
+                    let _ = new.unmap(&mut mm, &self.bar_user);
+                    Err(err)
+                }
+            }
+        } else {
+            engine.set_mode(bar, head, display, mode, None)
+        }
+        .inspect_err(|e| dev_err!(dev, "display: can't set head {}'s mode: {:?}\n", head, e))?;
         if changed {
             dev_info!(dev, "display: head {} switched to {:?}\n", head, mode);
         }
@@ -1078,12 +1147,13 @@ impl<'gpu> Gpu<'gpu> {
     #[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
     pub(crate) fn run_selftests(self: Pin<&mut Self>, pdev: &pci::Device<device::Bound>) {
         let this = self.project();
+        let mut mm = this.mm.lock();
         let dev = pdev.as_ref();
         let regions = &this.gsp_static_info.usable_fb_regions;
 
         if let Err(err) = crate::mm::selftest::run(
             dev,
-            this.mm,
+            &mut mm,
             regions,
             &this.bar_user,
             this.gsp_static_info.bar1_pde_base,
@@ -1093,7 +1163,7 @@ impl<'gpu> Gpu<'gpu> {
         }
 
         if let Some(display) = this.boot_display {
-            if let Err(err) = crate::mm::boot_display_test::draw(dev, this.mm, display, regions) {
+            if let Err(err) = crate::mm::boot_display_test::draw(dev, &mut mm, display, regions) {
                 dev_err!(dev, "boot display test pattern failed: {:?}\n", err);
             }
         }
@@ -1105,12 +1175,18 @@ struct DisplayOutput<'gpu> {
     engine: DisplayEngine<'gpu>,
     /// Nova's own scanout, if it could be set up.
     scanout: Option<Scanout>,
+    /// The DisplayPort link of the boot display, if it is shown through one.
+    link: Option<DpLinkConfig>,
 }
 
 #[pinned_drop]
 impl PinnedDrop for Gpu<'_> {
     fn drop(self: Pin<&mut Self>) {
         let this = self.project();
+
+        // `display_engine` is locked before `mm`.
+        let output = this.display_engine.lock().take();
+        let mut mm = this.mm.lock();
 
         // Before any field is dropped: unmapping needs `mm`, `bar_user` and a running GSP.
         let mapped = this.boot_scanout.lock().take();
@@ -1119,7 +1195,7 @@ impl PinnedDrop for Gpu<'_> {
                 .bar_user
                 .as_ref()
                 .get_ref()
-                .unmap(this.mm, mapped)
+                .unmap(&mut mm, mapped)
                 .inspect_err(|e| pr_err!("failed to unmap the boot display: {:?}\n", e));
         }
 
@@ -1128,10 +1204,10 @@ impl PinnedDrop for Gpu<'_> {
         let dev = gsp_resources.device.as_ref();
 
         // The display engine's objects first, as they live under those of `display`.
-        let output = this.display_engine.lock().take();
         if let Some(DisplayOutput {
             mut engine,
             scanout,
+            ..
         }) = output
         {
             if let Some(display) = this.display.as_ref() {
@@ -1141,7 +1217,7 @@ impl PinnedDrop for Gpu<'_> {
             // Once the window, which may show it, is freed.
             if let Some(scanout) = scanout {
                 let _ = scanout
-                    .unmap(this.mm, this.bar_user.as_ref().get_ref())
+                    .unmap(&mut mm, this.bar_user.as_ref().get_ref())
                     .inspect_err(|e| dev_err!(dev, "failed to unmap the scanout: {:?}\n", e));
             }
         }

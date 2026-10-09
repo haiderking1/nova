@@ -63,7 +63,8 @@ pub(crate) struct Scanout {
 }
 
 impl Scanout {
-    /// Allocates the framebuffers of a `width` by `height` scanout and maps them into BAR1.
+    /// Allocates the framebuffers of a `width` by `height` scanout, cleared to black, and maps them
+    /// into BAR1.
     ///
     /// Nothing is shown until the first [`Scanout::flip`].
     pub(crate) fn new(
@@ -122,6 +123,16 @@ impl Scanout {
 
         let mapped = bar_user.map_vram(mm, vram.range())?;
 
+        // Black until drawn into.
+        let mut line = KVec::new();
+        line.resize(num::u32_as_usize(mode.stride), 0u8, GFP_KERNEL)?;
+        for y in 0..num::u32_as_usize(mode.height) {
+            if let Err(err) = bar_user.write(&mapped, y * line.len(), &line) {
+                let _ = bar_user.unmap(mm, mapped);
+                return Err(err);
+            }
+        }
+
         Ok(Framebuffer {
             _vram: vram,
             mapped,
@@ -145,10 +156,16 @@ impl Scanout {
     /// Shows the back buffer from the next frame on, and returns once the framebuffer shown
     /// before isn't read anymore: it is the back buffer from then on.
     pub(crate) fn flip(&mut self, engine: &mut DisplayEngine<'_>, bar: Bar0<'_>) -> Result {
-        engine.show(bar, &self.framebuffers[self.back].surface)?;
+        self.show_back(|surface| engine.show(bar, surface))
+    }
+
+    /// Has `show` show the back buffer, which it returns once the framebuffer shown before isn't
+    /// read anymore: it is the back buffer from then on.
+    pub(crate) fn show_back<R>(&mut self, show: impl FnOnce(&Surface) -> Result<R>) -> Result<R> {
+        let shown = show(&self.framebuffers[self.back].surface)?;
         self.back = 1 - self.back;
 
-        Ok(())
+        Ok(shown)
     }
 
     /// Unmaps the framebuffers from BAR1 and frees them: the window must not show them anymore,

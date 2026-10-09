@@ -67,6 +67,12 @@ pub(crate) mod core_c67d {
         0x2020 + head * 0x400
     }
 
+    /// What window `window` may be used for: the widest line it fetches in bits 14:0, in pixels
+    /// (`NVC67D_WINDOW_SET_WINDOW_USAGE_BOUNDS`).
+    pub(crate) const fn window_set_window_usage_bounds(window: u32) -> u32 {
+        0x1010 + window * 0x80
+    }
+
     /// Pixel clock configuration of head `head` (`NVC67D_HEAD_SET_PIXEL_CLOCK_CONFIGURATION`).
     pub(crate) const fn head_set_pixel_clock_configuration(head: u32) -> u32 {
         0x201c + head * 0x400
@@ -76,6 +82,23 @@ pub(crate) mod core_c67d {
     /// (`NVC67D_HEAD_SET_PIXEL_CLOCK_FREQUENCY_MAX`).
     pub(crate) const fn head_set_pixel_clock_frequency_max(head: u32) -> u32 {
         0x2028 + head * 0x400
+    }
+
+    /// Point of the raster of head `head` its viewport starts at (`NVC67D_HEAD_SET_VIEWPORT_POINT_IN`).
+    pub(crate) const fn head_set_viewport_point_in(head: u32) -> u32 {
+        0x2048 + head * 0x400
+    }
+
+    /// Size of the area of the raster of head `head` its windows are composited into
+    /// (`NVC67D_HEAD_SET_VIEWPORT_SIZE_IN`).
+    pub(crate) const fn head_set_viewport_size_in(head: u32) -> u32 {
+        0x204c + head * 0x400
+    }
+
+    /// Size the viewport of head `head` is scaled to, its active area
+    /// (`NVC67D_HEAD_SET_VIEWPORT_SIZE_OUT`).
+    pub(crate) const fn head_set_viewport_size_out(head: u32) -> u32 {
+        0x2058 + head * 0x400
     }
 
     /// Total width and height of the raster of head `head` (`NVC67D_HEAD_SET_RASTER_SIZE`).

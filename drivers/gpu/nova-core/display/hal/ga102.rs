@@ -170,8 +170,9 @@ impl DisplayHal for Ga102 {
             // Shown as it is, without the input LUT that composition would need.
             (SET_CONTEXT_DMA_ILUT, 0),
             (SET_COMPOSITION_CONTROL, COMPOSITION_BYPASS),
-            // The update doesn't wait for any other channel.
-            (SET_INTERLOCK_FLAGS, 0),
+            // The update waits for no other channel, or for the core channel's next update
+            // (`INTERLOCK_WITH_CORE`, bit 0).
+            (SET_INTERLOCK_FLAGS, u32::from(image.interlock_with_core)),
             (SET_WINDOW_INTERLOCK_FLAGS, 0),
         ];
 
@@ -291,15 +292,33 @@ impl DisplayHal for Ga102 {
             ],
         )?;
         // No second vertical blanking, as for progressive rasters in nouveau.
-        push.push(bar, head_set_raster_vert_blank2(head), &[1])
+        push.push(bar, head_set_raster_vert_blank2(head), &[1])?;
+
+        // The viewport is the whole active area, unscaled.
+        let active = position((
+            raster.blank_start.0 - raster.blank_end.0,
+            raster.blank_start.1 - raster.blank_end.1,
+        ));
+        push.push(bar, head_set_viewport_point_in(head), &[0])?;
+        push.push(bar, head_set_viewport_size_in(head), &[active])?;
+        push.push(bar, head_set_viewport_size_out(head), &[active])
     }
 
-    fn push_core_update(&self, bar: Bar0<'_>, push: &mut PushBuffer<'_>) -> Result {
+    fn push_window_bounds(&self, bar: Bar0<'_>, push: &mut PushBuffer<'_>, window: u32) -> Result {
+        use core_c67d::*;
+
+        let method = window_set_window_usage_bounds(window);
+        let bounds = armed(bar, usize::try_from(method)?).ok_or(EINVAL)?;
+        // `MAX_PIXELS_FETCHED_PER_LINE`, bits 14:0.
+        push.push(bar, method, &[bounds | 0x7fff])
+    }
+
+    fn push_core_update(&self, bar: Bar0<'_>, push: &mut PushBuffer<'_>, windows: u32) -> Result {
         use core_c67d::*;
 
         push.push(bar, SET_CONTEXT_DMA_NOTIFIER, &[0])?;
         push.push(bar, SET_INTERLOCK_FLAGS, &[0])?;
-        push.push(bar, SET_WINDOW_INTERLOCK_FLAGS, &[0])?;
+        push.push(bar, SET_WINDOW_INTERLOCK_FLAGS, &[windows])?;
         push.push(bar, UPDATE, &[UPDATE_RELEASE])
     }
 

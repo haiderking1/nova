@@ -2,12 +2,12 @@
 
 //! Display support (kernel mode setting).
 //!
-//! nova-drm can't set modes yet. For now it drives the display the system firmware set up: one
-//! output (primary plane, CRTC, encoder and connector) offering only the firmware's mode, which
-//! the display engine keeps after nova-core boots the GSP. Frames are copied by the CPU from
-//! shadow-plane framebuffers into the back buffer of nova-core's own scanout, which is then
-//! flipped, so frames show whole. Without that scanout, they are copied into the firmware's
-//! framebuffer, which shows on screen as it is drawn.
+//! nova-drm drives the display the system firmware set up: one output (primary plane, CRTC,
+//! encoder and connector), on the head and output the firmware lit. Frames are copied by the CPU
+//! from shadow-plane framebuffers into the back buffer of nova-core's own scanout, which is then
+//! flipped, so frames show whole. Through that scanout, nova-core sets the modes of the monitor's
+//! EDID that the display's link carries. Without it, frames are copied into the firmware's
+//! framebuffer, which shows on screen as it is drawn, and only the firmware's mode works.
 //!
 //! With nova-core's scanout, the CRTC has vblanks: nova-core passes on the vblank interrupts of the
 //! head showing the scanout. A flip returns once the frame flipped is on screen, so a commit's
@@ -15,8 +15,7 @@
 //! next vblank.
 //!
 //! The connector reports what GSP-RM knows about the display: the type of connector it is shown
-//! through, and the EDID of the monitor (its name, physical size and modes, of which only those
-//! of the firmware's resolution are kept).
+//! through, and the EDID of the monitor (its name, physical size and modes).
 
 use core::marker::PhantomPinned;
 
@@ -84,7 +83,6 @@ use nova_core::api::{
     ConnectorType,
     ModeTimings,
     NovaCoreApi,
-    ScanoutMode,
     VblankHandler, //
 };
 
@@ -146,7 +144,7 @@ impl KmsDriver for NovaDriver {
         });
 
         Ok(ModeConfigInfo {
-            min_resolution: (width, height),
+            min_resolution: (1, 1),
             max_resolution: (width.max(MAX_FB_SIZE), height.max(MAX_FB_SIZE)),
             max_cursor: (0, 0),
             preferred_depth: 24,
@@ -192,9 +190,11 @@ impl KmsDriver for NovaDriver {
         modeset_token: ModesetsReadyToken<'_>,
         plane_update_token: PlaneUpdatesReadyToken<'_>,
     ) -> CommittedAtomicState<'a, Self> {
+        // The CRTC's mode is set first: nova-core's scanout takes its size, which planes are drawn
+        // into.
         let modeset_token = state.commit_modeset_disables(modeset_token);
-        let plane_update_token = state.commit_planes(plane_update_token, Default::default());
         let modeset_token = state.commit_modeset_enables(modeset_token);
+        let plane_update_token = state.commit_planes(plane_update_token, Default::default());
         state.fake_vblank();
 
         let state = state.commit_hw_done(modeset_token, plane_update_token);
@@ -299,14 +299,15 @@ impl plane::DriverPlane for NovaPlane {
         let scanout = drm
             .boot_display
             .as_ref()
-            .and_then(|display| display.scanout);
+            .is_some_and(|display| display.scanout.is_some());
         // Vblank interrupts stay on until the flip is done, so that DRM counts the vblank the
         // frame shows from, which the commit's event then carries.
         let crtc = new_state.crtc().map(Crtc::from_opaque);
         let _vblank = crtc.and_then(|crtc| crtc.vblank_get().ok());
-        let result = match scanout {
-            Some(scanout) => draw_to_scanout(drm, &scanout, old_state, &mut new_state),
-            None => copy_to_boot_display(drm, old_state, &new_state),
+        let result = if scanout {
+            draw_to_scanout(drm, old_state, &mut new_state)
+        } else {
+            copy_to_boot_display(drm, old_state, &new_state)
         };
         if let Err(err) = result {
             pr_err!("nova-drm: failed to update the display: {:?}\n", err);
@@ -320,7 +321,6 @@ impl plane::DriverPlane for NovaPlane {
 /// since either are drawn.
 fn draw_to_scanout(
     drm: &NovaDevice,
-    scanout: &ScanoutMode,
     old_state: &PlaneState<NovaPlaneState>,
     new_state: &mut PlaneStateMutator<'_, PlaneState<NovaPlaneState>>,
 ) -> Result {
@@ -334,12 +334,21 @@ fn draw_to_scanout(
     };
 
     let (src, dst) = (new_state.src(), new_state.dst());
-    let stride = usize::try_from(scanout.stride)?;
     let mut row_buf = KVec::new();
     let mut damage = None;
 
     registered.registration_data_with(|reg| {
         reg.api.with(|api| {
+            // The scanout has the size of the CRTC's mode, set before the planes are updated.
+            let scanout = api.scanout_mode().ok_or(ENODEV)?;
+            if dst.x1 < 0
+                || dst.y1 < 0
+                || i64::from(dst.x2) > i64::from(scanout.width)
+                || i64::from(dst.y2) > i64::from(scanout.height)
+            {
+                return Err(EINVAL);
+            }
+            let stride = usize::try_from(scanout.stride)?;
             let state: &PlaneStateMutator<'_, _> = new_state;
             let draw = |rect: &Rect, row_buf: &mut KVec<u8>| {
                 // `rect` is in framebuffer coordinates; the plane shows `src` at `dst`.
@@ -492,10 +501,22 @@ impl crtc::DriverCrtc for NovaCrtc {
     }
 
     fn mode_valid(crtc: &Crtc, mode: &DisplayMode) -> ModeStatus {
-        match crtc.drm_dev().boot_display.as_ref() {
-            // nova-drm can't set modes yet: only the firmware's mode works.
-            Some(display) => crtc.mode_valid_fixed(mode, &display.mode),
-            None => ModeStatus::OK,
+        let drm = crtc.drm_dev();
+        let Some(display) = drm.boot_display.as_ref() else {
+            return ModeStatus::OK;
+        };
+        // Without nova-core's scanout, only the firmware's mode works.
+        if display.scanout.is_none() {
+            return crtc.mode_valid_fixed(mode, &display.mode);
+        }
+
+        let Ok(timings) = mode_timings(mode) else {
+            return ModeStatus::NO_INTERLACE;
+        };
+        match with_api(drm, |api| api.check_mode(&timings)) {
+            Ok(()) => ModeStatus::OK,
+            Err(ERANGE) => ModeStatus::CLOCK_HIGH,
+            Err(_) => ModeStatus::BAD,
         }
     }
 

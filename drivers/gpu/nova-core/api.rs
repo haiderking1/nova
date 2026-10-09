@@ -128,9 +128,15 @@ impl NovaCoreApi<'_> {
         self.gpu.set_vblank_interrupt(head, enable)
     }
 
+    /// Checks that nova-core can show `mode` on the boot display, through its scanout: fails with
+    /// `ERANGE` if the display's link can't carry it, `EINVAL` if its timings are invalid.
+    pub fn check_mode(&self, mode: &ModeTimings) -> Result {
+        self.gpu.check_mode(mode)
+    }
+
     /// Has head `head` scan out `mode`, and returns once it does: whether the head had another
-    /// mode. Only the timings may change, not the resolution: the head keeps showing nova-core's
-    /// scanout.
+    /// mode. A mode of another resolution replaces nova-core's scanout with one of its size,
+    /// cleared: see [`NovaCoreApi::scanout_mode()`].
     pub fn set_mode(&self, head: u32, mode: &ModeTimings) -> Result<bool> {
         self.gpu.set_mode(head, mode)
     }

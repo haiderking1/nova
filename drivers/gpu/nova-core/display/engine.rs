@@ -252,16 +252,19 @@ impl<'a> DisplayEngine<'a> {
         channels.show(bar, surface)
     }
 
-    /// Has head `head` scan out `mode`, keeping its output and what it shows, and returns once
-    /// the display engine switched to it. Returns whether the head had another mode.
+    /// Has head `head`, driving the display `display_id`, scan out `mode` on the output it has,
+    /// and returns once the display engine switched to it. Returns whether the head had another
+    /// mode.
     ///
-    /// The head must keep its resolution: only its timings change.
+    /// A mode of another resolution needs the window to show a `surface` of its size, which it
+    /// does from the same frame on. Otherwise, the window keeps showing what it does.
     pub(crate) fn set_mode(
         &mut self,
         bar: Bar0<'_>,
         head: u32,
         display_id: u32,
         mode: &ModeTimings,
+        surface: Option<&Surface>,
     ) -> Result<bool> {
         let channels = self.channels.as_mut().ok_or(ENODEV)?;
         let raster = HeadRaster::new(mode)?;
@@ -269,18 +272,22 @@ impl<'a> DisplayEngine<'a> {
         if armed == raster {
             return Ok(false);
         }
-        // The window and the head's viewport keep their size.
-        if (
-            armed.blank_start.0 - armed.blank_end.0,
-            armed.blank_start.1 - armed.blank_end.1,
-        ) != (
-            raster.blank_start.0 - raster.blank_end.0,
-            raster.blank_start.1 - raster.blank_end.1,
-        ) {
-            return Err(ENOTSUPP);
+
+        let size = |raster: &HeadRaster| {
+            (
+                u32::from(raster.blank_start.0 - raster.blank_end.0),
+                u32::from(raster.blank_start.1 - raster.blank_end.1),
+            )
+        };
+        match surface {
+            Some(surface) if (surface.width, surface.height) != size(&raster) => {
+                return Err(EINVAL)
+            }
+            None if size(&armed) != size(&raster) => return Err(EINVAL),
+            _ => {}
         }
 
-        channels.set_mode(bar, head, display_id, &raster)?;
+        channels.set_mode(bar, head, display_id, &raster, surface)?;
         Ok(true)
     }
 }
@@ -288,6 +295,8 @@ impl<'a> DisplayEngine<'a> {
 impl<'a> Channels<'a> {
     /// Gives head `head`, driving the display `display_id`, the raster `raster` with a core
     /// update, and returns once the display engine uses it: once the core channel has it armed.
+    /// With a `surface`, the window shows it from the same frame on, which a change of resolution
+    /// needs.
     ///
     /// GSP-RM carries out the supervisor steps of the modeset that the update starts: the pixel
     /// clock, the output and the DisplayPort stream follow the new raster.
@@ -297,12 +306,23 @@ impl<'a> Channels<'a> {
         head: u32,
         display_id: u32,
         raster: &HeadRaster,
+        surface: Option<&Surface>,
     ) -> Result {
         let hal = self.hal;
-        let push = &mut self.core_push;
 
+        // The window update waits for the core update, which waits for it in turn.
+        let window = surface
+            .map(|surface| self.push_window_update(bar, surface, true))
+            .transpose()?;
+        let windows = if window.is_some() { 1 << WINDOW } else { 0 };
+
+        let push = &mut self.core_push;
+        if window.is_some() {
+            // CAST: `WINDOW` is a window index, below 32.
+            hal.push_window_bounds(bar, push, WINDOW as u32)?;
+        }
         hal.push_head_mode(bar, push, head, display_id, raster)?;
-        hal.push_core_update(bar, push)?;
+        hal.push_core_update(bar, push, windows)?;
         push.kick(bar)?;
 
         read_poll_timeout(
@@ -320,7 +340,12 @@ impl<'a> Channels<'a> {
             );
             log_exception(self.dev, bar, 0);
             log_exception(self.dev, bar, WINDOW + 1);
-        })
+        })?;
+
+        match window {
+            Some(status_word) => self.wait_window_update(status_word),
+            None => Ok(()),
+        }
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -424,6 +449,18 @@ impl<'a> Channels<'a> {
     /// The window bypasses composition, as NVIDIA's driver does to show a console. The head keeps
     /// the mode and output it has.
     fn show(&mut self, bar: Bar0<'_>, surface: &Surface) -> Result {
+        let status_word = self.push_window_update(bar, surface, false)?;
+        self.wait_window_update(status_word)
+    }
+
+    /// Sends the window update pointing the window at `surface`, waiting for the next core update
+    /// if `interlock_with_core`, and returns the word of the notifier it reports its progress in.
+    fn push_window_update(
+        &mut self,
+        bar: Bar0<'_>,
+        surface: &Surface,
+        interlock_with_core: bool,
+    ) -> Result<usize> {
         surface.check()?;
 
         let slot = self.notifier_slot;
@@ -441,6 +478,7 @@ impl<'a> Channels<'a> {
                 ctxdma: VRAM_CTXDMA,
                 notifier_ctxdma: NOTIFIER_CTXDMA,
                 notifier_offset,
+                interlock_with_core,
             },
         )?;
 
@@ -451,6 +489,12 @@ impl<'a> Channels<'a> {
         self.notifier_slot = (slot + 1) % NOTIFIER_SLOTS;
         push.wait_idle(bar)?;
 
+        Ok(status_word)
+    }
+
+    /// Waits for the window update reporting its progress in notifier word `status_word` to begin
+    /// taking effect: from then on, the surface shown before isn't read anymore.
+    fn wait_window_update(&self, status_word: usize) -> Result {
         let notifier = &self.notifier;
         let read_status = || -> Result<u32> { Ok(io_read!(notifier, [try: status_word])) };
         read_poll_timeout(

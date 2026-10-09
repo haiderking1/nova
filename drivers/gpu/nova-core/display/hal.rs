@@ -45,6 +45,8 @@ pub(crate) struct WindowImage<'a> {
     pub(super) notifier_ctxdma: u32,
     /// Offset of the notifier in its context DMA, in bytes: a multiple of 16.
     pub(super) notifier_offset: u32,
+    /// Whether the update waits for the next core channel update, to take effect with it.
+    pub(super) interlock_with_core: bool,
 }
 
 pub(crate) trait DisplayHal: Sync {
@@ -123,8 +125,13 @@ pub(crate) trait DisplayHal: Sync {
         raster: &HeadRaster,
     ) -> Result;
 
-    /// Pushes a core channel update without a notifier, which doesn't wait for other channels.
-    fn push_core_update(&self, bar: Bar0<'_>, push: &mut PushBuffer<'_>) -> Result;
+    /// Pushes the core channel method letting window `window` fetch lines of any width, as
+    /// nouveau does, keeping the rest of its usage bounds: the firmware set them for its mode.
+    fn push_window_bounds(&self, bar: Bar0<'_>, push: &mut PushBuffer<'_>, window: u32) -> Result;
+
+    /// Pushes a core channel update without a notifier, which takes effect with the updates of the
+    /// windows in `windows`, a mask, already sent interlocked with it.
+    fn push_core_update(&self, bar: Bar0<'_>, push: &mut PushBuffer<'_>, windows: u32) -> Result;
 
     /// Returns the raster head `head` scans out with, as the core channel has it armed.
     fn armed_raster(&self, bar: Bar0<'_>, head: u32) -> Option<HeadRaster>;
