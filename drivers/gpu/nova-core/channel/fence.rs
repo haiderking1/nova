@@ -237,6 +237,21 @@ impl<'a> Timeline<'a> {
         }
     }
 
+    /// Returns the fence of the last submission that is not done yet, if any.
+    ///
+    /// Fails with `ENODEV` once the channel runs no more work.
+    pub(crate) fn last(&self) -> Result<Option<ARef<Fence>>> {
+        let pending = self.pending.lock();
+        if pending.error.is_some() {
+            return Err(ENODEV);
+        }
+
+        Ok(pending
+            .fences
+            .last()
+            .map(|(_, fence)| ARef::from(fence.as_fence())))
+    }
+
     /// Returns whether the channel runs no more work, see [`Timeline::fail`].
     pub(crate) fn failed(&self) -> bool {
         self.pending.lock().error.is_some()

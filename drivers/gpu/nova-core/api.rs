@@ -277,6 +277,19 @@ impl NovaCoreApi<'_> {
         self.gpu.channel_exec(chid, pushes)
     }
 
+    /// Returns the fence of the last work submitted to the channel `chid` that is not done yet, if
+    /// any.
+    ///
+    /// Fails with `ENODEV` once the channel runs no more work.
+    pub fn channel_last_fence(&self, chid: u32) -> Result<Option<ARef<Fence>>> {
+        self.gpu.channel_last_fence(chid)
+    }
+
+    /// Returns the GPU's timer, a count of nanoseconds that work on the GPU timestamps with.
+    pub fn timestamp(&self) -> u64 {
+        self.gpu.timestamp()
+    }
+
     /// Allocates a zeroed buffer of at least `size` bytes of system memory, which the GPU
     /// accesses coherently with the CPU's caches. Its size is rounded up to the page size.
     pub fn alloc_system(&self, size: usize) -> Result<SystemBuffer> {

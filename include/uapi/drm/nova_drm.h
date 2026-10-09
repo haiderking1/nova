@@ -447,6 +447,24 @@ struct drm_nova_info_exec {
 };
 
 /**
+ * DRM_NOVA_INFO_TIMESTAMP
+ *
+ * Query the GPU's timer, which the timestamps that work writes count with.
+ * The result is returned in a &struct drm_nova_info_timestamp.
+ */
+#define DRM_NOVA_INFO_TIMESTAMP		0x04
+
+/**
+ * struct drm_nova_info_timestamp - the GPU's timer
+ */
+struct drm_nova_info_timestamp {
+	/**
+	 * @timestamp: The GPU's timer, a count of nanoseconds.
+	 */
+	__u64 timestamp;
+};
+
+/**
  * DRM_NOVA_ENGINE_GRAPHICS - the graphics engine
  *
  * Its channels have objects of the classes &struct drm_nova_channel_create
@@ -608,7 +626,10 @@ struct drm_nova_exec {
 
 	/**
 	 * @push_count: Number of push buffers at @push_ptr, at most
-	 * &struct drm_nova_info_exec.push_max.
+	 * &struct drm_nova_info_exec.push_max. With none, the synchronization
+	 * objects to signal get the fence that signals once the work submitted to
+	 * the channel before is done, and the ioctl fails with -ENODEV if the
+	 * channel runs no more work.
 	 */
 	__u32 push_count;
 

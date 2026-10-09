@@ -1080,6 +1080,65 @@ TEST_F(nova, exec_queue)
 	mapped_bo_destroy(self->fd, &dst);
 }
 
+/* The GPU's timer counts nanoseconds. */
+TEST_F(nova, info_timestamp)
+{
+	struct drm_nova_info_timestamp before = {}, after = {};
+	struct timespec pause = { .tv_nsec = 10 * 1000 * 1000 };
+	__u64 ns;
+
+	ASSERT_EQ(sizeof(before), nova_info(self->fd, DRM_NOVA_INFO_TIMESTAMP, &before,
+					    sizeof(before)));
+	nanosleep(&pause, NULL);
+	ASSERT_EQ(sizeof(after), nova_info(self->fd, DRM_NOVA_INFO_TIMESTAMP, &after,
+					   sizeof(after)));
+
+	ns = after.timestamp - before.timestamp;
+	TH_LOG("GPU timer advanced %llu ns over a 10 ms sleep", (unsigned long long)ns);
+	EXPECT_LE(10ull * 1000 * 1000, ns);
+	EXPECT_GT(1000ull * 1000 * 1000, ns);
+}
+
+/* EXEC without push buffers signals once the work submitted before is done. */
+TEST_F(nova, exec_empty)
+{
+	struct drm_nova_info_graphics gr = graphics_info(self->fd);
+	struct drm_nova_sync sig = { .flags = DRM_NOVA_SYNC_SYNCOBJ };
+	const __u64 size = 512ull << 20;
+	struct drm_nova_exec_push exec;
+	struct mapped_bo push;
+	int big, channel;
+
+	ASSERT_EQ(0, nova_vm_init(self->fd, KERNEL_START, KERNEL_SIZE));
+	mapped_bo_create(_metadata, self->fd, &push, 4096, 0, PUSH_VA);
+	big = nova_gem_create(self->fd, size, DRM_NOVA_GEM_VRAM);
+	ASSERT_LE(0, big);
+	ASSERT_EQ(0, nova_vm_map(self->fd, DST_VA, big, 0, size, 0));
+	channel = nova_channel_create(self->fd, DRM_NOVA_ENGINE_COPY);
+	ASSERT_LE(0, channel);
+	sig.handle = syncobj_create(self->fd);
+	ASSERT_LT(0, sig.handle);
+
+	/* With nothing submitted before, it signals right away. */
+	ASSERT_EQ(0, nova_exec_sync(self->fd, channel, NULL, 0, NULL, 0, &sig, 1));
+	EXPECT_EQ(0, syncobj_wait(self->fd, sig.handle, 0, 0));
+
+	/* After a fill of 512 MiB, once it is done. */
+	exec = (struct drm_nova_exec_push){
+		.va = PUSH_VA,
+		.range = 4 * push_copy_fill(push.map, gr.class_copy, DST_VA, size, 0x5a5a5a5a),
+	};
+	ASSERT_EQ(0, nova_exec(self->fd, channel, &exec, 1));
+	ASSERT_EQ(0, nova_exec_sync(self->fd, channel, NULL, 0, NULL, 0, &sig, 1));
+	EXPECT_EQ(-ETIME, syncobj_wait(self->fd, sig.handle, 0, 0));
+	EXPECT_EQ(0, syncobj_wait(self->fd, sig.handle, 0, 5000));
+
+	syncobj_destroy(self->fd, sig.handle);
+	EXPECT_EQ(0, nova_channel_destroy(self->fd, channel));
+	mapped_bo_destroy(self->fd, &push);
+	nova_gem_close(self->fd, big);
+}
+
 /*
  * Work that makes no progress fails: its fences signal once the watchdog
  * gives up on it, and the channel runs no more work. Other channels still do.
@@ -1121,6 +1180,7 @@ TEST_F(nova, exec_hang)
 	TH_LOG("hung work failed after %ld ms", ms);
 	EXPECT_LE(4000, ms);
 	EXPECT_EQ(-ENODEV, nova_exec(self->fd, channel, &exec, 1));
+	EXPECT_EQ(-ENODEV, nova_exec(self->fd, channel, NULL, 0));
 	EXPECT_EQ(0, nova_channel_destroy(self->fd, channel));
 
 	other = nova_channel_create(self->fd, DRM_NOVA_ENGINE_COPY);
@@ -1157,7 +1217,8 @@ TEST_F(nova, exec_invalid)
 	ASSERT_LE(0, channel);
 
 	EXPECT_EQ(-ENOENT, nova_exec(self->fd, channel + 1, &exec, 1));
-	EXPECT_EQ(-EINVAL, nova_exec(self->fd, channel, &exec, 0));
+	/* Without push buffers, nothing to wait for or signal. */
+	EXPECT_EQ(0, nova_exec(self->fd, channel, &exec, 0));
 	EXPECT_EQ(-EINVAL, nova_exec(self->fd, channel, &exec, 100000));
 	exec.range = 6;
 	EXPECT_EQ(-EINVAL, nova_exec(self->fd, channel, &exec, 1));

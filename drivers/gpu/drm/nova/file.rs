@@ -160,6 +160,13 @@ struct ExecInfo(uapi::drm_nova_info_exec);
 // SAFETY: `ExecInfo` has no interior mutability, and there are no uninitialized bytes.
 unsafe impl AsBytes for ExecInfo {}
 
+/// The GPU's timer returned to userspace.
+#[repr(transparent)]
+struct TimestampInfo(uapi::drm_nova_info_timestamp);
+
+// SAFETY: `TimestampInfo` has no interior mutability, and there are no uninitialized bytes.
+unsafe impl AsBytes for TimestampInfo {}
+
 /// Information on the GPU virtual address spaces returned to userspace.
 #[repr(transparent)]
 struct VmInfo(uapi::drm_nova_info_vm);
@@ -503,7 +510,7 @@ impl File {
             }
         }
 
-        if req.push_count == 0 || req.push_count > PUSH_MAX {
+        if req.push_count > PUSH_MAX {
             return Err(EINVAL);
         }
         let count = usize::try_from(req.push_count)?;
@@ -564,9 +571,16 @@ impl File {
             fence.status()?;
         }
 
-        let fence = reg_data
-            .api
-            .with(|api| api.channel_exec(req.channel, &pushes))?;
+        // Without push buffers, the objects to signal get the fence of the work submitted before.
+        let fence = reg_data.api.with(|api| {
+            if pushes.is_empty() {
+                Ok(api
+                    .channel_last_fence(req.channel)?
+                    .unwrap_or_else(Fence::stub))
+            } else {
+                api.channel_exec(req.channel, &pushes)
+            }
+        })?;
         for signal in signals.drain_all() {
             signal.signal(&fence);
         }
@@ -595,6 +609,12 @@ impl File {
                 info,
                 VmInfo(uapi::drm_nova_info_vm {
                     va_size: nova_core::api::VA_SIZE,
+                }),
+            )?,
+            uapi::DRM_NOVA_INFO_TIMESTAMP => write_info(
+                info,
+                TimestampInfo(uapi::drm_nova_info_timestamp {
+                    timestamp: reg_data.api.with(|api| api.timestamp()),
                 }),
             )?,
             _ => return Err(EINVAL),

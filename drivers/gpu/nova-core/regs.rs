@@ -38,6 +38,18 @@ register! {
     pub(crate) NV_PBUS_SW_SCRATCH(u32)[64] @ 0x00001400 {}
 }
 
+// PTIMER
+
+register! {
+    base: NovaRegisters;
+
+    /// Bits 31:0 of the GPU's timer, a count of nanoseconds.
+    pub(crate) NV_PTIMER_TIME_0(u32) @ 0x00009400 {}
+
+    /// Bits 63:32 of the GPU's timer.
+    pub(crate) NV_PTIMER_TIME_1(u32) @ 0x00009410 {}
+}
+
 // PGC6 register space.
 //
 // `GC6` is a GPU low-power state where VRAM is in self-refresh and the GPU is powered down (except

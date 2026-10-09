@@ -1728,6 +1728,37 @@ impl<'gpu> Gpu<'gpu> {
         channel.submit(self.gsp_resources.bar, &mut self.mm.lock(), pushes)
     }
 
+    /// Returns the GPU's timer, a count of nanoseconds that work on the GPU timestamps with.
+    pub(crate) fn timestamp(&self) -> u64 {
+        let bar = self.gsp_resources.bar;
+
+        // The halves are read apart: read the upper one again, until it didn't change meanwhile.
+        loop {
+            let upper = bar.read(crate::regs::NV_PTIMER_TIME_1).into_raw();
+            let lower = bar.read(crate::regs::NV_PTIMER_TIME_0).into_raw();
+            if bar.read(crate::regs::NV_PTIMER_TIME_1).into_raw() == upper {
+                return u64::from(upper) << 32 | u64::from(lower);
+            }
+        }
+    }
+
+    /// Returns the fence of the last work submitted to the channel `chid` that is not done yet, if
+    /// any.
+    ///
+    /// Fails with `ENODEV` once the channel runs no more work.
+    pub(crate) fn channel_last_fence(&self, chid: u32) -> Result<Option<ARef<Fence>>> {
+        let channel = self
+            .client_channels
+            .lock()
+            .get(num::u32_as_usize(chid))
+            .ok_or(EINVAL)?
+            .clone()
+            .ok_or(ENOENT)?;
+        let channel = channel.lock();
+
+        Option::as_ref(&*channel).ok_or(ENOENT)?.timeline().last()
+    }
+
     /// Allocates a zeroed buffer of at least `size` bytes of system memory, which the GPU accesses
     /// coherently with the CPU's caches. Its size is rounded up to the page size.
     pub(crate) fn alloc_system(&self, size: usize) -> Result<SystemBuffer> {
