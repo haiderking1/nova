@@ -544,6 +544,17 @@ impl Fence {
         Ok(ret > 0)
     }
 
+    /// Returns a fence that is already signaled, such as for work that has nothing to wait for.
+    pub fn stub() -> ARef<Self> {
+        // SAFETY: `dma_fence_get_stub()` has no preconditions, and returns a new reference to a
+        // valid, signaled fence, which `Self` wraps transparently.
+        unsafe {
+            ARef::from_raw(NonNull::new_unchecked(
+                bindings::dma_fence_get_stub().cast::<Self>(),
+            ))
+        }
+    }
+
     /// Waits for the fence to be signaled.
     ///
     /// A waiter that is `interruptible` returns early with `ERESTARTSYS` on a signal.
