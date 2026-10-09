@@ -17,8 +17,9 @@
 use crate::{
     bindings,
     error::{code::EINVAL, to_result, Result},
+    io::PhysAddr,
     mm::MmWithUser,
-    page::Page,
+    page::{Page, PAGE_SHIFT, PAGE_SIZE},
     types::Opaque,
 };
 
@@ -255,14 +256,61 @@ impl VmaNew {
     ///
     /// This enables the vma to contain both `struct page` and pure PFN pages. Returns a reference
     /// that can be used to call `vm_insert_page` on the vma.
+    ///
+    /// Fails with `EINVAL` if the vma maps I/O memory, as [`VmaNew::io_remap_writecombine`] makes
+    /// it do.
     #[inline]
-    pub fn set_mixedmap(&self) -> &VmaMixedMap {
-        // SAFETY: We don't yet provide a way to set VM_PFNMAP, so this cannot put the flags in an
-        // invalid state.
+    pub fn set_mixedmap(&self) -> Result<&VmaMixedMap> {
+        if self.flags() & flags::PFNMAP != 0 {
+            return Err(EINVAL);
+        }
+        // SAFETY: `VM_PFNMAP` isn't set, so this cannot put the flags in an invalid state.
         unsafe { self.update_flags(flags::MIXEDMAP, 0) };
 
         // SAFETY: We just set `VM_MIXEDMAP` on the vma.
-        unsafe { VmaMixedMap::from_raw(self.vma.as_ptr()) }
+        Ok(unsafe { VmaMixedMap::from_raw(self.vma.as_ptr()) })
+    }
+
+    /// Maps `size` bytes of I/O memory at physical address `phys` into the vma, `offset` bytes
+    /// from its start, write-combined: as the part of a PCI BAR that shows the memory of a device.
+    ///
+    /// The vma becomes one of PFNs without `struct page` (`VM_PFNMAP`), of I/O memory (`VM_IO`),
+    /// which can't grow and isn't dumped. Its page protection becomes write-combined, for all of
+    /// its mappings.
+    ///
+    /// Fails with `EINVAL` if the vma is a mixed map (see [`VmaNew::set_mixedmap`]), or if the
+    /// range isn't page aligned or doesn't fit in the vma.
+    pub fn io_remap_writecombine(&self, offset: usize, phys: PhysAddr, size: usize) -> Result {
+        if self.flags() & flags::MIXEDMAP != 0 {
+            return Err(EINVAL);
+        }
+        let phys = usize::try_from(phys).map_err(|_| EINVAL)?;
+        if (offset | phys | size) & (PAGE_SIZE - 1) != 0 {
+            return Err(EINVAL);
+        }
+        let start = self.start().checked_add(offset).ok_or(EINVAL)?;
+        if start.checked_add(size).ok_or(EINVAL)? > self.end() {
+            return Err(EINVAL);
+        }
+
+        // SAFETY: The vma is undergoing initial setup, so it's not shared, and `VmaNew` is `!Sync`:
+        // this is not a data race.
+        unsafe {
+            let vma = self.as_ptr();
+            (*vma).vm_page_prot = bindings::pgprot_writecombine((*vma).vm_page_prot);
+        }
+
+        // SAFETY: The vma is undergoing initial setup, and `start..start + size` is in it. Mapping
+        // PFNs makes it `VM_PFNMAP`, which is valid as it isn't `VM_MIXEDMAP`.
+        to_result(unsafe {
+            bindings::io_remap_pfn_range(
+                self.as_ptr(),
+                start,
+                phys >> PAGE_SHIFT,
+                size,
+                (*self.as_ptr()).vm_page_prot,
+            )
+        })
     }
 
     /// Set the `VM_IO` flag on this vma.

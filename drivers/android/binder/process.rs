@@ -1785,7 +1785,7 @@ impl Process {
 
         vma.try_clear_maywrite().map_err(|_| EPERM)?;
         vma.set_dontcopy();
-        vma.set_mixedmap();
+        vma.set_mixedmap()?;
 
         // TODO: Set ops. We need to learn when the user unmaps so that we can stop using it.
         this.create_mapping(vma)

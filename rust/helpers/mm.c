@@ -48,3 +48,15 @@ __rust_helper void rust_helper_vma_end_read(struct vm_area_struct *vma)
 {
 	vma_end_read(vma);
 }
+
+__rust_helper pgprot_t rust_helper_pgprot_writecombine(pgprot_t prot)
+{
+	return pgprot_writecombine(prot);
+}
+
+__rust_helper int rust_helper_io_remap_pfn_range(struct vm_area_struct *vma,
+						 unsigned long addr, unsigned long pfn,
+						 unsigned long size, pgprot_t prot)
+{
+	return io_remap_pfn_range(vma, addr, pfn, size, prot);
+}
