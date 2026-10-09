@@ -479,6 +479,7 @@ TEST_F(nova, vm_keeps_objects)
  * (copy), clc797.h (3D) and cla140.h (inline-to-memory), as Mesa ships them.
  */
 #define NVC56F_SET_OBJECT			0x0000
+#define NVC56F_SEM_ADDR_LO			0x005c
 #define NVC7B5_LAUNCH_DMA			0x0300
 #define NVC7B5_OFFSET_OUT_UPPER			0x0408
 #define NVC7B5_PITCH_IN				0x0410
@@ -488,6 +489,11 @@ TEST_F(nova, vm_keeps_objects)
 #define NVA140_LAUNCH_DMA			0x01b0
 #define NVA140_LOAD_INLINE_DATA			0x01b4
 
+/*
+ * NVC56F_SEM_EXECUTE: wait for a 32-bit semaphore to hold the payload, letting
+ * other channels run meanwhile.
+ */
+#define SEM_ACQUIRE		(0x0 | 1 << 12 | 0 << 24)
 /* NVC7B5_SET_REMAP_COMPONENTS: constant A as a single 4-byte component. */
 #define REMAP_FILL_32		(0x4 | 0x3 << 16 | 0x0 << 24)
 /*
@@ -1072,6 +1078,64 @@ TEST_F(nova, exec_queue)
 	EXPECT_EQ(0, nova_channel_destroy(self->fd, channel));
 	mapped_bo_destroy(self->fd, &push);
 	mapped_bo_destroy(self->fd, &dst);
+}
+
+/*
+ * Work that makes no progress fails: its fences signal once the watchdog
+ * gives up on it, and the channel runs no more work. Other channels still do.
+ */
+TEST_F(nova, exec_hang)
+{
+	struct drm_nova_info_graphics gr = graphics_info(self->fd);
+	struct drm_nova_sync sig = { .flags = DRM_NOVA_SYNC_SYNCOBJ };
+	struct drm_nova_exec_push exec;
+	struct mapped_bo push, sem;
+	struct timespec start, end;
+	int channel, other;
+	long ms;
+	__u32 *p;
+
+	ASSERT_EQ(0, nova_vm_init(self->fd, KERNEL_START, KERNEL_SIZE));
+	mapped_bo_create(_metadata, self->fd, &push, 4096, 0, PUSH_VA);
+	mapped_bo_create(_metadata, self->fd, &sem, 4096, 0, DST_VA);
+	channel = nova_channel_create(self->fd, DRM_NOVA_ENGINE_COPY);
+	ASSERT_LE(0, channel);
+	sig.handle = syncobj_create(self->fd);
+	ASSERT_LT(0, sig.handle);
+
+	/* Wait for the semaphore to hold 1: it holds 0, and nothing releases it. */
+	p = push.map;
+	*p++ = mthd(0, NVC56F_SEM_ADDR_LO, 5);
+	*p++ = (__u32)DST_VA;
+	*p++ = DST_VA >> 32;
+	*p++ = 1;
+	*p++ = 0;
+	*p++ = SEM_ACQUIRE;
+	exec = (struct drm_nova_exec_push){ .va = PUSH_VA, .range = (p - push.map) * 4 };
+
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	ASSERT_EQ(0, nova_exec_sync(self->fd, channel, &exec, 1, NULL, 0, &sig, 1));
+	ASSERT_EQ(0, syncobj_wait(self->fd, sig.handle, 0, 20000));
+	clock_gettime(CLOCK_MONOTONIC, &end);
+	ms = (end.tv_sec - start.tv_sec) * 1000 + (end.tv_nsec - start.tv_nsec) / 1000000;
+	TH_LOG("hung work failed after %ld ms", ms);
+	EXPECT_LE(4000, ms);
+	EXPECT_EQ(-ENODEV, nova_exec(self->fd, channel, &exec, 1));
+	EXPECT_EQ(0, nova_channel_destroy(self->fd, channel));
+
+	other = nova_channel_create(self->fd, DRM_NOVA_ENGINE_COPY);
+	ASSERT_LE(0, other);
+	exec = (struct drm_nova_exec_push){
+		.va = PUSH_VA,
+		.range = 4 * push_copy_fill(push.map, gr.class_copy, DST_VA, 4096, 0xa11ae),
+	};
+	ASSERT_EQ(0, nova_exec_wait(self->fd, other, &exec, 1));
+	EXPECT_EQ(-1, find_not(sem.map, 4096, 0xa11ae));
+
+	syncobj_destroy(self->fd, sig.handle);
+	EXPECT_EQ(0, nova_channel_destroy(self->fd, other));
+	mapped_bo_destroy(self->fd, &push);
+	mapped_bo_destroy(self->fd, &sem);
 }
 
 TEST_F(nova, exec_invalid)
