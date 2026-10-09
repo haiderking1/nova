@@ -30,6 +30,10 @@ impl<T> ::core::fmt::Debug for __IncompleteArrayField<T> {
         fmt.write_str("__IncompleteArrayField")
     }
 }
+pub const NV0080_CTRL_GR_INFO_MAX_SIZE: u32 = 58;
+pub const NV2080_CTRL_GR_INFO_INDEX_SM_VERSION: u32 = 12;
+pub const NV2080_CTRL_GR_INFO_INDEX_MAX_WARPS_PER_SM: u32 = 13;
+pub const NV2080_CTRL_GR_INFO_INDEX_LITTER_NUM_SM_PER_TPC: u32 = 32;
 pub const NV2080_CTRL_GPU_SET_POWER_STATE_GPU_LEVEL_0: u32 = 0;
 pub const NV2080_CTRL_GPU_SET_POWER_STATE_GPU_LEVEL_3: u32 = 3;
 pub const NV2080_CTRL_GPU_SET_POWER_STATE_GPU_LEVEL_7: u32 = 7;
@@ -47,12 +51,16 @@ pub const NV2080_CTRL_CMD_GPU_PROMOTE_CTX: u32 = 545259819;
 pub const NV2080_CTRL_GPU_INITIALIZE_CTX_APERTURE_VIDMEM: u32 = 0;
 pub const NV2080_CTRL_GPU_INITIALIZE_CTX_APERTURE_COH_SYS: u32 = 1;
 pub const NV2080_CTRL_GPU_INITIALIZE_CTX_GPU_CACHEABLE_NO: u32 = 1;
+pub const NV2080_CTRL_CMD_GPU_GET_FERMI_GPC_INFO: u32 = 545259831;
+pub const NV2080_CTRL_CMD_GPU_GET_FERMI_TPC_INFO: u32 = 545259832;
 pub const NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE: u32 = 545263890;
 pub const NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_MAX_ENTRIES: u32 = 32;
 pub const NV0073_CTRL_CMD_SYSTEM_GET_NUM_HEADS: u32 = 7536898;
 pub const NV0073_CTRL_CMD_SYSTEM_GET_ACTIVE: u32 = 7536908;
 pub const NV90F1_CTRL_CMD_VASPACE_COPY_SERVER_RESERVED_PDES: u32 = 2431713542;
 pub const NV2080_CTRL_CMD_INTERNAL_DISPLAY_GET_STATIC_INFO: u32 = 545262081;
+pub const NV2080_CTRL_INTERNAL_GR_MAX_ENGINES: u32 = 8;
+pub const NV2080_CTRL_CMD_INTERNAL_STATIC_KGR_GET_INFO: u32 = 545262122;
 pub const NV2080_CTRL_CMD_INTERNAL_STATIC_KGR_GET_CONTEXT_BUFFERS_INFO: u32 = 545262130;
 pub const NV2080_CTRL_CMD_INTERNAL_DISPLAY_WRITE_INST_MEM: u32 = 545262153;
 pub const NV2080_CTRL_CMD_INTERNAL_DISPLAY_CHANNEL_PUSHBUFFER: u32 = 545262168;
@@ -230,6 +238,8 @@ pub const MC_ENGINE_IDX_DISP: u32 = 2;
 pub const NV0073_CTRL_CMD_DP_GET_LINK_CONFIG: u32 = 7541600;
 pub const NV0073_CTRL_CMD_DP_CONFIG_STREAM: u32 = 7541602;
 pub const NV0073_CTRL_CMD_DP_SET_MANUAL_DISPLAYPORT: u32 = 7541605;
+pub const FERMI_TWOD_A: u32 = 36909;
+pub const KEPLER_INLINE_TO_MEMORY_B: u32 = 41280;
 pub type __u8 = ffi::c_uchar;
 pub type __u16 = ffi::c_ushort;
 pub type __u32 = ffi::c_uint;
@@ -736,6 +746,17 @@ pub struct NV2080_CTRL_GPU_PROMOTE_CTX_PARAMS {
     pub promoteEntry: [NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ENTRY; 16usize],
 }
 #[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV2080_CTRL_GPU_GET_FERMI_GPC_INFO_PARAMS {
+    pub gpcMask: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV2080_CTRL_GPU_GET_FERMI_TPC_INFO_PARAMS {
+    pub gpcId: u32_,
+    pub tpcMask: u32_,
+}
+#[repr(C)]
 #[derive(Debug, Copy, Clone, MaybeZeroable)]
 pub struct NV2080_CTRL_GPU_GET_GID_INFO_PARAMS {
     pub index: u32_,
@@ -822,6 +843,42 @@ pub struct NV2080_CTRL_INTERNAL_DISPLAY_GET_STATIC_INFO_PARAMS {
     pub __bindgen_padding_1: [u8; 2usize],
     pub numDispChannels: u32_,
 }
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV2080_CTRL_INTERNAL_GR_INFO {
+    pub index: u32_,
+    pub data: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone, MaybeZeroable)]
+pub struct NV2080_CTRL_INTERNAL_STATIC_GR_INFO {
+    pub infoList: [NV2080_CTRL_INTERNAL_GR_INFO; 58usize],
+}
+impl Default for NV2080_CTRL_INTERNAL_STATIC_GR_INFO {
+    fn default() -> Self {
+        let mut s = ::core::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::core::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone, MaybeZeroable)]
+pub struct NV2080_CTRL_INTERNAL_STATIC_GR_GET_INFO_PARAMS {
+    pub engineInfo: [NV2080_CTRL_INTERNAL_STATIC_GR_INFO; 8usize],
+}
+impl Default for NV2080_CTRL_INTERNAL_STATIC_GR_GET_INFO_PARAMS {
+    fn default() -> Self {
+        let mut s = ::core::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::core::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+pub type NV2080_CTRL_INTERNAL_STATIC_KGR_GET_INFO_PARAMS =
+    NV2080_CTRL_INTERNAL_STATIC_GR_GET_INFO_PARAMS;
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
 pub struct NV2080_CTRL_INTERNAL_ENGINE_CONTEXT_BUFFER_INFO {

@@ -30,8 +30,11 @@ use crate::{
         cmdq::Cmdq,
         rm::{
             commands::{
+                GpuGetGpcMask,
+                GpuGetTpcMask,
                 GpuPromoteCtx,
                 GrGetContextBuffersInfo,
+                GrGetInfo,
                 RmControl, //
             },
             device::RmDevice,
@@ -52,6 +55,8 @@ use crate::{
 use super::{
     gpfifo::Channel,
     hal::{
+        channel_hal,
+        Classes,
         Grid,
         Release, //
     },
@@ -219,9 +224,65 @@ fn promote(
 /// The context of the graphics engine: the layout of its context buffers, and the global ones.
 ///
 /// GSP-RM has built the golden context, which channels' contexts start from.
+/// What the graphics engine is made of and which classes its channels have, as userspace drivers
+/// need to know to build work for it.
+#[derive(Clone, Copy, Debug)]
+pub struct GraphicsInfo {
+    /// Major version of the shader instruction set, as the 8 of `sm_86`.
+    pub sm_major: u8,
+    /// Minor version of the shader instruction set, as the 6 of `sm_86`.
+    pub sm_minor: u8,
+    /// Number of enabled GPCs.
+    pub gpcs: u32,
+    /// Number of enabled TPCs, of all GPCs.
+    pub tpcs: u32,
+    /// Number of SMs of a TPC.
+    pub sms_per_tpc: u32,
+    /// Number of warps an SM runs at most at once.
+    pub max_warps_per_sm: u32,
+    /// Classes of the channels and of the engine objects on them.
+    pub classes: Classes,
+}
+
+impl GraphicsInfo {
+    /// Queries what GSP-RM reports about the graphics engine: the enabled GPCs and TPCs, like
+    /// nouveau, and the SMs, from the static information kernel RM loads.
+    fn query(
+        dev: &device::Device,
+        cmdq: &Cmdq<'_>,
+        chipset: Chipset,
+        internal: &InternalHandles,
+    ) -> Result<Self> {
+        let hal = channel_hal(chipset).ok_or(ENOTSUPP)?;
+        let gpc_mask = RmControl::new(internal.client, internal.subdevice, GpuGetGpcMask::new())
+            .send(dev, cmdq)?;
+        let mut tpcs = 0;
+        for gpc in (0..u32::BITS).filter(|gpc| gpc_mask & 1 << gpc != 0) {
+            let tpc_mask =
+                RmControl::new(internal.client, internal.subdevice, GpuGetTpcMask::new(gpc))
+                    .send(dev, cmdq)?;
+            tpcs += tpc_mask.count_ones();
+        }
+        let sms = RmControl::new(internal.client, internal.subdevice, GrGetInfo::new())
+            .send(dev, cmdq)?;
+
+        Ok(Self {
+            sm_major: sms.sm_version.0,
+            sm_minor: sms.sm_version.1,
+            gpcs: gpc_mask.count_ones(),
+            tpcs,
+            sms_per_tpc: sms.sms_per_tpc,
+            max_warps_per_sm: sms.max_warps_per_sm,
+            classes: hal.classes(),
+        })
+    }
+}
+
 pub(crate) struct GrContext<'a> {
     /// The graphics engine.
     engine: EngineInfo,
+    /// What the graphics engine is made of.
+    info: GraphicsInfo,
     /// Layouts of the context buffers of [`GR_CONTEXT_BUFFERS`], in order.
     layouts: KVec<Layout>,
     /// The global context buffers of [`GR_CONTEXT_BUFFERS`], in order, and `None` for the
@@ -247,6 +308,18 @@ impl<'a> GrContext<'a> {
         engine: EngineInfo,
         golden_chid: u32,
     ) -> Result<Self> {
+        let info = GraphicsInfo::query(dev, cmdq, chipset, internal)?;
+        dev_info!(
+            dev,
+            "gr: SM {}.{}, {} GPCs, {} TPCs of {} SMs, {} warps per SM\n",
+            info.sm_major,
+            info.sm_minor,
+            info.gpcs,
+            info.tpcs,
+            info.sms_per_tpc,
+            info.max_warps_per_sm
+        );
+
         let infos = RmControl::new(
             internal.client,
             internal.subdevice,
@@ -284,6 +357,7 @@ impl<'a> GrContext<'a> {
 
         let context = Self {
             engine,
+            info,
             layouts,
             globals,
             unrestricted_priv_access_map: unrestricted,
@@ -291,6 +365,11 @@ impl<'a> GrContext<'a> {
         context.build_golden(dev, cmdq, mm, chipset, rm, golden_chid)?;
 
         Ok(context)
+    }
+
+    /// Returns what the graphics engine is made of.
+    pub(crate) fn info(&self) -> &GraphicsInfo {
+        &self.info
     }
 
     /// Has GSP-RM build the golden context, on a channel `chid` given all the context buffers.

@@ -31,7 +31,10 @@ use crate::{
     bounded_enum,
     channel::{
         self,
-        gr::GrContext, //
+        gr::{
+            GrContext,
+            GraphicsInfo, //
+        },
     },
     display::mode::HeadRaster,
     display::{
@@ -1158,6 +1161,13 @@ impl<'gpu> Gpu<'gpu> {
         let dev = self.gsp_resources.device.as_ref();
 
         display.edid(dev, &self.gsp_resources.gsp.cmdq, output)
+    }
+
+    /// Returns what the graphics engine is made of and which classes its channels have.
+    ///
+    /// Fails with `ENODEV` if the graphics engine isn't set up.
+    pub(crate) fn graphics_info(&self) -> Result<GraphicsInfo> {
+        self.gr.as_ref().map(|gr| *gr.info()).ok_or(ENODEV)
     }
 
     /// Runs self-tests on the constructed [`Gpu`], logging failures without failing probe.

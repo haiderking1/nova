@@ -39,6 +39,7 @@ pub(crate) use fw::{
         GrContextBuffer,
         PromoteEntry,
         PromoteInit,
+        RmObjectClass,
         ServerReservedLevel,
         DISP_PUSHBUFFER_SIZE,
         GR_CONTEXT_BUFFERS,

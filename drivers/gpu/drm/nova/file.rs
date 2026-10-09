@@ -82,6 +82,39 @@ impl GpuInfo {
 // SAFETY: `GpuInfo` has no interior mutability, and there are no uninitialized bytes.
 unsafe impl AsBytes for GpuInfo {}
 
+/// Graphics engine information returned to userspace.
+#[repr(transparent)]
+struct GraphicsInfo(uapi::drm_nova_info_graphics);
+
+impl GraphicsInfo {
+    /// Collects the graphics engine information reported to userspace.
+    ///
+    /// Fails with [`ENODEV`] if the graphics engine isn't set up.
+    fn new(reg_data: &DrmRegData<'_>) -> Result<Self> {
+        let info = reg_data.api.with(|api| api.graphics_info())?;
+
+        Ok(Self(uapi::drm_nova_info_graphics {
+            sm_major: info.sm_major,
+            sm_minor: info.sm_minor,
+            gpc_count: info.gpcs,
+            tpc_count: info.tpcs,
+            sm_per_tpc: info.sms_per_tpc,
+            max_warps_per_sm: info.max_warps_per_sm,
+            class_gpfifo: info.classes.gpfifo,
+            class_copy: info.classes.copy,
+            class_2d: info.classes.two_d,
+            class_3d: info.classes.three_d,
+            class_m2mf: info.classes.inline_to_memory,
+            class_compute: info.classes.compute,
+            ..pin_init::zeroed()
+        }))
+    }
+}
+
+// SAFETY: `GraphicsInfo` has no interior mutability, and there are no uninitialized bytes: its
+// fields leave no padding.
+unsafe impl AsBytes for GraphicsInfo {}
+
 fn write_info<T: AsBytes>(info: &mut uapi::drm_nova_info, value: T) -> Result {
     // A NULL data pointer requests the size of the information structure.
     if info.data == 0 {
@@ -146,6 +179,7 @@ impl File {
     ) -> Result<u32> {
         match info.id {
             uapi::DRM_NOVA_INFO_GPU => write_info(info, GpuInfo::new(reg_data)?)?,
+            uapi::DRM_NOVA_INFO_GRAPHICS => write_info(info, GraphicsInfo::new(reg_data)?)?,
             _ => return Err(EINVAL),
         }
 

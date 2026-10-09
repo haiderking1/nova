@@ -16,6 +16,10 @@ use kernel::{
 };
 
 pub use crate::{
+    channel::{
+        gr::GraphicsInfo,
+        hal::Classes, //
+    },
     display::{
         ModeTimings,
         PresentMode,
@@ -169,6 +173,13 @@ impl NovaCoreApi<'_> {
         let bar1 = driver::bar1_resource_index(self.pdev)?;
 
         self.pdev.resource_len(bar1)
+    }
+
+    /// Returns what the graphics engine is made of and which classes its channels have.
+    ///
+    /// Fails with `ENODEV` if the graphics engine isn't set up.
+    pub fn graphics_info(&self) -> Result<GraphicsInfo> {
+        self.gpu.graphics_info()
     }
 }
 

@@ -1046,6 +1046,65 @@ rm_control!(
     |p| p.display_vector()
 );
 
+/// RM control command querying the mask of the enabled GPCs, sent to GSP-RM's internal subdevice.
+pub(crate) struct GpuGetGpcMask(GpcInfoParams);
+
+impl GpuGetGpcMask {
+    /// Creates the command.
+    pub(crate) fn new() -> Self {
+        Self(GpcInfoParams::new())
+    }
+}
+
+rm_control!(
+    GpuGetGpcMask,
+    Subdevice,
+    GpuGetFermiGpcInfo,
+    GpcInfoParams,
+    u32,
+    |p| p.gpc_mask()
+);
+
+/// RM control command querying the mask of the enabled TPCs of a GPC, sent to GSP-RM's internal
+/// subdevice.
+pub(crate) struct GpuGetTpcMask(TpcInfoParams);
+
+impl GpuGetTpcMask {
+    /// Creates the command for the GPC `gpc`.
+    pub(crate) fn new(gpc: u32) -> Self {
+        Self(TpcInfoParams::new(gpc))
+    }
+}
+
+rm_control!(
+    GpuGetTpcMask,
+    Subdevice,
+    GpuGetFermiTpcInfo,
+    TpcInfoParams,
+    u32,
+    |p| p.tpc_mask()
+);
+
+/// RM control command querying the static information of the graphics engines, sent to GSP-RM's
+/// internal subdevice.
+pub(crate) struct GrGetInfo(GrInfoParams);
+
+impl GrGetInfo {
+    /// Creates the command.
+    pub(crate) fn new() -> Self {
+        Self(GrInfoParams::new())
+    }
+}
+
+rm_control!(
+    GrGetInfo,
+    Subdevice,
+    InternalStaticKgrGetInfo,
+    GrInfoParams,
+    GrStaticInfo,
+    |p| p.info().ok_or(EINVAL)?
+);
+
 /// RM control command for querying the configuration of the link of a DisplayPort display.
 pub(crate) struct DpGetLinkConfig(DpGetLinkConfigParams);
 

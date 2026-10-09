@@ -188,6 +188,90 @@ struct drm_nova_info_gpu {
 	__u8 gpu_gid[16];
 };
 
+/**
+ * DRM_NOVA_INFO_GRAPHICS
+ *
+ * Query what the graphics engine is made of, and the classes of the channels
+ * and of the engine objects on them that userspace builds work for. The result
+ * is returned in a &struct drm_nova_info_graphics.
+ *
+ * Fails with -ENODEV if the graphics engine isn't available.
+ */
+#define DRM_NOVA_INFO_GRAPHICS		0x01
+
+/**
+ * struct drm_nova_info_graphics - graphics engine information
+ */
+struct drm_nova_info_graphics {
+	/**
+	 * @sm_major: Major version of the shader instruction set, as the 8 of
+	 * sm_86.
+	 */
+	__u8 sm_major;
+
+	/**
+	 * @sm_minor: Minor version of the shader instruction set, as the 6 of
+	 * sm_86.
+	 */
+	__u8 sm_minor;
+
+	/**
+	 * @pad: 16 bit padding, 0.
+	 */
+	__u16 pad;
+
+	/**
+	 * @gpc_count: Number of enabled GPCs.
+	 */
+	__u32 gpc_count;
+
+	/**
+	 * @tpc_count: Number of enabled TPCs, of all GPCs.
+	 */
+	__u32 tpc_count;
+
+	/**
+	 * @sm_per_tpc: Number of SMs of a TPC.
+	 */
+	__u32 sm_per_tpc;
+
+	/**
+	 * @max_warps_per_sm: Number of warps an SM runs at most at once.
+	 */
+	__u32 max_warps_per_sm;
+
+	/**
+	 * @class_gpfifo: Class of the GPFIFO channels.
+	 */
+	__u32 class_gpfifo;
+
+	/**
+	 * @class_copy: Class of the copy engine objects.
+	 */
+	__u32 class_copy;
+
+	/**
+	 * @class_2d: Class of the 2D engine objects.
+	 */
+	__u32 class_2d;
+
+	/**
+	 * @class_3d: Class of the 3D engine objects.
+	 */
+	__u32 class_3d;
+
+	/**
+	 * @class_m2mf: Class of the inline-to-memory engine objects, which write
+	 * data from the push buffer to memory.
+	 */
+	__u32 class_m2mf;
+
+	/**
+	 * @class_compute: Class of the compute engine objects.
+	 */
+	__u32 class_compute;
+};
+
 #define DRM_NOVA_INFO			0x00
 #define DRM_NOVA_GEM_CREATE		0x01
 #define DRM_NOVA_GEM_INFO		0x02

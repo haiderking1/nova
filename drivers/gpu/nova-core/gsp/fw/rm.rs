@@ -63,6 +63,12 @@ pub(crate) enum RmControlMsgFunction {
     VaspaceCopyServerReservedPdes = bindings::NV90F1_CTRL_CMD_VASPACE_COPY_SERVER_RESERVED_PDES,
     /// Get the interrupt vectors of the units whose interrupts the CPU services.
     InternalIntrGetKernelTable = bindings::NV2080_CTRL_CMD_INTERNAL_INTR_GET_KERNEL_TABLE,
+    /// Get the mask of the enabled GPCs.
+    GpuGetFermiGpcInfo = bindings::NV2080_CTRL_CMD_GPU_GET_FERMI_GPC_INFO,
+    /// Get the mask of the enabled TPCs of a GPC.
+    GpuGetFermiTpcInfo = bindings::NV2080_CTRL_CMD_GPU_GET_FERMI_TPC_INFO,
+    /// Get the static information of the graphics engines.
+    InternalStaticKgrGetInfo = bindings::NV2080_CTRL_CMD_INTERNAL_STATIC_KGR_GET_INFO,
 }
 
 // TODO[FPRI]: This is a temporary solution to be replaced with the corresponding derive macros
@@ -107,6 +113,11 @@ impl TryFrom<u32> for RmControlMsgFunction {
             }
             bindings::NV2080_CTRL_CMD_INTERNAL_INTR_GET_KERNEL_TABLE => {
                 Ok(Self::InternalIntrGetKernelTable)
+            }
+            bindings::NV2080_CTRL_CMD_GPU_GET_FERMI_GPC_INFO => Ok(Self::GpuGetFermiGpcInfo),
+            bindings::NV2080_CTRL_CMD_GPU_GET_FERMI_TPC_INFO => Ok(Self::GpuGetFermiTpcInfo),
+            bindings::NV2080_CTRL_CMD_INTERNAL_STATIC_KGR_GET_INFO => {
+                Ok(Self::InternalStaticKgrGetInfo)
             }
             _ => Err(EINVAL),
         }
@@ -192,6 +203,11 @@ pub(crate) enum RmObjectClass {
     ThreeDAmpereB = bindings::AMPERE_B,
     /// A compute object of GA10x GPUs (but GA100), child of a channel on the graphics engine.
     ComputeAmpereB = bindings::AMPERE_COMPUTE_B,
+    /// A 2D object, child of a channel on the graphics engine.
+    TwoDFermiA = bindings::FERMI_TWOD_A,
+    /// An inline-to-memory object, which writes data from its push buffer to memory, child of a
+    /// channel on the graphics engine.
+    InlineToMemoryKeplerB = bindings::KEPLER_INLINE_TO_MEMORY_B,
 }
 
 impl From<RmObjectClass> for u32 {
@@ -929,6 +945,109 @@ unsafe impl FromBytes for IntrKernelTableParams {}
 
 // SAFETY: Padding is explicit and will not contain uninitialized data.
 unsafe impl AsBytes for IntrKernelTableParams {}
+
+/// Parameters of `NV2080_CTRL_CMD_GPU_GET_FERMI_GPC_INFO`: the mask of the enabled GPCs.
+#[repr(transparent)]
+pub(crate) struct GpcInfoParams(bindings::NV2080_CTRL_GPU_GET_FERMI_GPC_INFO_PARAMS);
+
+impl GpcInfoParams {
+    /// Creates the parameters, all filled in by GSP-RM.
+    pub(crate) fn new() -> Self {
+        Self(Default::default())
+    }
+
+    /// Returns the mask of the enabled GPCs, one bit per GPC ID.
+    pub(crate) fn gpc_mask(&self) -> u32 {
+        self.0.gpcMask
+    }
+}
+
+// SAFETY: This struct only contains integer types for which all bit patterns are valid.
+unsafe impl FromBytes for GpcInfoParams {}
+
+// SAFETY: This struct only contains integer types, without padding.
+unsafe impl AsBytes for GpcInfoParams {}
+
+/// Parameters of `NV2080_CTRL_CMD_GPU_GET_FERMI_TPC_INFO`: the mask of the enabled TPCs of a GPC.
+#[repr(transparent)]
+pub(crate) struct TpcInfoParams(bindings::NV2080_CTRL_GPU_GET_FERMI_TPC_INFO_PARAMS);
+
+impl TpcInfoParams {
+    /// Creates the parameters querying the TPCs of the GPC `gpc`.
+    pub(crate) fn new(gpc: u32) -> Self {
+        Self(bindings::NV2080_CTRL_GPU_GET_FERMI_TPC_INFO_PARAMS {
+            gpcId: gpc,
+            ..Default::default()
+        })
+    }
+
+    /// Returns the mask of the enabled TPCs of the GPC, one bit per TPC ID: 0 if the GPC isn't
+    /// enabled.
+    pub(crate) fn tpc_mask(&self) -> u32 {
+        self.0.tpcMask
+    }
+}
+
+// SAFETY: This struct only contains integer types for which all bit patterns are valid.
+unsafe impl FromBytes for TpcInfoParams {}
+
+// SAFETY: This struct only contains integer types, without padding.
+unsafe impl AsBytes for TpcInfoParams {}
+
+/// What the graphics engine's static information says about its SMs.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GrStaticInfo {
+    /// Version of the shader instruction set, as major and minor numbers.
+    pub(crate) sm_version: (u8, u8),
+    /// Number of warps an SM runs at most at once.
+    pub(crate) max_warps_per_sm: u32,
+    /// Number of SMs of a TPC.
+    pub(crate) sms_per_tpc: u32,
+}
+
+/// Parameters of `NV2080_CTRL_CMD_INTERNAL_STATIC_KGR_GET_INFO`: the static information of the
+/// graphics engines, which kernel RM loads once (`kgraphicsLoadStaticInfo`).
+#[repr(transparent)]
+pub(crate) struct GrInfoParams(bindings::NV2080_CTRL_INTERNAL_STATIC_KGR_GET_INFO_PARAMS);
+
+impl GrInfoParams {
+    /// Creates the parameters, all filled in by GSP-RM.
+    pub(crate) fn new() -> Self {
+        Self(Default::default())
+    }
+
+    /// Returns the information `index` (`NV2080_CTRL_GR_INFO_INDEX_*`) of the first graphics
+    /// engine. The list is indexed by it, as kernel RM reads it.
+    fn value(&self, index: u32) -> Option<u32> {
+        self.0
+            .engineInfo
+            .first()?
+            .infoList
+            .get(usize::try_from(index).ok()?)
+            .map(|info| info.data)
+    }
+
+    /// Returns what the information says about the SMs, if it has all of it.
+    pub(crate) fn info(&self) -> Option<GrStaticInfo> {
+        // `NV2080_CTRL_GR_INFO_SM_VERSION_*`: the major number in bits 15:8, the minor in 7:0.
+        let version = self.value(bindings::NV2080_CTRL_GR_INFO_INDEX_SM_VERSION)?;
+
+        Some(GrStaticInfo {
+            sm_version: (
+                u8::try_from(version >> 8).ok()?,
+                u8::try_from(version & 0xff).ok()?,
+            ),
+            max_warps_per_sm: self.value(bindings::NV2080_CTRL_GR_INFO_INDEX_MAX_WARPS_PER_SM)?,
+            sms_per_tpc: self.value(bindings::NV2080_CTRL_GR_INFO_INDEX_LITTER_NUM_SM_PER_TPC)?,
+        })
+    }
+}
+
+// SAFETY: This struct only contains integer types for which all bit patterns are valid.
+unsafe impl FromBytes for GrInfoParams {}
+
+// SAFETY: This struct only contains integer types, without padding.
+unsafe impl AsBytes for GrInfoParams {}
 
 /// Memory of a GPFIFO channel, which the client allocates for GSP-RM to set up.
 pub(crate) struct ChannelMemory {

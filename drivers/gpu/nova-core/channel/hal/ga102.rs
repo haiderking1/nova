@@ -35,7 +35,7 @@ use crate::{
             AllocThreeDAmpereB,
             RmAlloc, //
         },
-        EngineInfo,
+        EngineInfo, RmObjectClass,
     },
     regs,
 };
@@ -43,6 +43,7 @@ use crate::{
 use super::{
     super::gpfifo::Channel,
     ChannelHal,
+    Classes,
     GpEntry,
     GpfifoAlloc,
     Grid,
@@ -62,6 +63,17 @@ struct Ga102;
 pub(super) const GA102_HAL: &dyn ChannelHal = &Ga102;
 
 impl ChannelHal for Ga102 {
+    fn classes(&self) -> Classes {
+        Classes {
+            gpfifo: RmObjectClass::ChannelGpfifoAmpere.into(),
+            copy: RmObjectClass::CopyEngineAmpereB.into(),
+            two_d: RmObjectClass::TwoDFermiA.into(),
+            three_d: RmObjectClass::ThreeDAmpereB.into(),
+            inline_to_memory: RmObjectClass::InlineToMemoryKeplerB.into(),
+            compute: RmObjectClass::ComputeAmpereB.into(),
+        }
+    }
+
     fn alloc_gpfifo(
         &self,
         dev: &device::Device,

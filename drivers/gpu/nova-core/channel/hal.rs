@@ -67,7 +67,28 @@ pub(crate) struct Release {
     pub(crate) payload: u32,
 }
 
+/// Classes of the channels and of the engine objects allocated on them.
+#[derive(Clone, Copy, Debug)]
+pub struct Classes {
+    /// The GPFIFO channel.
+    pub gpfifo: u32,
+    /// The copy engine.
+    pub copy: u32,
+    /// The 2D engine, on channels on the graphics engine.
+    pub two_d: u32,
+    /// The 3D engine, on channels on the graphics engine.
+    pub three_d: u32,
+    /// The inline-to-memory engine, writing data from the push buffer to memory, on channels on
+    /// the graphics engine.
+    pub inline_to_memory: u32,
+    /// The compute engine, on channels on the graphics engine.
+    pub compute: u32,
+}
+
 pub(crate) trait ChannelHal: Sync {
+    /// The classes of the channels and of the engine objects allocated on them.
+    fn classes(&self) -> Classes;
+
     // The GPFIFO channel.
 
     /// Allocates the GPFIFO channel `handle` under `device`. GSP-RM puts it in a channel group of
