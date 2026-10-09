@@ -281,6 +281,57 @@ pub(super) mod selftest {
         Ok(())
     }
 
+    /// Test that a `u64` access moves both halves: nouveau and RM only ever access BAR0 32 bits
+    /// at a time, so check that the window takes 64-bit accesses whole, in both directions.
+    fn test_u64_halves(
+        dev: &device::Device<device::Bound>,
+        pramin: &mut Pramin<'_>,
+        base: VramAddress,
+    ) -> Result {
+        let addr = base + 0x30;
+        let val: u64 = 0x1122_3344_5566_7788;
+
+        // A `u64` write, read back as two `u32`s.
+        pramin.window_at::<u32>(addr)?.view().write_val(0xffff_ffff);
+        pramin
+            .window_at::<u32>(addr + 4)?
+            .view()
+            .write_val(0xffff_ffff);
+        pramin.window_at::<u64>(addr)?.view().write_val(val);
+        selftest_assert_eq!(
+            dev,
+            pramin.window_at::<u32>(addr)?.view().read_val(),
+            0x5566_7788
+        );
+        selftest_assert_eq!(
+            dev,
+            pramin.window_at::<u32>(addr + 4)?.view().read_val(),
+            0x1122_3344
+        );
+
+        // Two `u32` writes, read back as a `u64`.
+        pramin.window_at::<u32>(addr)?.view().write_val(0x8877_6655);
+        pramin
+            .window_at::<u32>(addr + 4)?
+            .view()
+            .write_val(0x4433_2211);
+        selftest_assert_eq!(
+            dev,
+            pramin.window_at::<u64>(addr)?.view().read_val(),
+            0x4433_2211_8877_6655
+        );
+
+        // The batched writes that clear page tables, over set upper halves.
+        pramin.write_u64s(addr, &[0, val])?;
+        selftest_assert_eq!(dev, pramin.window_at::<u32>(addr + 4)?.view().read_val(), 0);
+        selftest_assert_eq!(
+            dev,
+            pramin.window_at::<u32>(addr + 12)?.view().read_val(),
+            0x1122_3344
+        );
+        Ok(())
+    }
+
     /// Test that offsets outside the VRAM region are rejected.
     fn test_invalid_offset(
         dev: &device::Device<device::Bound>,
@@ -326,6 +377,7 @@ pub(super) mod selftest {
 
         test_byte_readwrite(dev, pramin, base)?;
         test_u32_as_bytes(dev, pramin, base)?;
+        test_u64_halves(dev, pramin, base)?;
         test_window_reposition(dev, pramin, base)?;
         test_invalid_offset(dev, pramin, vram_end)?;
         test_misaligned_access(dev, pramin, base)?;
