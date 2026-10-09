@@ -5,6 +5,7 @@ use core::ops::Range;
 use kernel::{
     device,
     dma::Device,
+    dma_buf::Fence,
     fmt,
     gpu::buddy::{
         GpuBuddyAllocFlags,
@@ -23,12 +24,12 @@ use kernel::{
         SZ_4K, //
     },
     sync::{
+        aref::ARef,
         new_spinlock_irq,
         Arc,
         Mutex,
         SetOnce, //
     },
-    time::Delta,
     uapi, //
 };
 
@@ -472,9 +473,6 @@ impl<'a> GspSubtree<'a> {
 
 /// A channel of a client, until it is freed.
 type ClientChannelRef<'gpu> = Arc<Mutex<Option<ClientChannel<'gpu>>>>;
-
-/// How long the work of clients may run: much longer than a frame.
-const CLIENT_WORK_TIMEOUT: Delta = Delta::from_secs(5);
 
 /// Structure holding the resources required to operate the GPU.
 #[pin_data(PinnedDrop)]
@@ -1670,6 +1668,7 @@ impl<'gpu> Gpu<'gpu> {
             .ok_or(ENOENT)?;
 
         if let Some(mut channel) = channel.lock().take() {
+            channel.wait_idle();
             let gsp_resources = &self.gsp_resources;
             channel.free(
                 gsp_resources.device.as_ref(),
@@ -1684,12 +1683,13 @@ impl<'gpu> Gpu<'gpu> {
         Ok(())
     }
 
-    /// Runs the push buffers `pushes` on the channel `chid`, in order, and returns once they are
-    /// done.
+    /// Has the channel `chid` run the push buffers `pushes`, in order, after the work submitted
+    /// before, and returns the fence that signals once they are done.
     ///
-    /// Fails with `ETIMEDOUT` if they aren't done in [`CLIENT_WORK_TIMEOUT`], and with `ENODEV`
-    /// when work timed out on the channel before: it runs no more.
-    pub(crate) fn channel_exec(&self, chid: u32, pushes: &[PushBuffer]) -> Result {
+    /// Waits for the channel to have room, as the work submitted before completes. Fails with
+    /// `ETIMEDOUT` if it makes no progress in time, and with `ENODEV` once the channel runs no
+    /// more work.
+    pub(crate) fn channel_exec(&self, chid: u32, pushes: &[PushBuffer]) -> Result<ARef<Fence>> {
         let channel = self
             .client_channels
             .lock()
@@ -1698,21 +1698,12 @@ impl<'gpu> Gpu<'gpu> {
             .clone()
             .ok_or(ENOENT)?;
 
-        let fence = Option::as_mut(&mut *channel.lock()).ok_or(ENOENT)?.submit(
-            self.gsp_resources.bar,
-            &mut self.mm.lock(),
-            pushes,
-        )?;
+        let mut channel = channel.lock();
+        let channel = Option::as_mut(&mut *channel).ok_or(ENOENT)?;
+        // Without `mm` locked: other channels' work goes on meanwhile.
+        channel.wait_for_room(pushes.len())?;
 
-        // Without the channel locked: other work is submitted meanwhile.
-        if fence.wait_timeout(false, CLIENT_WORK_TIMEOUT)? {
-            return fence.status().map(|_| ());
-        }
-        if let Some(channel) = Option::as_mut(&mut *channel.lock()) {
-            channel.fail(ETIMEDOUT);
-        }
-
-        Err(ETIMEDOUT)
+        channel.submit(self.gsp_resources.bar, &mut self.mm.lock(), pushes)
     }
 
     /// Allocates a zeroed buffer of at least `size` bytes of system memory, which the GPU accesses

@@ -16,12 +16,14 @@
 use kernel::{
     device,
     dma_buf::Fence,
+    io::poll::read_poll_timeout,
     page::PAGE_SIZE,
     prelude::*,
     sync::{
         aref::ARef,
         Arc, //
-    }, //
+    },
+    time::Delta, //
 };
 
 use crate::{
@@ -49,7 +51,8 @@ use super::{
     gpfifo::{
         Channel,
         NewSpace,
-        GPFIFO_ENTRIES, //
+        GPFIFO_ENTRIES,
+        TAIL_SLOTS, //
     },
     gr::{
         ChannelContext,
@@ -96,6 +99,10 @@ pub enum ChannelEngine {
 /// kernel's push buffer and the one entry a full ring keeps free.
 pub const PUSH_MAX: u32 = GPFIFO_ENTRIES - 2;
 
+/// How long a channel may make no progress on the work submitted before it's considered hung: much
+/// longer than a frame.
+const PROGRESS_TIMEOUT: Delta = Delta::from_secs(5);
+
 /// A push buffer of a client.
 #[derive(Clone, Copy, Debug)]
 pub struct PushBuffer {
@@ -121,6 +128,9 @@ pub(crate) struct ClientChannel<'a> {
     fence_mapped: Option<MappedRange>,
     /// The value released by the last work submitted.
     sequence: u32,
+    /// The submissions that may still run, oldest first: the value each releases, and the number
+    /// of entries of the GPFIFO ring it takes.
+    in_flight: KVec<(u32, u32)>,
 }
 
 impl<'a> ClientChannel<'a> {
@@ -167,6 +177,7 @@ impl<'a> ClientChannel<'a> {
             timeline,
             fence_mapped: None,
             sequence: 0,
+            in_flight: KVec::new(),
         };
 
         match client.set_up(dev, cmdq, mm, rm, gr, space, copy_index) {
@@ -245,10 +256,84 @@ impl<'a> ClientChannel<'a> {
         Ok(())
     }
 
-    /// Has the channel run the push buffers `pushes`, in order, and returns the fence that
-    /// signals once they are done.
+    /// Returns the number of entries of the GPFIFO ring that submitting `pushes` push buffers
+    /// takes: theirs and the kernel's push buffer's.
+    fn ring_entries(pushes: usize) -> Result<u32> {
+        Ok(u32::try_from(pushes)?.checked_add(1).ok_or(EINVAL)?)
+    }
+
+    /// Forgets the submissions that are done.
+    fn reclaim(&mut self) {
+        let done = self.timeline.completed();
+        // Sequence numbers wrap: one is reached when it is at most 2^31 before the value.
+        self.in_flight
+            .retain(|(sequence, _)| done.wrapping_sub(*sequence) >= 1 << 31);
+    }
+
+    /// Returns whether the ring and the kernel's push buffer have room for a submission of
+    /// `entries` entries of the ring.
+    fn has_room(&self, entries: u32) -> bool {
+        let used: u32 = self.in_flight.iter().map(|(_, entries)| entries).sum();
+
+        // The ring keeps one entry free, so that a full ring isn't taken for an empty one.
+        used + entries < GPFIFO_ENTRIES && self.in_flight.len() < TAIL_SLOTS
+    }
+
+    /// Waits until the channel has room to submit `pushes` push buffers, as the work submitted
+    /// before completes.
     ///
-    /// Fails with `ENODEV` once the channel runs no more work.
+    /// Fails with `ETIMEDOUT` if the work submitted before makes no progress in time: the channel
+    /// then runs no more work. Fails with `EINVAL` if no ring could take that many.
+    pub(crate) fn wait_for_room(&mut self, pushes: usize) -> Result {
+        let entries = Self::ring_entries(pushes)?;
+        if entries >= GPFIFO_ENTRIES {
+            return Err(EINVAL);
+        }
+
+        self.reclaim();
+        if self.has_room(entries) {
+            return Ok(());
+        }
+        let result = read_poll_timeout(
+            || {
+                self.reclaim();
+                Ok(self.has_room(entries))
+            },
+            |&room| room,
+            Delta::from_micros(50),
+            PROGRESS_TIMEOUT,
+        );
+        if result.is_err() {
+            self.fail(ETIMEDOUT);
+            return Err(ETIMEDOUT);
+        }
+
+        Ok(())
+    }
+
+    /// Waits until the work submitted is done, for at most a while: the channel's work is then
+    /// considered hung, and runs no more.
+    pub(crate) fn wait_idle(&mut self) {
+        if self.timeline.failed() {
+            return;
+        }
+        let last = self.sequence;
+        let result = read_poll_timeout(
+            || Ok(self.timeline.completed()),
+            |&done| done.wrapping_sub(last) < 1 << 31,
+            Delta::from_micros(50),
+            PROGRESS_TIMEOUT,
+        );
+        if result.is_err() {
+            self.fail(ETIMEDOUT);
+        }
+    }
+
+    /// Has the channel run the push buffers `pushes`, in order, after the work submitted before,
+    /// and returns the fence that signals once they are done.
+    ///
+    /// The channel must have room, see [`ClientChannel::wait_for_room`]: fails with `EBUSY`
+    /// otherwise. Fails with `ENODEV` once the channel runs no more work.
     pub(crate) fn submit(
         &mut self,
         bar: Bar0<'_>,
@@ -256,6 +341,10 @@ impl<'a> ClientChannel<'a> {
         pushes: &[PushBuffer],
     ) -> Result<ARef<Fence>> {
         let hal = self.channel.hal();
+        let ring_entries = Self::ring_entries(pushes.len())?;
+        if !self.has_room(ring_entries) {
+            return Err(EBUSY);
+        }
 
         let mut entries: KVec<GpEntry> = KVec::with_capacity(pushes.len(), GFP_KERNEL)?;
         for push in pushes {
@@ -274,14 +363,20 @@ impl<'a> ClientChannel<'a> {
             },
         )?;
         hal.push_notify(&mut tail)?;
+        self.in_flight.reserve(1, GFP_KERNEL)?;
 
         // Before the submission, so that its notification finds the fence.
         let fence = self.timeline.add(sequence)?;
-        if let Err(err) = self.channel.submit(bar, mm, &entries, &tail) {
+        // The slot was last used by the submission `TAIL_SLOTS` before, done since there is room.
+        let slot = num::u32_as_usize(sequence) % TAIL_SLOTS;
+        if let Err(err) = self.channel.submit_queued(bar, mm, &entries, &tail, slot) {
             self.timeline.cancel(sequence, err);
             return Err(err);
         }
         self.sequence = sequence;
+        self.in_flight
+            .push_within_capacity((sequence, ring_entries))
+            .map_err(|_| ENOMEM)?;
 
         Ok(fence)
     }

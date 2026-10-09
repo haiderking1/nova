@@ -129,7 +129,7 @@ impl<'a> Timeline<'a> {
     }
 
     /// Returns the value the semaphore holds.
-    fn value(&self) -> u32 {
+    pub(crate) fn completed(&self) -> u32 {
         // SAFETY: The semaphore is the first 4 bytes of the page `semaphore` owns, which the GPU
         // writes coherently with the CPU's caches.
         unsafe { self.semaphore.as_ptr().cast::<u32>().read_volatile() }
@@ -171,7 +171,7 @@ impl<'a> Timeline<'a> {
     ///
     /// Takes no sleeping lock, for the notification interrupt's handler.
     pub(crate) fn signal_completed(&self) {
-        let value = self.value();
+        let value = self.completed();
         let mut pending = self.pending.lock();
 
         // Sequence numbers wrap: one is reached when it is at most 2^31 before the value.
@@ -200,6 +200,11 @@ impl<'a> Timeline<'a> {
                 fence.signal(Err(err));
             }
         }
+    }
+
+    /// Returns whether the channel runs no more work, see [`Timeline::fail`].
+    pub(crate) fn failed(&self) -> bool {
+        self.pending.lock().error.is_some()
     }
 
     /// Has the fences pending, and those added later, signal `err`: the channel runs no more work.

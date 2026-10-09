@@ -11,10 +11,14 @@ use core::{
 use kernel::{
     auxiliary,
     device::Bound,
+    dma_buf::Fence,
     pci,
     prelude::*,
     screen_info::PixelFormat,
-    sync::Arc,
+    sync::{
+        aref::ARef,
+        Arc, //
+    },
     types::ForLt, //
 };
 
@@ -263,12 +267,13 @@ impl NovaCoreApi<'_> {
         self.gpu.destroy_channel(vm, chid)
     }
 
-    /// Runs the push buffers `pushes` on the channel `chid`, in order, and returns once they are
-    /// done.
+    /// Has the channel `chid` run the push buffers `pushes`, in order, after the work submitted
+    /// before, and returns the fence that signals once they are done.
     ///
-    /// Fails with `ETIMEDOUT` if they take too long, and with `ENODEV` if work timed out on the
-    /// channel before: it runs no more.
-    pub fn channel_exec(&self, chid: u32, pushes: &[PushBuffer]) -> Result {
+    /// Waits for room on the channel, as the work submitted before completes. Fails with
+    /// `ETIMEDOUT` if that work makes no progress in time, and with `ENODEV` once the channel runs
+    /// no more work, such as after that.
+    pub fn channel_exec(&self, chid: u32, pushes: &[PushBuffer]) -> Result<ARef<Fence>> {
         self.gpu.channel_exec(chid, pushes)
     }
 

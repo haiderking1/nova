@@ -109,6 +109,11 @@ pub(super) const GPFIFO_ENTRIES: u32 = 1024;
 /// Offset of the semaphore the channel releases.
 const SEMAPHORE: usize = GPFIFO + num::u32_as_usize(GPFIFO_ENTRIES) * size_of::<GpEntry>();
 static_assert!(SEMAPHORE + size_of::<u32>() <= CONTROL_SIZE);
+/// Size of a slot of the push buffer, which [`Channel::submit_queued`] writes the tail of a
+/// submission to, while earlier ones may still run from other slots.
+pub(super) const TAIL_SLOT_SIZE: usize = 0x100;
+/// Number of slots of the push buffer.
+pub(super) const TAIL_SLOTS: usize = PUSH_BUFFER_SIZE / TAIL_SLOT_SIZE;
 
 /// How long work may take: much longer than any fill of a framebuffer.
 const TIMEOUT: Delta = Delta::from_secs(1);
@@ -514,12 +519,56 @@ impl<'a> Channel<'a> {
         entries: &[GpEntry],
         tail: &[u32],
     ) -> Result {
-        let control_va = self.control_va()?;
         // The ring is empty: the work submitted before is done.
+        if entries.len() + usize::from(!tail.is_empty()) >= num::u32_as_usize(GPFIFO_ENTRIES) {
+            return Err(EINVAL);
+        }
+
+        self.submit_at(bar, mm, entries, tail, PUSH_BUFFER, PUSH_BUFFER_SIZE)
+    }
+
+    /// Has the channel run the push buffers of `entries`, then the methods of `tail`, from slot
+    /// `slot` of the kernel's push buffer, after the work submitted before, and returns without
+    /// waiting for them.
+    ///
+    /// The work submitted before may still run, but the caller must make sure that the ring has
+    /// room for the entries and the tail's, and that the work last submitted from `slot` is done.
+    pub(crate) fn submit_queued(
+        &mut self,
+        bar: Bar0<'_>,
+        mm: &mut GpuMm<'_>,
+        entries: &[GpEntry],
+        tail: &[u32],
+        slot: usize,
+    ) -> Result {
+        if slot >= TAIL_SLOTS {
+            return Err(EINVAL);
+        }
+
+        self.submit_at(
+            bar,
+            mm,
+            entries,
+            tail,
+            PUSH_BUFFER + slot * TAIL_SLOT_SIZE,
+            TAIL_SLOT_SIZE,
+        )
+    }
+
+    /// Does [`Channel::submit`] with the tail at offset `tail_offset` of the control memory, in
+    /// `tail_room` bytes.
+    fn submit_at(
+        &mut self,
+        bar: Bar0<'_>,
+        mm: &mut GpuMm<'_>,
+        entries: &[GpEntry],
+        tail: &[u32],
+        tail_offset: usize,
+        tail_room: usize,
+    ) -> Result {
+        let control_va = self.control_va()?;
         let count = entries.len() + usize::from(!tail.is_empty());
-        if count >= num::u32_as_usize(GPFIFO_ENTRIES)
-            || tail.len() * size_of::<u32>() > PUSH_BUFFER_SIZE
-        {
+        if count >= num::u32_as_usize(GPFIFO_ENTRIES) || tail.len() * size_of::<u32>() > tail_room {
             return Err(EINVAL);
         }
         let control = self.control.range().start;
@@ -527,10 +576,10 @@ impl<'a> Channel<'a> {
         let mut ring = KVec::with_capacity(count, GFP_KERNEL)?;
         ring.extend_from_slice(entries, GFP_KERNEL)?;
         if !tail.is_empty() {
-            mm.write_vram(control + num::usize_as_u64(PUSH_BUFFER), tail)?;
+            mm.write_vram(control + num::usize_as_u64(tail_offset), tail)?;
             ring.push(
                 self.hal.gp_entry(
-                    control_va + num::usize_as_u64(PUSH_BUFFER),
+                    control_va + num::usize_as_u64(tail_offset),
                     u32::try_from(tail.len())?,
                     false,
                 )?,
