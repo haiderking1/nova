@@ -24,6 +24,12 @@ pub use crate::{
         VramBuffer,
         VRAM_BUFFER_ALIGN, //
     },
+    channel::client::{
+        ChannelEngine,
+        GraphicsObjects,
+        PushBuffer,
+        PUSH_MAX, //
+    },
     channel::{
         gr::GraphicsInfo,
         hal::Classes, //
@@ -242,6 +248,28 @@ impl NovaCoreApi<'_> {
     /// Tears down the `size` bytes mapped from the virtual address `addr` of `vm`.
     pub fn vm_unmap(&self, vm: &mut ClientVm, addr: u64, size: u64) -> Result {
         self.gpu.vm_unmap(vm, addr, size)
+    }
+
+    /// Allocates a channel on `engine` running in `vm`, and returns its ID.
+    ///
+    /// The channel maps its memory in the kernel range of `vm`. It must be freed with
+    /// [`NovaCoreApi::destroy_channel`] before `vm` is.
+    pub fn create_channel(&self, vm: &mut ClientVm, engine: ChannelEngine) -> Result<u32> {
+        self.gpu.create_channel(vm, engine)
+    }
+
+    /// Frees the channel `chid`, which runs in `vm`, once the work it runs is done.
+    pub fn destroy_channel(&self, vm: &mut ClientVm, chid: u32) -> Result {
+        self.gpu.destroy_channel(vm, chid)
+    }
+
+    /// Runs the push buffers `pushes` on the channel `chid`, in order, and returns once they are
+    /// done.
+    ///
+    /// Fails with `ETIMEDOUT` if they take too long, and with `ENODEV` if work timed out on the
+    /// channel before: it runs no more.
+    pub fn channel_exec(&self, chid: u32, pushes: &[PushBuffer]) -> Result {
+        self.gpu.channel_exec(chid, pushes)
     }
 
     /// Allocates a zeroed buffer of at least `size` bytes of system memory, which the GPU

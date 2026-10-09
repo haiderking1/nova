@@ -48,6 +48,7 @@ pub const NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ID_PRIV_ACCESS_MAP: u32 = 10;
 pub const NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ID_UNRESTRICTED_PRIV_ACCESS_MAP: u32 = 11;
 pub const NV2080_CTRL_GPU_PROMOTE_CONTEXT_MAX_ENTRIES: u32 = 16;
 pub const NV2080_CTRL_CMD_GPU_PROMOTE_CTX: u32 = 545259819;
+pub const NV2080_CTRL_CMD_GPU_EVICT_CTX: u32 = 545259820;
 pub const NV2080_CTRL_GPU_INITIALIZE_CTX_APERTURE_VIDMEM: u32 = 0;
 pub const NV2080_CTRL_GPU_INITIALIZE_CTX_APERTURE_COH_SYS: u32 = 1;
 pub const NV2080_CTRL_GPU_INITIALIZE_CTX_GPU_CACHEABLE_NO: u32 = 1;
@@ -94,6 +95,7 @@ pub const REGISTRY_TABLE_ENTRY_TYPE_DWORD: u32 = 1;
 pub const GSP_MSG_QUEUE_ELEMENT_SIZE_MAX: u32 = 65536;
 pub const NVA06F_CTRL_CMD_GPFIFO_SCHEDULE: u32 = 2691629315;
 pub const NVA06F_CTRL_CMD_BIND: u32 = 2691629316;
+pub const NVA06F_CTRL_CMD_STOP_CHANNEL: u32 = 2691629330;
 pub const NV0080_CTRL_CMD_DMA_SET_PAGE_DIRECTORY: u32 = 8394771;
 pub const NV0080_CTRL_DMA_SET_PAGE_DIRECTORY_FLAGS_APERTURE_VIDMEM: u32 = 0;
 pub const NV0080_CTRL_CMD_DMA_UNSET_PAGE_DIRECTORY: u32 = 8394772;
@@ -185,6 +187,12 @@ pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_STEREO_3PIN_DIN: u32 = 115;
 pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_USB_C_UHBR: u32 = 116;
 pub const NV0073_CTRL_SPECIFIC_CONNECTOR_DATA_TYPE_UNKNOWN: u32 = 4294967295;
 pub const AMPERE_CHANNEL_GPFIFO_A: u32 = 50543;
+pub const KEPLER_CHANNEL_GROUP_A: u32 = 41068;
+pub const FERMI_CONTEXT_SHARE_A: u32 = 36967;
+pub const NV_CTXSHARE_ALLOCATION_FLAGS_SUBCONTEXT_SYNC: u32 = 0;
+pub const NVC36F_CTRL_CMD_GPFIFO_FAULT_METHOD_BUFFER_MAX_RUNQUEUES: u32 = 2;
+pub const NVA06C_CTRL_INTERNAL_PROMOTE_FAULT_METHOD_BUFFERS_MAX_RUNQUEUES: u32 = 2;
+pub const NVA06C_CTRL_CMD_INTERNAL_PROMOTE_FAULT_METHOD_BUFFERS: u32 = 2691432714;
 pub const NVC56F_SET_OBJECT: u32 = 0;
 pub const NVC56F_MEM_OP_A: u32 = 40;
 pub const NVC56F_MEM_OP_C_MEMBAR_TYPE_SYS_MEMBAR: u32 = 0;
@@ -197,6 +205,7 @@ pub const NVC56F_WFI: u32 = 120;
 pub const NVC56F_WFI_SCOPE_ALL: u32 = 1;
 pub const NVC56F_GP_ENTRY__SIZE: u32 = 8;
 pub const NVC56F_GP_ENTRY1_LEVEL_MAIN: u32 = 0;
+pub const NVC56F_GP_ENTRY1_SYNC_WAIT: u32 = 1;
 pub const NVC56F_DMA_SEC_OP_INC_METHOD: u32 = 1;
 pub const AMPERE_DMA_COPY_B: u32 = 51125;
 pub const NVC7B5_SET_SEMAPHORE_A: u32 = 576;
@@ -747,6 +756,15 @@ pub struct NV2080_CTRL_GPU_PROMOTE_CTX_PARAMS {
 }
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV2080_CTRL_GPU_EVICT_CTX_PARAMS {
+    pub engineType: u32_,
+    pub hClient: u32_,
+    pub ChID: u32_,
+    pub hChanClient: u32_,
+    pub hObject: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
 pub struct NV2080_CTRL_GPU_GET_FERMI_GPC_INFO_PARAMS {
     pub gpcMask: u32_,
 }
@@ -1027,6 +1045,40 @@ pub struct NV_CHANNEL_ALLOC_PARAMS {
     pub __bindgen_padding_0: [u8; 4usize],
 }
 pub type NV_CHANNELGPFIFO_ALLOCATION_PARAMETERS = NV_CHANNEL_ALLOC_PARAMS;
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS {
+    pub hObjectError: u32_,
+    pub hObjectEccError: u32_,
+    pub hVASpace: u32_,
+    pub engineType: u32_,
+    pub bIsCallingContextVgpuPlugin: u8_,
+    pub __bindgen_padding_0: [u8; 3usize],
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV_CTXSHARE_ALLOCATION_PARAMETERS {
+    pub hVASpace: u32_,
+    pub flags: u32_,
+    pub subctxId: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV2080_CTRL_INTERNAL_MEMDESC_INFO {
+    pub base: u64_,
+    pub size: u64_,
+    pub alignment: u64_,
+    pub addressSpace: u32_,
+    pub cpuCacheAttrib: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NVA06C_CTRL_INTERNAL_PROMOTE_FAULT_METHOD_BUFFERS_PARAMS {
+    pub methodBufferMemdesc: [NV2080_CTRL_INTERNAL_MEMDESC_INFO; 2usize],
+    pub bar2Addr: [u64_; 2usize],
+    pub numValidEntries: u32_,
+    pub __bindgen_padding_0: [u8; 4usize],
+}
 pub const ChannelPBSize_PB_SIZE_4KB: ChannelPBSize = 0;
 pub const ChannelPBSize_PB_SIZE_8KB: ChannelPBSize = 1;
 pub const ChannelPBSize_PB_SIZE_16KB: ChannelPBSize = 2;
@@ -1660,6 +1712,11 @@ pub struct NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS {
 #[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
 pub struct NVA06F_CTRL_BIND_PARAMS {
     pub engineType: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NVA06F_CTRL_STOP_CHANNEL_PARAMS {
+    pub bImmediate: u8_,
 }
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone, MaybeZeroable)]

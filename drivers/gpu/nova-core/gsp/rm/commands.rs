@@ -3,6 +3,7 @@
 use core::{
     array,
     convert::Infallible,
+    marker::PhantomData,
     mem::size_of,
     ops::Range, //
 };
@@ -26,7 +27,9 @@ use crate::{
         },
         commands::{
             Channel,
+            ChannelGroup,
             Client,
+            ContextShare,
             CopyEngine,
             Device,
             DisplayCommon,
@@ -847,33 +850,68 @@ rm_control!(
     |p| p.size()
 );
 
-/// Allocation of a GA10x GPFIFO channel under a device. RM puts it in a channel group of its own.
-pub(crate) struct AllocChannelGpfifoAmpere(ChannelGpfifoAllocParams);
+/// Allocation of a GA10x GPFIFO channel under `P`: a [`Device`], when RM puts the channel in a
+/// channel group of its own, or a [`ChannelGroup`].
+pub(crate) struct AllocChannelGpfifoAmpere<P>(ChannelGpfifoAllocParams, PhantomData<P>);
 
-impl AllocChannelGpfifoAmpere {
-    /// Creates the command, see [`ChannelGpfifoAllocParams::kernel`].
-    pub(crate) fn kernel(
+impl AllocChannelGpfifoAmpere<Device> {
+    /// Creates the command for a channel alone in the address space `va_space`, see
+    /// [`ChannelGpfifoAllocParams::new`].
+    pub(crate) fn alone(
         va_space: Handle<VaSpace>,
         engine_type: u32,
         chid: u32,
         gpfifo: u64,
         entries: u32,
         memory: &ChannelMemory,
+        privileged: bool,
     ) -> Self {
-        Self(ChannelGpfifoAllocParams::kernel(
-            va_space.as_raw(),
-            engine_type,
-            chid,
-            gpfifo,
-            entries,
-            memory,
-        ))
+        Self(
+            ChannelGpfifoAllocParams::new(
+                ChannelSpace::VaSpace(va_space.as_raw()),
+                engine_type,
+                chid,
+                gpfifo,
+                entries,
+                memory,
+                privileged,
+            ),
+            PhantomData,
+        )
     }
 }
 
-impl RmAllocCommand for AllocChannelGpfifoAmpere {
+impl AllocChannelGpfifoAmpere<ChannelGroup> {
+    /// Creates the command for a channel of a group, in the group's context share
+    /// `context_share`, see [`ChannelGpfifoAllocParams::new`]. The method buffer of `memory` must
+    /// be the group's one of the channel's runqueue.
+    pub(crate) fn in_group(
+        context_share: Handle<ContextShare>,
+        engine_type: u32,
+        chid: u32,
+        gpfifo: u64,
+        entries: u32,
+        memory: &ChannelMemory,
+        privileged: bool,
+    ) -> Self {
+        Self(
+            ChannelGpfifoAllocParams::new(
+                ChannelSpace::ContextShare(context_share.as_raw()),
+                engine_type,
+                chid,
+                gpfifo,
+                entries,
+                memory,
+                privileged,
+            ),
+            PhantomData,
+        )
+    }
+}
+
+impl<P> RmAllocCommand for AllocChannelGpfifoAmpere<P> {
     const CLASS: RmObjectClass = RmObjectClass::ChannelGpfifoAmpere;
-    type Parent = Device;
+    type Parent = P;
     type Object = Channel;
     type Params = ChannelGpfifoAllocParams;
 
@@ -881,6 +919,70 @@ impl RmAllocCommand for AllocChannelGpfifoAmpere {
         &self.0
     }
 }
+
+/// Allocation of a channel group (TSG) under a device.
+pub(crate) struct AllocChannelGroupKepler(ChannelGroupAllocParams);
+
+impl AllocChannelGroupKepler {
+    /// Creates the command for a group on engine `engine_type`, an `NV2080_ENGINE_TYPE`, whose
+    /// channels run in the address space `va_space`.
+    pub(crate) fn new(va_space: Handle<VaSpace>, engine_type: u32) -> Self {
+        Self(ChannelGroupAllocParams::new(va_space.as_raw(), engine_type))
+    }
+}
+
+impl RmAllocCommand for AllocChannelGroupKepler {
+    const CLASS: RmObjectClass = RmObjectClass::ChannelGroupKepler;
+    type Parent = Device;
+    type Object = ChannelGroup;
+    type Params = ChannelGroupAllocParams;
+
+    fn params(&self) -> &Self::Params {
+        &self.0
+    }
+}
+
+/// Allocation of a context share under a channel group.
+pub(crate) struct AllocContextShareFermi(ContextShareAllocParams);
+
+impl AllocContextShareFermi {
+    /// Creates the command for the group's synchronous subcontext, in the address space
+    /// `va_space`: see [`ContextShareAllocParams::sync`].
+    pub(crate) fn sync(va_space: Handle<VaSpace>) -> Self {
+        Self(ContextShareAllocParams::sync(va_space.as_raw()))
+    }
+}
+
+impl RmAllocCommand for AllocContextShareFermi {
+    const CLASS: RmObjectClass = RmObjectClass::ContextShareFermi;
+    type Parent = ChannelGroup;
+    type Object = ContextShare;
+    type Params = ContextShareAllocParams;
+
+    fn params(&self) -> &Self::Params {
+        &self.0
+    }
+}
+
+/// RM control command giving GSP-RM the method buffers of a channel group, which kernel RM sends
+/// right after allocating the group (`kchangrpapiConstruct`).
+pub(crate) struct TsgPromoteFaultMethodBuffers(PromoteFaultMethodBuffersParams);
+
+impl TsgPromoteFaultMethodBuffers {
+    /// Creates the command, see [`PromoteFaultMethodBuffersParams::new`].
+    pub(crate) fn new(buffers: [u64; RUNQUEUES], size: u64) -> Self {
+        Self(PromoteFaultMethodBuffersParams::new(buffers, size))
+    }
+}
+
+rm_control!(
+    TsgPromoteFaultMethodBuffers,
+    ChannelGroup,
+    TsgInternalPromoteFaultMethodBuffers,
+    PromoteFaultMethodBuffersParams,
+    (),
+    |_p| ()
+);
 
 /// RM control command querying a page of the device info table: the engines of the GPU and the
 /// runlists they are on.
@@ -918,6 +1020,36 @@ pub(crate) struct AllocThreeDAmpereB;
 
 impl RmAllocCommand for AllocThreeDAmpereB {
     const CLASS: RmObjectClass = RmObjectClass::ThreeDAmpereB;
+    type Parent = Channel;
+    type Object = GraphicsObject;
+    // The class takes no parameters.
+    type Params = [u8; 0];
+
+    fn params(&self) -> &Self::Params {
+        &[]
+    }
+}
+
+/// Allocation of a 2D object on a channel on the graphics engine.
+pub(crate) struct AllocTwoDFermiA;
+
+impl RmAllocCommand for AllocTwoDFermiA {
+    const CLASS: RmObjectClass = RmObjectClass::TwoDFermiA;
+    type Parent = Channel;
+    type Object = GraphicsObject;
+    // The class takes no parameters.
+    type Params = [u8; 0];
+
+    fn params(&self) -> &Self::Params {
+        &[]
+    }
+}
+
+/// Allocation of an inline-to-memory object on a channel on the graphics engine.
+pub(crate) struct AllocInlineToMemoryKeplerB;
+
+impl RmAllocCommand for AllocInlineToMemoryKeplerB {
+    const CLASS: RmObjectClass = RmObjectClass::InlineToMemoryKeplerB;
     type Parent = Channel;
     type Object = GraphicsObject;
     // The class takes no parameters.

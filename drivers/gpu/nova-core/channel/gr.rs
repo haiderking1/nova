@@ -56,14 +56,20 @@ use crate::{
 };
 
 use super::{
-    gpfifo::Channel,
+    gpfifo::{
+        Channel,
+        NewSpace, //
+    },
     hal::{
         channel_hal,
         Classes,
         Grid,
         Release, //
     },
-    vaspace::Mode, //
+    vaspace::{
+        AddressSpace,
+        Mode, //
+    },
 };
 
 /// Handle of the 3D object allocated to build the golden context.
@@ -161,21 +167,20 @@ impl<'a> GlobalBuffer<'a> {
         })
     }
 
-    /// Maps the buffer into `channel`'s address space with `access`, at a virtual address aligned
-    /// to `alignment`.
+    /// Maps the buffer into `space` with `access`, at a virtual address aligned to `alignment`.
     fn map(
         &self,
-        channel: &mut Channel<'_>,
+        space: &mut AddressSpace,
         mm: &mut GpuMm<'_>,
         alignment: u64,
         access: Access,
     ) -> Result<MappedRange> {
         match self {
-            Self::Vram(vram) => channel.map_vram_aligned(mm, vram.range(), alignment, access),
+            Self::Vram(vram) => space.map_vram_aligned(mm, vram.range(), alignment, access),
             Self::System(memory) => {
                 let start = memory.dma_address();
                 let end = start + num::usize_as_u64(memory.size());
-                channel.map_sysmem_aligned(mm, start..end, alignment, access)
+                space.map_sysmem_aligned(mm, start..end, alignment, access)
             }
         }
     }
@@ -294,6 +299,9 @@ pub(crate) struct GrContext<'a> {
     globals: KVec<Option<GlobalBuffer<'a>>>,
     /// The unrestricted privileged register access map, only given to the golden context.
     unrestricted_priv_access_map: ContiguousVram,
+    /// The context buffers of the golden context's own, kept like nouveau keeps them
+    /// (`r535_gr_oneinit()`) rather than freed once the golden context is built.
+    _golden_buffers: KVec<GlobalBuffer<'a>>,
 }
 
 impl<'a> GrContext<'a> {
@@ -359,14 +367,15 @@ impl<'a> GrContext<'a> {
             .ok_or(EINVAL)?;
         let unrestricted = layouts[priv_access_map].alloc(mm, true)?;
 
-        let context = Self {
+        let mut context = Self {
             engine,
             info,
             layouts,
             globals,
             unrestricted_priv_access_map: unrestricted,
+            _golden_buffers: KVec::new(),
         };
-        context.build_golden(dev, cmdq, mm, chipset, rm, golden_chid)?;
+        context._golden_buffers = context.build_golden(dev, cmdq, mm, chipset, rm, golden_chid)?;
 
         Ok(context)
     }
@@ -377,6 +386,7 @@ impl<'a> GrContext<'a> {
     }
 
     /// Has GSP-RM build the golden context, on a channel `chid` given all the context buffers.
+    /// Returns the context buffers of the golden context's own.
     fn build_golden(
         &self,
         dev: &device::Device<device::Bound>,
@@ -385,7 +395,7 @@ impl<'a> GrContext<'a> {
         chipset: Chipset,
         rm: &RmDevice,
         chid: u32,
-    ) -> Result {
+    ) -> Result<KVec<GlobalBuffer<'a>>> {
         // The golden context is built when the 3D object is allocated: the channel runs no work.
         let mut channel = Channel::new(
             dev,
@@ -397,7 +407,7 @@ impl<'a> GrContext<'a> {
             chid,
             false,
             // GSP-RM maps buffers of its own to build the golden context.
-            Mode::Split,
+            NewSpace::Own(Mode::Split),
         )?;
         let mut own = KVec::new();
         let mut mappings = KVec::new();
@@ -422,8 +432,12 @@ impl<'a> GrContext<'a> {
                 let gpu_va = if buffer.is_priv_access_map() {
                     None
                 } else {
-                    let mapped =
-                        global.map(channel, mm, layout.va_alignment, buffer_access(buffer))?;
+                    let mapped = global.map(
+                        channel.own_space()?,
+                        mm,
+                        layout.va_alignment,
+                        buffer_access(buffer),
+                    )?;
                     let va = mapped.start().into_raw();
                     mappings.push(mapped, GFP_KERNEL)?;
                     Some(va)
@@ -466,15 +480,146 @@ impl<'a> GrContext<'a> {
 
         let result = build(&mut channel, mm);
 
-        // GSP-RM keeps the golden context: the channel isn't needed anymore. Its context buffers
-        // stay mapped until it is freed.
+        // GSP-RM keeps the golden context: the channel isn't needed anymore. It was never
+        // scheduled. Its 3D object is freed first, then the channel, like nouveau frees them; the
+        // context buffers stay mapped until then.
         channel.release(dev, cmdq);
         for mapped in mappings {
             let _ = channel.unmap(mm, mapped);
         }
-        channel.free(dev, cmdq, mm);
+        channel.free(dev, cmdq, mm, None);
 
-        result
+        result.map(|()| own)
+    }
+}
+
+/// The context buffers of a channel on the graphics engine: those of its own, and the mappings
+/// of all of them into the channel's address space.
+pub(crate) struct ChannelContext {
+    /// The per-channel context buffers.
+    _buffers: KVec<ContiguousVram>,
+    /// Mappings of the context buffers.
+    mappings: KVec<MappedRange>,
+}
+
+impl ChannelContext {
+    /// Unmaps the context buffers from `space`, the address space of their channel, which
+    /// GSP-RM must have freed.
+    pub(crate) fn unmap(&mut self, mm: &mut GpuMm<'_>, space: &mut AddressSpace) {
+        while let Some(mapped) = self.mappings.pop() {
+            let _ = space.unmap(mm, mapped);
+        }
+    }
+
+    /// Forgets the mappings of the context buffers: their address space is gone with the GPU.
+    pub(crate) fn forget(self) {
+        for mapped in self.mappings {
+            mapped.forget();
+        }
+    }
+}
+
+impl GrContext<'_> {
+    /// Returns the graphics engine.
+    pub(crate) fn engine(&self) -> EngineInfo {
+        self.engine
+    }
+
+    /// Allocates the per-channel context buffers of a new channel on the graphics engine, and
+    /// maps them and the global ones into `space`, the channel's address space. Returns them, and
+    /// the entries to give GSP-RM with [`promote`].
+    ///
+    /// `privileged` channels get the unrestricted privileged register access map, like kernel RM
+    /// gives kernel channels (`kgrctxGetRegisterAccessMapId()`), the others the restricted one.
+    fn map_channel_context(
+        &self,
+        mm: &mut GpuMm<'_>,
+        space: &mut AddressSpace,
+        privileged: bool,
+    ) -> Result<(ChannelContext, KVec<PromoteEntry>)> {
+        let mut context = ChannelContext {
+            _buffers: KVec::new(),
+            mappings: KVec::new(),
+        };
+        let mut entries = KVec::new();
+
+        let mut map = |context: &mut ChannelContext, mm: &mut GpuMm<'_>| -> Result {
+            for (i, buffer) in GR_CONTEXT_BUFFERS.iter().enumerate() {
+                let layout = &self.layouts[i];
+                let access = buffer_access(buffer);
+                let mut promote_id = buffer.promote_id;
+                let (mapped, init) = match &self.globals[i] {
+                    // The unrestricted map is initialized with the golden context.
+                    Some(_) if privileged && buffer.is_priv_access_map() => {
+                        promote_id = GR_UNRESTRICTED_PRIV_ACCESS_MAP;
+                        let mapped = space.map_vram_aligned(
+                            mm,
+                            self.unrestricted_priv_access_map.range(),
+                            layout.va_alignment,
+                            access,
+                        )?;
+                        (mapped, None)
+                    }
+                    // GSP-RM initialized the global buffers with the golden context.
+                    Some(global) => (global.map(space, mm, layout.va_alignment, access)?, None),
+                    None => {
+                        let vram = layout.alloc(mm, buffer.init)?;
+                        let mapped = space.map_vram_aligned(
+                            mm,
+                            vram.range(),
+                            layout.va_alignment,
+                            access,
+                        )?;
+                        let init = buffer.init.then(|| vram_init(&vram, layout.size));
+                        context._buffers.push(vram, GFP_KERNEL)?;
+                        (mapped, init)
+                    }
+                };
+
+                let gpu_va = mapped.start().into_raw();
+                context.mappings.push(mapped, GFP_KERNEL)?;
+                entries.push(
+                    PromoteEntry {
+                        promote_id,
+                        gpu_va: Some(gpu_va),
+                        init,
+                    },
+                    GFP_KERNEL,
+                )?;
+            }
+
+            Ok(())
+        };
+
+        match map(&mut context, mm) {
+            Ok(()) => Ok((context, entries)),
+            Err(err) => {
+                context.unmap(mm, space);
+                Err(err)
+            }
+        }
+    }
+
+    /// Sets up the context of `channel`, which runs in `space` on the graphics engine: allocates
+    /// its context buffers, maps them and the global ones into `space`, and gives them to GSP-RM.
+    /// See [`GrContext::map_channel_context`] for `privileged`.
+    pub(crate) fn set_up_channel(
+        &self,
+        dev: &device::Device,
+        cmdq: &Cmdq<'_>,
+        mm: &mut GpuMm<'_>,
+        rm: &RmDevice,
+        channel: &Channel<'_>,
+        space: &mut AddressSpace,
+        privileged: bool,
+    ) -> Result<ChannelContext> {
+        let (mut context, entries) = self.map_channel_context(mm, space, privileged)?;
+        if let Err(err) = promote(dev, cmdq, rm, channel, &entries) {
+            context.unmap(mm, space);
+            return Err(err);
+        }
+
+        Ok(context)
     }
 }
 
@@ -483,10 +628,8 @@ impl<'a> GrContext<'a> {
 /// It must be released with [`ComputeChannel::free`] while the GSP is running.
 pub(crate) struct ComputeChannel<'a> {
     channel: Channel<'a>,
-    /// The per-channel context buffers.
-    _buffers: KVec<ContiguousVram>,
-    /// Mappings of the context buffers.
-    mappings: KVec<MappedRange>,
+    /// The context buffers of the channel, once set up.
+    context: Option<ChannelContext>,
 }
 
 impl<'a> ComputeChannel<'a> {
@@ -510,12 +653,11 @@ impl<'a> ComputeChannel<'a> {
             context.engine,
             chid,
             true,
-            Mode::ClientOwned,
+            NewSpace::Own(Mode::ClientOwned),
         )?;
         let mut compute = Self {
             channel,
-            _buffers: KVec::new(),
-            mappings: KVec::new(),
+            context: None,
         };
 
         match compute.set_up(dev, cmdq, mm, rm, context, chid) {
@@ -536,59 +678,15 @@ impl<'a> ComputeChannel<'a> {
         context: &GrContext<'_>,
         chid: u32,
     ) -> Result {
-        let mut entries = KVec::new();
-        for (i, buffer) in GR_CONTEXT_BUFFERS.iter().enumerate() {
-            let layout = &context.layouts[i];
-            let access = buffer_access(buffer);
-            let mut promote_id = buffer.promote_id;
-            let (mapped, init) = match &context.globals[i] {
-                // Like kernel RM gives kernel channels (`kgrctxGetRegisterAccessMapId()`): the
-                // unrestricted privileged register access map, initialized with the golden
-                // context, instead of the restricted one.
-                Some(_) if buffer.is_priv_access_map() => {
-                    promote_id = GR_UNRESTRICTED_PRIV_ACCESS_MAP;
-                    let mapped = self.channel.map_vram_aligned(
-                        mm,
-                        context.unrestricted_priv_access_map.range(),
-                        layout.va_alignment,
-                        access,
-                    )?;
-                    (mapped, None)
-                }
-                // GSP-RM initialized the global buffers with the golden context.
-                Some(global) => (
-                    global.map(&mut self.channel, mm, layout.va_alignment, access)?,
-                    None,
-                ),
-                None => {
-                    let vram = layout.alloc(mm, buffer.init)?;
-                    let mapped = self.channel.map_vram_aligned(
-                        mm,
-                        vram.range(),
-                        layout.va_alignment,
-                        access,
-                    )?;
-                    let init = buffer.init.then(|| vram_init(&vram, layout.size));
-                    self._buffers.push(vram, GFP_KERNEL)?;
-                    (mapped, init)
-                }
-            };
-
-            entries.push(
-                PromoteEntry {
-                    promote_id,
-                    gpu_va: Some(mapped.start().into_raw()),
-                    init,
-                },
-                GFP_KERNEL,
-            )?;
-            self.mappings.push(mapped, GFP_KERNEL)?;
-        }
+        // A kernel channel: privileged.
+        let (channel_context, entries) =
+            context.map_channel_context(mm, self.channel.own_space()?, true)?;
+        self.context = Some(channel_context);
         promote(dev, cmdq, rm, &self.channel, &entries)?;
 
         self.channel
             .hal()
-            .alloc_compute(dev, cmdq, &self.channel, COMPUTE_HANDLE | chid)?;
+            .alloc_compute(dev, cmdq, &mut self.channel, COMPUTE_HANDLE | chid)?;
 
         Ok(())
     }
@@ -647,9 +745,9 @@ impl<'a> ComputeChannel<'a> {
     pub(crate) fn free(&mut self, dev: &device::Device, cmdq: &Cmdq<'_>, mm: &mut GpuMm<'_>) {
         // The context buffers stay mapped until the channel is freed.
         self.channel.release(dev, cmdq);
-        while let Some(mapped) = self.mappings.pop() {
-            let _ = self.channel.unmap(mm, mapped);
+        if let (Some(mut context), Ok(space)) = (self.context.take(), self.channel.own_space()) {
+            context.unmap(mm, space);
         }
-        self.channel.free(dev, cmdq, mm);
+        self.channel.free(dev, cmdq, mm, None);
     }
 }

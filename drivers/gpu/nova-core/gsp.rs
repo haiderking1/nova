@@ -41,10 +41,12 @@ pub(crate) use fw::{
         PromoteInit,
         RmObjectClass,
         ServerReservedLevel,
+        CHANNEL_IDS,
         DISP_PUSHBUFFER_SIZE,
         GR_CONTEXT_BUFFERS,
         GR_UNRESTRICTED_PRIV_ACCESS_MAP, //
         RM_SERVER_VA,
+        RUNQUEUES,
     },
 };
 pub(crate) use fw::{

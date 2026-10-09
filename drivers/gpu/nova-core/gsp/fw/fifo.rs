@@ -69,8 +69,9 @@ pub(crate) mod host_c56f {
     }
 
     /// Returns the GPFIFO entry of the push buffer of `words` 32-bit words at GPU virtual address
-    /// `addr`, which must be 4-byte aligned.
-    pub(crate) fn gp_entry(addr: u64, words: u32) -> Result<[u32; 2]> {
+    /// `addr`, which must be 4-byte aligned. If `wait`, the channel fetches it once the work
+    /// before is done, rather than ahead.
+    pub(crate) fn gp_entry(addr: u64, words: u32, wait: bool) -> Result<[u32; 2]> {
         // `NVC56F_GP_ENTRY1_LENGTH` is bits 30:10, `NVC56F_GP_ENTRY1_GET_HI` bits 7:0.
         if addr % 4 != 0 || addr >> 40 != 0 || words >= 1 << 21 {
             return Err(EINVAL);
@@ -80,7 +81,15 @@ pub(crate) mod host_c56f {
         // `NVC56F_GP_ENTRY1_GET_HI` the 8 bits above, checked above to be all there is.
         Ok([
             addr as u32,
-            (addr >> 32) as u32 | bindings::NVC56F_GP_ENTRY1_LEVEL_MAIN << 9 | words << 10,
+            (addr >> 32) as u32
+                | bindings::NVC56F_GP_ENTRY1_LEVEL_MAIN << 9
+                | words << 10
+                // `NVC56F_GP_ENTRY1_SYNC` is bit 31.
+                | if wait {
+                    bindings::NVC56F_GP_ENTRY1_SYNC_WAIT << 31
+                } else {
+                    0
+                },
         ])
     }
 

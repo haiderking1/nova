@@ -16,7 +16,9 @@ use crate::{
         cmdq::Cmdq,
         commands::{
             Channel as RmChannel,
+            ChannelGroup,
             Client,
+            ContextShare,
             Device,
             Handle,
             VaSpace, //
@@ -32,10 +34,25 @@ mod ga102;
 /// A GPFIFO entry: where a push buffer is and how long it is.
 pub(crate) type GpEntry = [u32; 2];
 
+/// Where a GPFIFO channel is allocated.
+pub(crate) enum GpfifoParent {
+    /// Under `device`, in the address space `va_space`. GSP-RM puts the channel in a channel group
+    /// of its own.
+    Device {
+        device: Handle<Device>,
+        va_space: Handle<VaSpace>,
+    },
+    /// In the channel group `group`, in its context share `context_share`.
+    Group {
+        group: Handle<ChannelGroup>,
+        context_share: Handle<ContextShare>,
+    },
+}
+
 /// What a GPFIFO channel is allocated with.
 pub(crate) struct GpfifoAlloc<'a> {
-    /// The address space the channel runs in.
-    pub(crate) va_space: Handle<VaSpace>,
+    /// Where the channel is allocated, and the address space it runs in.
+    pub(crate) parent: GpfifoParent,
     /// The `NV2080_ENGINE_TYPE` of the engine the channel runs on.
     pub(crate) engine_type: u32,
     /// The channel ID.
@@ -46,6 +63,9 @@ pub(crate) struct GpfifoAlloc<'a> {
     pub(crate) entries: u32,
     /// The memory of the channel.
     pub(crate) memory: &'a ChannelMemory,
+    /// Whether the channel may use the methods reserved to privileged channels: kernel channels
+    /// may, those of clients mayn't.
+    pub(crate) privileged: bool,
 }
 
 /// Size and shape of compute work.
@@ -91,14 +111,12 @@ pub(crate) trait ChannelHal: Sync {
 
     // The GPFIFO channel.
 
-    /// Allocates the GPFIFO channel `handle` under `device`. GSP-RM puts it in a channel group of
-    /// its own.
+    /// Allocates the GPFIFO channel `handle` under the parent of `alloc`.
     fn alloc_gpfifo(
         &self,
         dev: &device::Device,
         cmdq: &Cmdq<'_>,
         client: Handle<Client>,
-        device: Handle<Device>,
         handle: u32,
         alloc: &GpfifoAlloc<'_>,
     ) -> Result<Handle<RmChannel>>;
@@ -110,8 +128,8 @@ pub(crate) trait ChannelHal: Sync {
     fn userd_gp_put(&self) -> usize;
 
     /// Returns the GPFIFO entry of the push buffer of `words` 32-bit words at GPU virtual address
-    /// `addr`, 4-byte aligned.
-    fn gp_entry(&self, addr: u64, words: u32) -> Result<GpEntry>;
+    /// `addr`, 4-byte aligned. If `wait`, the channel fetches it once the work before is done.
+    fn gp_entry(&self, addr: u64, words: u32, wait: bool) -> Result<GpEntry>;
 
     /// Appends to `push` the methods doing `release` once the channel's engine is idle.
     fn push_release(&self, push: &mut KVec<u32>, release: Release) -> Result;
@@ -126,7 +144,7 @@ pub(crate) trait ChannelHal: Sync {
         &self,
         dev: &device::Device,
         cmdq: &Cmdq<'_>,
-        channel: &Channel<'_>,
+        channel: &mut Channel<'_>,
         handle: u32,
         index: u32,
     ) -> Result;
@@ -150,7 +168,26 @@ pub(crate) trait ChannelHal: Sync {
         &self,
         dev: &device::Device,
         cmdq: &Cmdq<'_>,
-        channel: &Channel<'_>,
+        channel: &mut Channel<'_>,
+        handle: u32,
+    ) -> Result;
+
+    /// Allocates the 2D object `handle` on `channel`, which runs on the graphics engine.
+    fn alloc_2d(
+        &self,
+        dev: &device::Device,
+        cmdq: &Cmdq<'_>,
+        channel: &mut Channel<'_>,
+        handle: u32,
+    ) -> Result;
+
+    /// Allocates the inline-to-memory object `handle` on `channel`, which runs on the graphics
+    /// engine.
+    fn alloc_inline_to_memory(
+        &self,
+        dev: &device::Device,
+        cmdq: &Cmdq<'_>,
+        channel: &mut Channel<'_>,
         handle: u32,
     ) -> Result;
 
@@ -159,7 +196,7 @@ pub(crate) trait ChannelHal: Sync {
         &self,
         dev: &device::Device,
         cmdq: &Cmdq<'_>,
-        channel: &Channel<'_>,
+        channel: &mut Channel<'_>,
         handle: u32,
     ) -> Result;
 

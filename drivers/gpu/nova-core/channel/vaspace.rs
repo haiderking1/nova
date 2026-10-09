@@ -100,8 +100,8 @@ pub(crate) struct AddressSpace {
     /// The root page directory.
     _pdb: ContiguousVram,
     vmm: Vmm,
-    /// Where the next aligned mapping may start.
-    next_aligned: u64,
+    /// Where aligned mappings start.
+    aligned_start: u64,
     /// The addresses Nova maps its own buffers at.
     layout: VaLayout,
 }
@@ -122,7 +122,7 @@ impl AddressSpace {
         layout: VaLayout,
     ) -> Result<Self> {
         let page_size = num::usize_as_u64(PAGE_SIZE);
-        let next_aligned = match &layout {
+        let aligned_start = match &layout {
             VaLayout::Kernel => ALIGNED_VA_START,
             VaLayout::Client(kernel) => {
                 // GSP-RM's part of split address spaces is Nova's.
@@ -198,7 +198,7 @@ impl AddressSpace {
             mmu_version,
             _pdb: pdb,
             vmm,
-            next_aligned,
+            aligned_start,
             layout,
         })
     }
@@ -316,8 +316,9 @@ impl AddressSpace {
         self.map_aligned(mm, dma, alignment, access, Memory::SystemCoherent)
     }
 
-    /// Maps the page-aligned `range` of addresses of `memory` at a virtual address aligned to
-    /// `alignment`.
+    /// Maps the page-aligned `range` of addresses of `memory` at the lowest free virtual address
+    /// aligned to `alignment`, so that the addresses of freed mappings are used again: a channel
+    /// replacing another maps its buffers where the other had them.
     fn map_aligned(
         &mut self,
         mm: &mut GpuMm<'_>,
@@ -330,21 +331,24 @@ impl AddressSpace {
             return Err(EINVAL);
         }
         let pfns = Self::pfns(range.clone())?;
-        let start = self
-            .next_aligned
+        let mut start = self
+            .aligned_start
             .checked_next_multiple_of(alignment)
             .ok_or(ENOSPC)?;
-        let end = start
-            .checked_add(range.end - range.start)
-            .filter(|&end| end <= VA_SIZE)
-            .ok_or(ENOSPC)?;
-
-        let mapped = self
-            .vmm
-            .map_memory(mm, &pfns, Some(start..end), access, memory)?;
-        self.next_aligned = end;
-
-        Ok(mapped)
+        loop {
+            let end = start
+                .checked_add(range.end - range.start)
+                .filter(|&end| end <= VA_SIZE)
+                .ok_or(ENOSPC)?;
+            match self
+                .vmm
+                .map_memory(mm, &pfns, Some(start..end), access, memory)
+            {
+                // Mapped there already: the next aligned address.
+                Err(err) if err == EEXIST => start = start.checked_add(alignment).ok_or(ENOSPC)?,
+                result => return result,
+            }
+        }
     }
 
     /// Returns the frames of the page-aligned address `range`.

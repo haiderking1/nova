@@ -17,7 +17,6 @@ use crate::{
         commands::{
             Channel as RmChannel,
             Client,
-            Device,
             Handle, //
         },
         fifo::{
@@ -32,7 +31,9 @@ use crate::{
             AllocChannelGpfifoAmpere,
             AllocComputeAmpereB,
             AllocCopyEngineAmpereB,
+            AllocInlineToMemoryKeplerB,
             AllocThreeDAmpereB,
+            AllocTwoDFermiA,
             RmAlloc, //
         },
         EngineInfo, RmObjectClass,
@@ -46,6 +47,7 @@ use super::{
     Classes,
     GpEntry,
     GpfifoAlloc,
+    GpfifoParent,
     Grid,
     Release, //
 };
@@ -79,24 +81,54 @@ impl ChannelHal for Ga102 {
         dev: &device::Device,
         cmdq: &Cmdq<'_>,
         client: Handle<Client>,
-        device: Handle<Device>,
         handle: u32,
         alloc: &GpfifoAlloc<'_>,
     ) -> Result<Handle<RmChannel>> {
-        Ok(RmAlloc::new(
-            client,
-            device,
-            Handle::new(handle),
-            AllocChannelGpfifoAmpere::kernel(
-                alloc.va_space,
-                alloc.engine_type,
-                alloc.chid,
-                alloc.gpfifo,
-                alloc.entries,
-                alloc.memory,
-            ),
-        )
-        .send(dev, cmdq)?)
+        let handle = Handle::new(handle);
+        let (engine_type, chid, gpfifo, entries, memory, privileged) = (
+            alloc.engine_type,
+            alloc.chid,
+            alloc.gpfifo,
+            alloc.entries,
+            alloc.memory,
+            alloc.privileged,
+        );
+
+        Ok(match alloc.parent {
+            GpfifoParent::Device { device, va_space } => RmAlloc::new(
+                client,
+                device,
+                handle,
+                AllocChannelGpfifoAmpere::alone(
+                    va_space,
+                    engine_type,
+                    chid,
+                    gpfifo,
+                    entries,
+                    memory,
+                    privileged,
+                ),
+            )
+            .send(dev, cmdq)?,
+            GpfifoParent::Group {
+                group,
+                context_share,
+            } => RmAlloc::new(
+                client,
+                group,
+                handle,
+                AllocChannelGpfifoAmpere::in_group(
+                    context_share,
+                    engine_type,
+                    chid,
+                    gpfifo,
+                    entries,
+                    memory,
+                    privileged,
+                ),
+            )
+            .send(dev, cmdq)?,
+        })
     }
 
     fn userd_gp_get(&self) -> usize {
@@ -107,8 +139,8 @@ impl ChannelHal for Ga102 {
         host_c56f::USERD_GP_PUT
     }
 
-    fn gp_entry(&self, addr: u64, words: u32) -> Result<GpEntry> {
-        host_c56f::gp_entry(addr, words)
+    fn gp_entry(&self, addr: u64, words: u32, wait: bool) -> Result<GpEntry> {
+        host_c56f::gp_entry(addr, words, wait)
     }
 
     fn push_release(&self, push: &mut KVec<u32>, release: Release) -> Result {
@@ -137,7 +169,7 @@ impl ChannelHal for Ga102 {
         &self,
         dev: &device::Device,
         cmdq: &Cmdq<'_>,
-        channel: &Channel<'_>,
+        channel: &mut Channel<'_>,
         handle: u32,
         index: u32,
     ) -> Result {
@@ -187,7 +219,7 @@ impl ChannelHal for Ga102 {
         &self,
         dev: &device::Device,
         cmdq: &Cmdq<'_>,
-        channel: &Channel<'_>,
+        channel: &mut Channel<'_>,
         handle: u32,
     ) -> Result {
         channel
@@ -195,11 +227,35 @@ impl ChannelHal for Ga102 {
             .map(|_| ())
     }
 
+    fn alloc_2d(
+        &self,
+        dev: &device::Device,
+        cmdq: &Cmdq<'_>,
+        channel: &mut Channel<'_>,
+        handle: u32,
+    ) -> Result {
+        channel
+            .alloc_object(dev, cmdq, handle, AllocTwoDFermiA)
+            .map(|_| ())
+    }
+
+    fn alloc_inline_to_memory(
+        &self,
+        dev: &device::Device,
+        cmdq: &Cmdq<'_>,
+        channel: &mut Channel<'_>,
+        handle: u32,
+    ) -> Result {
+        channel
+            .alloc_object(dev, cmdq, handle, AllocInlineToMemoryKeplerB)
+            .map(|_| ())
+    }
+
     fn alloc_compute(
         &self,
         dev: &device::Device,
         cmdq: &Cmdq<'_>,
-        channel: &Channel<'_>,
+        channel: &mut Channel<'_>,
         handle: u32,
     ) -> Result {
         channel

@@ -43,10 +43,10 @@ use crate::{
 
 pub use crate::channel::vaspace::VA_SIZE;
 
-/// Handle of the address space of a client, after those of channels, completed with its ID.
-const VA_SPACE_HANDLE: u32 = 0x90f1_8000;
+/// Handle of the address space of a client, under the RM client of its own.
+const VA_SPACE_HANDLE: u32 = 0x90f1_0000;
 
-/// Number of address spaces clients may have at once: the IDs completing their handles.
+/// Number of address spaces clients may have at once: the IDs giving their RM clients.
 pub(crate) const MAX_VMS: usize = 0x8000;
 
 /// A buffer of a client, to map into a [`ClientVm`].
@@ -60,26 +60,31 @@ pub enum BufferRef<'a> {
 
 /// A GPU virtual address space of a client.
 ///
+/// It has an RM client of its own, under whose device are the address space and the channels
+/// running in it (see [`crate::gsp::rm::device`]).
+///
 /// It must be given back to [`NovaCoreApi::free_vm`](crate::api::NovaCoreApi::free_vm) while
 /// nova-core is bound.
 pub struct ClientVm {
     space: AddressSpace,
-    /// The ID completing the handle of the address space.
+    rm: RmDevice,
+    /// The ID giving the RM client.
     id: usize,
 }
 
 impl ClientVm {
     /// Allocates an empty address space whose kernel range is `kernel`, with the ID `id`, under
-    /// the device of `rm`.
+    /// an RM client of its own.
     pub(crate) fn new(
         dev: &device::Device,
         cmdq: &Cmdq<'_>,
         mm: &mut GpuMm<'_>,
         chipset: Chipset,
-        rm: &RmDevice,
         kernel: Range<u64>,
         id: usize,
     ) -> Result<Self> {
+        // Index 0 is Nova's own client.
+        let rm = RmDevice::new(dev, cmdq, u32::try_from(id)?.checked_add(1).ok_or(EINVAL)?)?;
         let space = AddressSpace::new(
             dev,
             cmdq,
@@ -87,17 +92,35 @@ impl ClientVm {
             chipset.mmu_version(),
             rm.client(),
             rm.device(),
-            VA_SPACE_HANDLE | u32::try_from(id)?,
+            VA_SPACE_HANDLE,
             Mode::ClientOwned,
             VaLayout::Client(kernel),
-        )?;
+        );
 
-        Ok(Self { space, id })
+        match space {
+            Ok(space) => Ok(Self { space, rm, id }),
+            Err(err) => {
+                let _ = rm.free(dev, cmdq);
+                Err(err)
+            }
+        }
     }
 
-    /// Returns the ID completing the handle of the address space.
+    /// Returns the ID giving the RM client.
     pub(crate) fn id(&self) -> usize {
         self.id
+    }
+
+    /// Returns the RM client of the address space, under whose device the channels running in
+    /// it are, and the address space, in whose kernel range they map their memory.
+    pub(crate) fn rm_and_space_mut(&mut self) -> (&RmDevice, &mut AddressSpace) {
+        (&self.rm, &mut self.space)
+    }
+
+    /// Returns the address space, in whose kernel range the channels of the client map their
+    /// memory.
+    pub(crate) fn space_mut(&mut self) -> &mut AddressSpace {
+        &mut self.space
     }
 
     /// Maps the `size` bytes of `buffer` from `offset` at the virtual address `addr`, as memory of
@@ -153,8 +176,12 @@ impl ClientVm {
             .unmap_at(mm, addr, usize::try_from(size / page_size)?)
     }
 
-    /// Releases the address space from GSP-RM. Its page tables are freed when it is dropped.
-    pub(crate) fn free(&self, dev: &device::Device, cmdq: &Cmdq<'_>) -> Result {
-        self.space.free(dev, cmdq)
+    /// Releases the address space from GSP-RM, then its RM client, and frees its page tables.
+    pub(crate) fn free(self, dev: &device::Device, cmdq: &Cmdq<'_>) -> Result {
+        let Self { space, rm, .. } = self;
+        let released = space.free(dev, cmdq);
+        let freed = rm.free(dev, cmdq);
+
+        released.and(freed)
     }
 }

@@ -28,6 +28,7 @@ use kernel::{
         Mutex,
         SetOnce, //
     },
+    time::Delta,
     uapi, //
 };
 
@@ -38,6 +39,11 @@ use crate::{
         SystemBuffer,
         VramBuffer,
         VRAM_BUFFER_ALIGN, //
+    },
+    channel::client::{
+        ChannelEngine,
+        ClientChannel,
+        PushBuffer, //
     },
     channel::{
         self,
@@ -81,13 +87,17 @@ use crate::{
                 IntrGetKernelTable,
                 RmControl, //
             },
-            device::RmDevice,
+            device::{
+                RmDevice,
+                NOVA_CLIENT, //
+            },
         },
         ConnectorType,
         DpLinkConfig,
         EngineInfo,
         Gsp,
-        GspBootContext, //
+        GspBootContext,
+        CHANNEL_IDS, //
     },
     irq::{
         self,
@@ -111,7 +121,10 @@ use crate::{
         VramAddress,
         PAGE_SIZE, //
     },
-    num::IntoSafeCast,
+    num::{
+        self,
+        IntoSafeCast, //
+    },
     vgpu::VgpuManager, //
     vm::{
         self,
@@ -441,6 +454,12 @@ impl<'a> GspSubtree<'a> {
     }
 }
 
+/// A channel of a client, until it is freed.
+type ClientChannelRef<'gpu> = Arc<Mutex<Option<ClientChannel<'gpu>>>>;
+
+/// How long the work of clients may run: much longer than a frame.
+const CLIENT_WORK_TIMEOUT: Delta = Delta::from_secs(5);
+
 /// Structure holding the resources required to operate the GPU.
 #[pin_data(PinnedDrop)]
 pub(crate) struct Gpu<'gpu> {
@@ -493,6 +512,15 @@ pub(crate) struct Gpu<'gpu> {
     /// The IDs of the address spaces of clients.
     #[pin]
     vm_ids: Mutex<IdPool>,
+    /// The IDs of the channels of clients.
+    #[pin]
+    chids: Mutex<IdPool>,
+    /// The channels of clients, by ID, each behind a lock of its own: running work on a channel
+    /// waits for it without blocking the others.
+    ///
+    /// Locked before a channel's lock, which is locked before `mm`.
+    #[pin]
+    client_channels: Mutex<KVec<Option<ClientChannelRef<'gpu>>>>,
     /// GPU memory manager owning memory management resources.
     ///
     /// Must be kept declared *before* `gsp_resources`, so that its components are dropped while
@@ -708,7 +736,7 @@ impl<'gpu> Gpu<'gpu> {
             },
 
             // Not fatal: the RM client is only needed for the display engine and channels.
-            rm: RmDevice::new(dev, &gsp_resources.gsp.cmdq)
+            rm: RmDevice::new(dev, &gsp_resources.gsp.cmdq, NOVA_CLIENT)
                 .inspect_err(|e| dev_warn!(dev, "can't allocate an RM client: {:?}\n", e))
                 .ok(),
 
@@ -761,6 +789,20 @@ impl<'gpu> Gpu<'gpu> {
             copy <- new_mutex!(None, "nova_copy"),
 
             vm_ids <- new_mutex!(IdPool::with_capacity(vm::MAX_VMS, GFP_KERNEL)?, "nova_vm_ids"),
+
+            chids <- new_mutex!(
+                IdPool::with_capacity(num::u32_as_usize(CHANNEL_IDS), GFP_KERNEL)?,
+                "nova_chids"
+            ),
+
+            client_channels <- new_mutex!(
+                {
+                    let mut channels = KVec::new();
+                    channels.resize(num::u32_as_usize(CHANNEL_IDS), None, GFP_KERNEL)?;
+                    channels
+                },
+                "nova_client_channels"
+            ),
 
             // Create GPU memory manager owning memory management resources.
             mm <- new_mutex!({
@@ -1414,7 +1456,6 @@ impl<'gpu> Gpu<'gpu> {
     /// address space, and with `ENOSPC` if clients have too many address spaces.
     pub(crate) fn create_vm(&self, kernel: Range<u64>) -> Result<ClientVm> {
         let gsp_resources = &self.gsp_resources;
-        let rm = self.rm.as_ref().ok_or(ENODEV)?;
 
         let id = self
             .vm_ids
@@ -1427,7 +1468,6 @@ impl<'gpu> Gpu<'gpu> {
             &gsp_resources.gsp.cmdq,
             &mut self.mm.lock(),
             self.spec.chipset,
-            rm,
             kernel,
             id,
         );
@@ -1441,12 +1481,10 @@ impl<'gpu> Gpu<'gpu> {
     /// Frees `vm`, which nothing may use anymore.
     pub(crate) fn free_vm(&self, vm: ClientVm) {
         let gsp_resources = &self.gsp_resources;
+        let id = vm.id();
         let _ = vm
             .free(gsp_resources.device.as_ref(), &gsp_resources.gsp.cmdq)
             .inspect_err(|e| pr_err!("failed to free a client's address space: {:?}\n", e));
-        // Its page tables are freed with it.
-        let id = vm.id();
-        drop(vm);
         self.vm_ids.lock().release_id(id);
     }
 
@@ -1467,6 +1505,97 @@ impl<'gpu> Gpu<'gpu> {
     /// Tears down the `size` bytes mapped from the virtual address `addr` of `vm`.
     pub(crate) fn vm_unmap(&self, vm: &mut ClientVm, addr: u64, size: u64) -> Result {
         vm.unmap(&mut self.mm.lock(), addr, size)
+    }
+
+    /// Allocates a channel on `engine` running in `vm`, and returns its ID.
+    ///
+    /// Fails with `ENOSPC` if there are too many channels.
+    pub(crate) fn create_channel(&self, vm: &mut ClientVm, engine: ChannelEngine) -> Result<u32> {
+        let gsp_resources = &self.gsp_resources;
+
+        let chid = self
+            .chids
+            .lock()
+            .find_unused_id(num::u32_as_usize(channel::FIRST_CLIENT_CHID))
+            .ok_or(ENOSPC)?
+            .acquire();
+        let created = (|| {
+            let chid = u32::try_from(chid)?;
+            // The channel is under the device of the address space's own RM client.
+            let (rm, space) = vm.rm_and_space_mut();
+            let channel = ClientChannel::new(
+                gsp_resources.device.as_ref(),
+                &gsp_resources.gsp.cmdq,
+                &mut self.mm.lock(),
+                self.spec.chipset,
+                rm,
+                self.gr.as_ref(),
+                space,
+                chid,
+                engine,
+            )?;
+            let channel =
+                Arc::pin_init(new_mutex!(Some(channel), "nova_client_channel"), GFP_KERNEL)
+                    .inspect_err(|_| pr_err!("can't track client channel {}: leaked\n", chid))?;
+            *self
+                .client_channels
+                .lock()
+                .get_mut(num::u32_as_usize(chid))
+                .ok_or(EINVAL)? = Some(channel);
+
+            Ok(chid)
+        })();
+        if created.is_err() {
+            self.chids.lock().release_id(chid);
+        }
+
+        created
+    }
+
+    /// Frees the channel `chid`, which runs in `vm`, once the work it runs is done.
+    pub(crate) fn destroy_channel(&self, vm: &mut ClientVm, chid: u32) -> Result {
+        let index = num::u32_as_usize(chid);
+        let channel = self
+            .client_channels
+            .lock()
+            .get_mut(index)
+            .ok_or(EINVAL)?
+            .take()
+            .ok_or(ENOENT)?;
+
+        if let Some(mut channel) = channel.lock().take() {
+            let gsp_resources = &self.gsp_resources;
+            channel.free(
+                gsp_resources.device.as_ref(),
+                &gsp_resources.gsp.cmdq,
+                &mut self.mm.lock(),
+                vm.space_mut(),
+            );
+        }
+        self.chids.lock().release_id(index);
+
+        Ok(())
+    }
+
+    /// Runs the push buffers `pushes` on the channel `chid`, in order, and returns once they are
+    /// done.
+    ///
+    /// Fails with `ETIMEDOUT` if they aren't done in [`CLIENT_WORK_TIMEOUT`], and with `ENODEV`
+    /// when work timed out on the channel before: it runs no more.
+    pub(crate) fn channel_exec(&self, chid: u32, pushes: &[PushBuffer]) -> Result {
+        let channel = self
+            .client_channels
+            .lock()
+            .get(num::u32_as_usize(chid))
+            .ok_or(EINVAL)?
+            .clone()
+            .ok_or(ENOENT)?;
+
+        let mut channel = channel.lock();
+        let channel = Option::as_mut(&mut *channel).ok_or(ENOENT)?;
+        let sequence = channel.submit(self.gsp_resources.bar, &mut self.mm.lock(), pushes)?;
+        // Without `mm` locked: other work goes on meanwhile.
+        channel.wait(sequence, CLIENT_WORK_TIMEOUT)
     }
 
     /// Allocates a zeroed buffer of at least `size` bytes of system memory, which the GPU accesses
@@ -1568,6 +1697,13 @@ impl PinnedDrop for Gpu<'_> {
 
         if let Some(mut copy) = copy {
             copy.free(dev, &gsp_resources.gsp.cmdq, &mut mm);
+        }
+
+        // The channels of clients left, whose address spaces go away with the GPU.
+        for channel in this.client_channels.lock().iter_mut() {
+            if let Some(mut channel) = channel.take().and_then(|channel| channel.lock().take()) {
+                channel.abandon(dev, &gsp_resources.gsp.cmdq);
+            }
         }
 
         // Last, as every other RM object is allocated under it.

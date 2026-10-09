@@ -85,10 +85,22 @@ pub(crate) struct DisplayWindowChannel;
 /// through.
 pub(crate) struct VaSpace;
 
+/// Marker type for the GSP-RM handle of a channel group (TSG).
+///
+/// A channel group, a child of a device, holds channels that share one context of their engine and
+/// are scheduled together.
+pub(crate) struct ChannelGroup;
+
+/// Marker type for the GSP-RM handle of a context share.
+///
+/// A context share, a child of a channel group, is a subcontext of the group's context, in which
+/// the group's channels that name it run.
+pub(crate) struct ContextShare;
+
 /// Marker type for the GSP-RM handle of a GPFIFO channel.
 ///
-/// A channel, a child of a device, fetches the command buffers listed in its GPFIFO and runs them
-/// on the engine it's bound to.
+/// A channel, a child of a device or of a channel group, fetches the command buffers listed in its
+/// GPFIFO and runs them on the engine it's bound to.
 pub(crate) struct Channel;
 
 /// Marker type for the GSP-RM handle of a copy engine object.
@@ -102,6 +114,10 @@ pub(crate) struct CopyEngine;
 /// Such an object, a child of a channel on the graphics engine, makes the class's methods available
 /// on the channel.
 pub(crate) struct GraphicsObject;
+
+/// Marker type for the GSP-RM handle of an object of an engine class allocated on a channel, such
+/// as a [`GraphicsObject`] or a [`CopyEngine`], when its class doesn't matter.
+pub(crate) struct ChannelObject;
 
 /// A typed GSP-RM object handle.
 ///
@@ -146,6 +162,7 @@ impl<'a> SetSystemInfo<'a> {
 
 impl<'a> CommandToGsp for SetSystemInfo<'a> {
     const FUNCTION: MsgFunction = MsgFunction::GspSetSystemInfo;
+    const SEQUENCED: bool = false;
     type Command = fw::commands::GspSetSystemInfo;
     type Reply = NoReply;
     type InitError = Error;
@@ -216,6 +233,7 @@ impl SetRegistry {
 
 impl CommandToGsp for SetRegistry {
     const FUNCTION: MsgFunction = MsgFunction::SetRegistry;
+    const SEQUENCED: bool = false;
     type Command = fw::commands::PackedRegistryTable;
     type Reply = NoReply;
     type InitError = Infallible;

@@ -1323,11 +1323,12 @@ impl MsgHeaderVersion {
 }
 
 impl bindings::rpc_message_header_v {
-    fn init(cmd_size: usize, function: MsgFunction) -> impl Init<Self, Error> {
+    fn init(cmd_size: usize, sequence: u32, function: MsgFunction) -> impl Init<Self, Error> {
         type RpcMessageHeader = bindings::rpc_message_header_v;
 
         try_init!(RpcMessageHeader {
             header_version: MsgHeaderVersion::new().into(),
+            sequence,
             signature: bindings::NV_VGPU_MSG_SIGNATURE_VALID,
             function: function.into(),
             length: size_of::<Self>()
@@ -1355,10 +1356,14 @@ impl GspMsgElement {
     /// # Arguments
     ///
     /// * `sequence` - Sequence number of the message.
+    /// * `rpc_sequence` - Sequence number of the RPC (see [`CommandToGsp::SEQUENCED`]).
     /// * `cmd_size` - Size of the command (not including the message element), in bytes.
     /// * `function` - Function of the message.
+    ///
+    /// [`CommandToGsp::SEQUENCED`]: crate::gsp::cmdq::CommandToGsp::SEQUENCED
     pub(crate) fn init(
         sequence: u32,
+        rpc_sequence: u32,
         cmd_size: usize,
         function: MsgFunction,
     ) -> impl Init<Self, Error> {
@@ -1372,7 +1377,7 @@ impl GspMsgElement {
                 .div_ceil(GSP_PAGE_SIZE)
                 .try_into()
                 .map_err(|_| EOVERFLOW)?,
-            rpc <- RpcMessageHeader::init(cmd_size, function),
+            rpc <- RpcMessageHeader::init(cmd_size, rpc_sequence, function),
             ..Zeroable::init_zeroed()
         });
 

@@ -27,7 +27,10 @@ use crate::{
 };
 
 use super::{
-    gpfifo::Channel,
+    gpfifo::{
+        Channel,
+        NewSpace, //
+    },
     vaspace::Mode, //
 };
 
@@ -64,13 +67,14 @@ impl<'a> CopyChannel<'a> {
             engine,
             super::COPY_CHID,
             true,
-            Mode::ClientOwned,
+            NewSpace::Own(Mode::ClientOwned),
         )?;
-        if let Err(err) = channel
-            .hal()
-            .alloc_copy(dev, cmdq, &channel, COPY_ENGINE_HANDLE, index)
+        if let Err(err) =
+            channel
+                .hal()
+                .alloc_copy(dev, cmdq, &mut channel, COPY_ENGINE_HANDLE, index)
         {
-            channel.free(dev, cmdq, mm);
+            channel.free(dev, cmdq, mm, None);
             return Err(err);
         }
 
@@ -126,13 +130,13 @@ impl<'a> CopyChannel<'a> {
 
     /// Frees the channel. Its memory is freed when it is dropped.
     pub(crate) fn free(&mut self, dev: &device::Device, cmdq: &Cmdq<'_>, mm: &mut GpuMm<'_>) {
-        self.channel.free(dev, cmdq, mm);
+        self.channel.free(dev, cmdq, mm, None);
     }
 }
 
 /// Returns a copy engine of `engines` whose runlist has no graphics engine, so that its channels
 /// don't wait for graphics work.
-fn find_engine(engines: &[EngineInfo]) -> Result<EngineInfo> {
+pub(crate) fn find_engine(engines: &[EngineInfo]) -> Result<EngineInfo> {
     let shares_graphics = |runlist| {
         engines
             .iter()

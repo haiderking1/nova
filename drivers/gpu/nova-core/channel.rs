@@ -5,6 +5,7 @@
 //! A channel runs on one engine. It fetches the command buffers listed in its GPFIFO, a ring of
 //! GPU virtual addresses and lengths, from the address space it is bound to.
 
+pub(crate) mod client;
 #[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
 pub(crate) mod compute_test;
 pub(crate) mod copy;
@@ -21,6 +22,8 @@ pub(crate) const COPY_CHID: u32 = 1;
 pub(crate) const GOLDEN_CHID: u32 = 2;
 /// Channel ID of the compute channel.
 pub(crate) const COMPUTE_CHID: u32 = 3;
+/// First channel ID of the channels of clients.
+pub(crate) const FIRST_CLIENT_CHID: u32 = COMPUTE_CHID + 1;
 
 use kernel::{
     device,

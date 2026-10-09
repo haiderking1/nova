@@ -52,6 +52,9 @@ pub(crate) enum RmControlMsgFunction {
     GpfifoBind = bindings::NVA06F_CTRL_CMD_BIND,
     /// Enable or disable the scheduling of a channel.
     GpfifoSchedule = bindings::NVA06F_CTRL_CMD_GPFIFO_SCHEDULE,
+    /// Give the method buffers of a channel group to GSP-RM.
+    TsgInternalPromoteFaultMethodBuffers =
+        bindings::NVA06C_CTRL_CMD_INTERNAL_PROMOTE_FAULT_METHOD_BUFFERS,
     /// Get the engines of the GPU and the runlists they are on.
     FifoGetDeviceInfoTable = bindings::NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE,
     /// Get the sizes of the context buffers of the graphics engines.
@@ -101,6 +104,9 @@ impl TryFrom<u32> for RmControlMsgFunction {
             bindings::NV0080_CTRL_CMD_DMA_UNSET_PAGE_DIRECTORY => Ok(Self::DmaUnsetPageDirectory),
             bindings::NVA06F_CTRL_CMD_BIND => Ok(Self::GpfifoBind),
             bindings::NVA06F_CTRL_CMD_GPFIFO_SCHEDULE => Ok(Self::GpfifoSchedule),
+            bindings::NVA06C_CTRL_CMD_INTERNAL_PROMOTE_FAULT_METHOD_BUFFERS => {
+                Ok(Self::TsgInternalPromoteFaultMethodBuffers)
+            }
             bindings::NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE => {
                 Ok(Self::FifoGetDeviceInfoTable)
             }
@@ -195,7 +201,13 @@ pub(crate) enum RmObjectClass {
     WindowChannelGa102 = bindings::NVC67E_WINDOW_CHANNEL_DMA,
     /// A GPU virtual address space, child of a device.
     VaSpace = bindings::FERMI_VASPACE_A,
-    /// A GPFIFO channel of GA10x GPUs, child of a device.
+    /// A channel group (TSG), child of a device: channels that share a context of their engine,
+    /// and are scheduled together.
+    ChannelGroupKepler = bindings::KEPLER_CHANNEL_GROUP_A,
+    /// A context share, child of a channel group: a subcontext of the group's context, with an
+    /// address space of its own.
+    ContextShareFermi = bindings::FERMI_CONTEXT_SHARE_A,
+    /// A GPFIFO channel of GA10x GPUs, child of a device or of a channel group.
     ChannelGpfifoAmpere = bindings::AMPERE_CHANNEL_GPFIFO_A,
     /// A copy engine object of GA10x GPUs, child of a channel.
     CopyEngineAmpereB = bindings::AMPERE_DMA_COPY_B,
@@ -1069,6 +1081,9 @@ const CHANNEL_RAMFC_SIZE: u64 = 0x200;
 pub(crate) const CHANNEL_USERD_SIZE: u64 = size_of::<bindings::Nvc56fControl>() as u64;
 /// Number of USERDs in a USERD page, which RM indexes channel IDs by.
 const CHANNEL_USERDS_PER_PAGE: u32 = 8;
+/// Number of channel IDs the allocation of a channel can give: `NVOS04_FLAGS_CHANNEL_USERD_INDEX_PAGE_VALUE`
+/// is 9 bits wide, `NVOS04_FLAGS_CHANNEL_USERD_INDEX_VALUE` 3 bits.
+pub(crate) const CHANNEL_IDS: u32 = (1 << 9) * CHANNEL_USERDS_PER_PAGE;
 
 // `NVOS04_FLAGS_*` fields in `alloc_channel.h`, whose positions bindgen can't translate.
 
@@ -1084,6 +1099,8 @@ const NVOS04_FLAGS_CHANNEL_USERD_INDEX_PAGE_FIXED: u32 = 1 << 21;
 
 // `NV_KERNELCHANNEL_ALLOC_INTERNALFLAGS_*` in RM's `kernel_channel.h`, not part of the SDK.
 
+/// `NV_KERNELCHANNEL_ALLOC_INTERNALFLAGS_PRIVILEGE_USER`.
+const INTERNALFLAGS_PRIVILEGE_USER: u32 = 0;
 /// `NV_KERNELCHANNEL_ALLOC_INTERNALFLAGS_PRIVILEGE_ADMIN`.
 const INTERNALFLAGS_PRIVILEGE_ADMIN: u32 = 1;
 /// `NV_KERNELCHANNEL_ALLOC_INTERNALFLAGS_ERROR_NOTIFIER_TYPE_NONE`: no error notifier.
@@ -1091,22 +1108,120 @@ const INTERNALFLAGS_ERROR_NOTIFIER_TYPE_NONE: u32 = 1 << 2;
 /// `NV_KERNELCHANNEL_ALLOC_INTERNALFLAGS_ECC_ERROR_NOTIFIER_TYPE_NONE`: no ECC error notifier.
 const INTERNALFLAGS_ECC_ERROR_NOTIFIER_TYPE_NONE: u32 = 1 << 4;
 
+/// Where a channel runs, by RM handle.
+#[derive(Clone, Copy)]
+pub(crate) enum ChannelSpace {
+    /// In an address space, for a channel allocated alone.
+    VaSpace(u32),
+    /// In a context share of the channel's group.
+    ContextShare(u32),
+}
+
+/// Wrapper for [`bindings::NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS`].
+#[repr(transparent)]
+pub(crate) struct ChannelGroupAllocParams(bindings::NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS);
+
+impl ChannelGroupAllocParams {
+    /// Creates the parameters to allocate a channel group on engine `engine_type` (an
+    /// `NV2080_ENGINE_TYPE`), whose channels run in the address space `va_space`.
+    pub(crate) fn new(va_space: u32, engine_type: u32) -> Self {
+        Self(bindings::NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS {
+            hVASpace: va_space,
+            engineType: engine_type,
+            ..Default::default()
+        })
+    }
+}
+
+// SAFETY: Padding is explicit and will not contain uninitialized data.
+unsafe impl AsBytes for ChannelGroupAllocParams {}
+
+/// Wrapper for [`bindings::NV_CTXSHARE_ALLOCATION_PARAMETERS`].
+#[repr(transparent)]
+pub(crate) struct ContextShareAllocParams(bindings::NV_CTXSHARE_ALLOCATION_PARAMETERS);
+
+impl ContextShareAllocParams {
+    /// Creates the parameters to allocate the synchronous subcontext of a channel group, the one
+    /// graphics work runs in (VEID 0), in the address space `va_space`.
+    pub(crate) fn sync(va_space: u32) -> Self {
+        Self(bindings::NV_CTXSHARE_ALLOCATION_PARAMETERS {
+            hVASpace: va_space,
+            flags: bindings::NV_CTXSHARE_ALLOCATION_FLAGS_SUBCONTEXT_SYNC,
+            subctxId: 0,
+        })
+    }
+}
+
+// SAFETY: This struct only contains integer types, without padding.
+unsafe impl AsBytes for ContextShareAllocParams {}
+
+/// Number of runqueues of a runlist, each of which has a method buffer in a channel group
+/// (`kfifoGetNumRunqueues_GV100` in RM, the size of the arrays of
+/// [`PromoteFaultMethodBuffersParams`]).
+pub(crate) const RUNQUEUES: usize =
+    num::u32_as_usize(bindings::NVA06C_CTRL_INTERNAL_PROMOTE_FAULT_METHOD_BUFFERS_MAX_RUNQUEUES);
+
+/// Wrapper for [`bindings::NVA06C_CTRL_INTERNAL_PROMOTE_FAULT_METHOD_BUFFERS_PARAMS`].
+#[repr(transparent)]
+pub(crate) struct PromoteFaultMethodBuffersParams(
+    bindings::NVA06C_CTRL_INTERNAL_PROMOTE_FAULT_METHOD_BUFFERS_PARAMS,
+);
+
+impl PromoteFaultMethodBuffersParams {
+    /// Creates the parameters to give GSP-RM the method buffers of a channel group, one per
+    /// runqueue, of `size` bytes at the DMA addresses `buffers` in coherent system memory.
+    pub(crate) fn new(buffers: [u64; RUNQUEUES], size: u64) -> Self {
+        Self(
+            bindings::NVA06C_CTRL_INTERNAL_PROMOTE_FAULT_METHOD_BUFFERS_PARAMS {
+                methodBufferMemdesc: buffers.map(|base| {
+                    bindings::NV2080_CTRL_INTERNAL_MEMDESC_INFO {
+                        base,
+                        size,
+                        alignment: 1,
+                        addressSpace: ADDR_SYSMEM,
+                        cpuCacheAttrib: bindings::NV_MEMORY_CACHED,
+                    }
+                }),
+                numValidEntries:
+                    bindings::NVA06C_CTRL_INTERNAL_PROMOTE_FAULT_METHOD_BUFFERS_MAX_RUNQUEUES,
+                ..Default::default()
+            },
+        )
+    }
+}
+
+// SAFETY: This struct only contains integer types for which all bit patterns are valid.
+unsafe impl FromBytes for PromoteFaultMethodBuffersParams {}
+
+// SAFETY: Padding is explicit and will not contain uninitialized data.
+unsafe impl AsBytes for PromoteFaultMethodBuffersParams {}
+
 /// Wrapper for [`bindings::NV_CHANNEL_ALLOC_PARAMS`].
 #[repr(transparent)]
 pub(crate) struct ChannelGpfifoAllocParams(bindings::NV_CHANNEL_ALLOC_PARAMS);
 
 impl ChannelGpfifoAllocParams {
-    /// Creates the parameters to allocate the privileged channel `chid` on engine `engine_type`
-    /// (an `NV2080_ENGINE_TYPE`), in the address space `va_space`, whose GPFIFO of `entries`
-    /// entries is at GPU virtual address `gpfifo`.
-    pub(crate) fn kernel(
-        va_space: u32,
+    /// Creates the parameters to allocate the channel `chid` on engine `engine_type` (an
+    /// `NV2080_ENGINE_TYPE`), in `space`, whose GPFIFO of `entries` entries is at GPU virtual
+    /// address `gpfifo`.
+    ///
+    /// Kernel channels are `privileged`, those of clients aren't, like nouveau's: their push
+    /// buffers can't use the methods reserved to privileged channels.
+    pub(crate) fn new(
+        space: ChannelSpace,
         engine_type: u32,
         chid: u32,
         gpfifo: u64,
         entries: u32,
         memory: &ChannelMemory,
+        privileged: bool,
     ) -> Self {
+        // A channel of a group runs in the address space of its context share instead of naming
+        // one (`kchannelConstruct` in RM).
+        let (va_space, context_share) = match space {
+            ChannelSpace::VaSpace(va_space) => (va_space, 0),
+            ChannelSpace::ContextShare(context_share) => (0, context_share),
+        };
         let vram = |base, size| bindings::NV_MEMORY_DESC_PARAMS {
             base,
             size,
@@ -1118,12 +1233,17 @@ impl ChannelGpfifoAllocParams {
             gpFifoOffset: gpfifo,
             gpFifoEntries: entries,
             // The channel ID is set through the index of the channel's USERD.
-            flags: NVOS04_FLAGS_PRIVILEGED_CHANNEL
-                | (chid % CHANNEL_USERDS_PER_PAGE) << NVOS04_FLAGS_CHANNEL_USERD_INDEX_VALUE_SHIFT
+            flags: if privileged {
+                NVOS04_FLAGS_PRIVILEGED_CHANNEL
+            } else {
+                0
+            } | (chid % CHANNEL_USERDS_PER_PAGE)
+                << NVOS04_FLAGS_CHANNEL_USERD_INDEX_VALUE_SHIFT
                 | (chid / CHANNEL_USERDS_PER_PAGE)
                     << NVOS04_FLAGS_CHANNEL_USERD_INDEX_PAGE_VALUE_SHIFT
                 | NVOS04_FLAGS_CHANNEL_USERD_INDEX_PAGE_FIXED,
             hVASpace: va_space,
+            hContextShare: context_share,
             engineType: engine_type,
             instanceMem: vram(memory.instance, CHANNEL_INSTANCE_SIZE),
             userdMem: vram(memory.userd, CHANNEL_USERD_SIZE),
@@ -1134,8 +1254,11 @@ impl ChannelGpfifoAllocParams {
                 addressSpace: ADDR_SYSMEM,
                 cacheAttrib: bindings::NV_MEMORY_CACHED,
             },
-            internalFlags: INTERNALFLAGS_PRIVILEGE_ADMIN
-                | INTERNALFLAGS_ERROR_NOTIFIER_TYPE_NONE
+            internalFlags: if privileged {
+                INTERNALFLAGS_PRIVILEGE_ADMIN
+            } else {
+                INTERNALFLAGS_PRIVILEGE_USER
+            } | INTERNALFLAGS_ERROR_NOTIFIER_TYPE_NONE
                 | INTERNALFLAGS_ECC_ERROR_NOTIFIER_TYPE_NONE,
             ..Default::default()
         })
@@ -1265,9 +1388,9 @@ pub(crate) const GR_CONTEXT_BUFFERS: [GrContextBuffer; 8] = {
             true,
             true,
             false,
-            // In system memory, kernel RM's default for it (`kgraphicsConstructEngine()`: "FECS
-            // event buffer defaults to cached SYSMEM").
-            true,
+            // In VRAM, like nouveau gives it (`r535_gr_promote_ctx()`), rather than in cached
+            // system memory, kernel RM's default for it (`kgraphicsConstructEngine()`).
+            false,
         ),
         buffer(
             bindings::NV0080_CTRL_FIFO_GET_ENGINE_CONTEXT_PROPERTIES_ENGINE_ID_GRAPHICS_PRIV_ACCESS_MAP,

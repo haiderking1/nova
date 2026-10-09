@@ -2,10 +2,10 @@
 
 //! GPFIFO channels.
 //!
-//! A channel lives in an address space of its own. Its control memory holds the push buffer, the
-//! GPFIFO ring listing the parts of the push buffer to run, and a semaphore the channel releases
-//! once the work submitted before is done. Work is run synchronously: one push buffer at a time,
-//! waited for through the semaphore.
+//! A kernel channel lives in an address space of its own, a client's channel in the client's.
+//! Its control memory holds the kernel's push buffer, the GPFIFO ring listing the push buffers to
+//! run, and a semaphore the channel releases once the work submitted before is done. The kernel's
+//! work is run synchronously: one push buffer at a time, waited for through the semaphore.
 
 use core::ops::Range;
 
@@ -29,22 +29,30 @@ use crate::{
         cmdq::Cmdq,
         commands::{
             Channel as RmChannel,
+            ChannelGroup,
+            ChannelObject,
             Client,
-            Handle, //
+            ContextShare,
+            Device,
+            Handle,
+            VaSpace, //
         },
         rm::{
             commands::{
+                AllocChannelGroupKepler,
+                AllocContextShareFermi,
                 CeGetFaultMethodBufferSize,
                 GpfifoBind,
                 GpfifoSchedule,
                 RmAlloc,
                 RmAllocCommand,
                 RmControl,
-                RmFree, //
+                RmFree,
+                TsgPromoteFaultMethodBuffers, //
             },
             device::RmDevice,
         },
-        ChannelMemory, EngineInfo,
+        ChannelMemory, EngineInfo, RUNQUEUES,
     },
     mm::{
         pagetable::Access,
@@ -66,6 +74,7 @@ use super::{
         ChannelHal,
         GpEntry,
         GpfifoAlloc,
+        GpfifoParent,
         Release, //
     },
     vaspace::{
@@ -80,6 +89,11 @@ const VA_SPACE_HANDLE: u32 = 0x90f1_0000;
 /// Handle of a channel, after nouveau's, completed with its ID.
 const CHANNEL_HANDLE: u32 = 0xf1f0_0000;
 
+/// Handle of the channel group of a channel, completed with the channel's ID.
+const GROUP_HANDLE: u32 = 0xa06c_0000;
+/// Handle of the context share of a channel's group, completed with the channel's ID.
+const CONTEXT_SHARE_HANDLE: u32 = 0x9067_0000;
+
 // Layout of the control memory of a channel.
 
 /// Size of the control memory.
@@ -91,7 +105,7 @@ const PUSH_BUFFER_SIZE: usize = 0x8000;
 /// Offset of the GPFIFO ring.
 const GPFIFO: usize = PUSH_BUFFER + PUSH_BUFFER_SIZE;
 /// Number of entries of the GPFIFO ring: a power of two.
-const GPFIFO_ENTRIES: u32 = 1024;
+pub(super) const GPFIFO_ENTRIES: u32 = 1024;
 /// Offset of the semaphore the channel releases.
 const SEMAPHORE: usize = GPFIFO + num::u32_as_usize(GPFIFO_ENTRIES) * size_of::<GpEntry>();
 static_assert!(SEMAPHORE + size_of::<u32>() <= CONTROL_SIZE);
@@ -99,22 +113,50 @@ static_assert!(SEMAPHORE + size_of::<u32>() <= CONTROL_SIZE);
 /// How long work may take: much longer than any fill of a framebuffer.
 const TIMEOUT: Delta = Delta::from_secs(1);
 
-/// A kernel GPFIFO channel.
+/// The address space a channel runs in.
+enum Space {
+    /// One of the channel's own.
+    Own(AddressSpace),
+    /// A client's, which the client keeps, and gives for the channel's mappings.
+    Client(Handle<VaSpace>),
+}
+
+/// The address space a new channel runs in.
+pub(crate) enum NewSpace<'a> {
+    /// One of the channel's own, in this mode.
+    Own(Mode),
+    /// A client's.
+    Client(&'a mut AddressSpace),
+}
+
+/// A GPFIFO channel.
+///
+/// A channel on the graphics engine is alone in a channel group of its own, with a context share,
+/// like kernel RM allocates them for its clients' channels: GSP-RM's own groups for channels
+/// allocated alone aren't fit for the graphics engine's.
 ///
 /// It must be released with [`Channel::free`] while the GSP is running.
 pub(crate) struct Channel<'a> {
     hal: &'static dyn ChannelHal,
     client: Handle<Client>,
-    address_space: AddressSpace,
+    space: Space,
+    /// The channel group, once allocated, for channels on the graphics engine.
+    group: Option<Handle<ChannelGroup>>,
+    /// The context share of the group, once allocated.
+    context_share: Option<Handle<ContextShare>>,
     /// The channel, once allocated.
     handle: Option<Handle<RmChannel>>,
+    /// The objects allocated on the channel, oldest first.
+    objects: KVec<Handle<ChannelObject>>,
     /// Channel ID.
     chid: u32,
     /// The engine the channel runs on.
     engine: EngineInfo,
     instance: ContiguousVram,
     userd: ContiguousVram,
-    method_buffer: Coherent<'a, [u8]>,
+    /// The buffers the GPU saves pending methods into on faults: the channel group's, one per
+    /// runqueue, or the channel's own. The channel runs on the first runqueue.
+    method_buffers: KVec<Coherent<'a, [u8]>>,
     control: ContiguousVram,
     /// GPU mapping of the control memory.
     control_mapped: Option<MappedRange>,
@@ -125,9 +167,9 @@ pub(crate) struct Channel<'a> {
 }
 
 impl<'a> Channel<'a> {
-    /// Allocates channel `chid` on `engine` under the device of `rm`, in an address space of its
-    /// own in `mode`. Fails with `ENOTSUPP` if Nova doesn't support the channels of `chipset`.
-    /// Unless `scheduled`, the channel is only allocated: it is neither bound to its engine nor
+    /// Allocates channel `chid` on `engine` under the device of `rm`, in the address space
+    /// `space`. Fails with `ENOTSUPP` if Nova doesn't support the channels of `chipset`. Unless
+    /// `scheduled`, the channel is only allocated: it is neither bound to its engine nor
     /// scheduled, so it can't run work.
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -139,16 +181,26 @@ impl<'a> Channel<'a> {
         engine: EngineInfo,
         chid: u32,
         scheduled: bool,
-        mode: Mode,
+        space: NewSpace<'_>,
     ) -> Result<Self> {
         let hal = hal::channel_hal(chipset).ok_or(ENOTSUPP)?;
         let (client, device) = (rm.client(), rm.device());
 
+        let grouped = engine.is_graphics();
         let method_buffer_size =
             RmControl::new(client, rm.subdevice(), CeGetFaultMethodBufferSize::new())
                 .send(dev, cmdq)?;
-        let method_buffer =
-            Coherent::<u8>::zeroed_slice(dev, num::u32_as_usize(method_buffer_size), GFP_KERNEL)?;
+        let mut method_buffers = KVec::new();
+        for _ in 0..if grouped { RUNQUEUES } else { 1 } {
+            method_buffers.push(
+                Coherent::<u8>::zeroed_slice(
+                    dev,
+                    num::u32_as_usize(method_buffer_size),
+                    GFP_KERNEL,
+                )?,
+                GFP_KERNEL,
+            )?;
+        }
 
         let alloc_cleared = |mm: &mut GpuMm<'_>, size: usize| -> Result<ContiguousVram> {
             let vram = mm.alloc_contiguous(size, Alignment::new::<SZ_4K>())?;
@@ -159,66 +211,94 @@ impl<'a> Channel<'a> {
         let userd = alloc_cleared(mm, SZ_4K)?;
         let control = alloc_cleared(mm, CONTROL_SIZE)?;
 
-        let address_space = AddressSpace::new(
-            dev,
-            cmdq,
-            mm,
-            chipset.mmu_version(),
-            client,
-            device,
-            VA_SPACE_HANDLE | chid,
-            mode,
-            VaLayout::Kernel,
-        )?;
+        // Kernel channels have address spaces of their own, and are privileged.
+        let privileged = matches!(space, NewSpace::Own(_));
+        let (own, mut client_space, mode) = match space {
+            NewSpace::Own(mode) => (
+                Some(AddressSpace::new(
+                    dev,
+                    cmdq,
+                    mm,
+                    chipset.mmu_version(),
+                    client,
+                    device,
+                    VA_SPACE_HANDLE | chid,
+                    mode,
+                    VaLayout::Kernel,
+                )?),
+                None,
+                mode,
+            ),
+            NewSpace::Client(space) => (None, Some(space), Mode::ClientOwned),
+        };
+        let space = match own {
+            Some(own) => Space::Own(own),
+            None => Space::Client(client_space.as_ref().ok_or(EINVAL)?.handle()),
+        };
 
         let mut channel = Self {
             hal,
             client,
-            address_space,
+            space,
+            group: None,
+            context_share: None,
             handle: None,
             chid,
             engine,
             instance,
             userd,
-            method_buffer,
+            method_buffers,
             control,
             control_mapped: None,
+            objects: KVec::new(),
             put: 0,
             sequence: 0,
         };
 
-        let set_up = |channel: &mut Self, mm: &mut GpuMm<'_>| -> Result {
-            let control_mapped =
-                channel
-                    .address_space
-                    .map_vram(mm, channel.control.range(), Access::READ_WRITE)?;
+        let set_up = |channel: &mut Self,
+                      mm: &mut GpuMm<'_>,
+                      client_space: Option<&mut AddressSpace>|
+         -> Result {
+            let control = channel.control.range();
+            let space = channel.space_mut(client_space)?;
+            let control_mapped = space.map_vram(mm, control, Access::READ_WRITE)?;
             let gpfifo = control_mapped.start().into_raw() + num::usize_as_u64(GPFIFO);
-            channel.control_mapped = Some(control_mapped);
 
             // The control memory's mapping created the page directories GSP-RM takes.
-            if mode == Mode::Split {
-                channel.address_space.share_with_rm(dev, cmdq, mm)?;
-            }
+            let shared = if mode == Mode::Split {
+                space.share_with_rm(dev, cmdq, mm)
+            } else {
+                Ok(())
+            };
+            let va_space = space.handle();
+            channel.control_mapped = Some(control_mapped);
+            shared?;
+
+            let parent = if grouped {
+                channel.alloc_group(dev, cmdq, device, va_space, method_buffer_size)?
+            } else {
+                GpfifoParent::Device { device, va_space }
+            };
 
             let memory = ChannelMemory {
                 instance: channel.instance.range().start.into_raw(),
                 userd: channel.userd.range().start.into_raw(),
-                method_buffer: channel.method_buffer.dma_address(),
+                method_buffer: channel.method_buffers[0].dma_address(),
                 method_buffer_size: u64::from(method_buffer_size),
             };
             let handle = hal.alloc_gpfifo(
                 dev,
                 cmdq,
                 client,
-                device,
                 CHANNEL_HANDLE | chid,
                 &GpfifoAlloc {
-                    va_space: channel.address_space.handle(),
+                    parent,
                     engine_type: engine.engine_type,
                     chid,
                     gpfifo,
                     entries: GPFIFO_ENTRIES,
                     memory: &memory,
+                    privileged,
                 },
             )?;
             channel.handle = Some(handle);
@@ -232,13 +312,87 @@ impl<'a> Channel<'a> {
             Ok(())
         };
 
-        match set_up(&mut channel, mm) {
+        match set_up(&mut channel, mm, client_space.as_deref_mut()) {
             Ok(()) => Ok(channel),
             Err(err) => {
-                channel.free(dev, cmdq, mm);
+                channel.free(dev, cmdq, mm, client_space);
                 Err(err)
             }
         }
+    }
+
+    /// Allocates the channel group of the channel under `device`, its channels running in the
+    /// address space `va_space`, with the group's method buffers of `method_buffer_size` bytes
+    /// and its context share, as kernel RM does (`kchangrpapiConstruct`), and returns where the
+    /// channel is allocated.
+    fn alloc_group(
+        &mut self,
+        dev: &device::Device,
+        cmdq: &Cmdq<'_>,
+        device: Handle<Device>,
+        va_space: Handle<VaSpace>,
+        method_buffer_size: u32,
+    ) -> Result<GpfifoParent> {
+        let group = RmAlloc::new(
+            self.client,
+            device,
+            Handle::new(GROUP_HANDLE | self.chid),
+            AllocChannelGroupKepler::new(va_space, self.engine.engine_type),
+        )
+        .send(dev, cmdq)?;
+        self.group = Some(group);
+
+        let mut buffers = [0; RUNQUEUES];
+        for (buffer, method_buffer) in buffers.iter_mut().zip(&self.method_buffers) {
+            *buffer = method_buffer.dma_address();
+        }
+        RmControl::new(
+            self.client,
+            group,
+            TsgPromoteFaultMethodBuffers::new(buffers, u64::from(method_buffer_size)),
+        )
+        .send(dev, cmdq)?;
+
+        let context_share = RmAlloc::new(
+            self.client,
+            group,
+            Handle::new(CONTEXT_SHARE_HANDLE | self.chid),
+            AllocContextShareFermi::sync(va_space),
+        )
+        .send(dev, cmdq)?;
+        self.context_share = Some(context_share);
+
+        Ok(GpfifoParent::Group {
+            group,
+            context_share,
+        })
+    }
+
+    /// Returns the address space the channel runs in: its own, or `client_space`, which must then
+    /// be the client's one it runs in.
+    fn space_mut<'s>(
+        &'s mut self,
+        client_space: Option<&'s mut AddressSpace>,
+    ) -> Result<&'s mut AddressSpace> {
+        match (&mut self.space, client_space) {
+            (Space::Own(space), _) => Ok(space),
+            (Space::Client(handle), Some(space)) if space.handle().as_raw() == handle.as_raw() => {
+                Ok(space)
+            }
+            (Space::Client(_), _) => Err(EINVAL),
+        }
+    }
+
+    /// Returns the address space of the channel's own, in which the kernel maps its buffers.
+    ///
+    /// Fails with `EINVAL` for the channels of clients.
+    pub(crate) fn own_space(&mut self) -> Result<&mut AddressSpace> {
+        self.space_mut(None)
+    }
+
+    /// Returns the ID of the channel.
+    pub(crate) fn chid(&self) -> u32 {
+        self.chid
     }
 
     /// Returns the HAL of the channel's GPU.
@@ -256,10 +410,10 @@ impl<'a> Channel<'a> {
         self.handle.ok_or(ENODEV)
     }
 
-    /// Allocates the object `handle` of an engine class on the channel. It is freed along with the
-    /// channel.
+    /// Allocates the object `handle` of an engine class on the channel. It is freed before the
+    /// channel, by [`Channel::release`].
     pub(crate) fn alloc_object<A>(
-        &self,
+        &mut self,
         dev: &device::Device,
         cmdq: &Cmdq<'_>,
         handle: u32,
@@ -268,19 +422,23 @@ impl<'a> Channel<'a> {
     where
         A: RmAllocCommand<Parent = RmChannel>,
     {
-        Ok(
-            RmAlloc::new(self.client, self.handle()?, Handle::new(handle), command)
-                .send(dev, cmdq)
-                .inspect_err(|e| {
-                    dev_err!(
-                        dev,
-                        "channel {}: can't allocate an object of class {:#x}: {:?}\n",
-                        self.chid,
-                        u32::from(A::CLASS),
-                        e
-                    )
-                })?,
-        )
+        // Room for the object first: once allocated, it must be tracked.
+        self.objects.reserve(1, GFP_KERNEL)?;
+        let object = RmAlloc::new(self.client, self.handle()?, Handle::new(handle), command)
+            .send(dev, cmdq)
+            .inspect_err(|e| {
+                dev_err!(
+                    dev,
+                    "channel {}: can't allocate an object of class {:#x}: {:?}\n",
+                    self.chid,
+                    u32::from(A::CLASS),
+                    e
+                )
+            })?;
+        self.objects
+            .push(Handle::new(object.as_raw()), GFP_KERNEL)?;
+
+        Ok(object)
     }
 
     /// Maps the page-aligned VRAM `range` with `access` into the channel's address space,
@@ -292,7 +450,7 @@ impl<'a> Channel<'a> {
         range: Range<VramAddress>,
         access: Access,
     ) -> Result<MappedRange> {
-        self.address_space.map_vram(mm, range, access)
+        self.own_space()?.map_vram(mm, range, access)
     }
 
     /// Like [`Channel::map_vram`], for the pages `pfns` of `memory`, in order.
@@ -303,7 +461,7 @@ impl<'a> Channel<'a> {
         memory: Memory,
         access: Access,
     ) -> Result<MappedRange> {
-        self.address_space.map_pages(mm, pfns, memory, access)
+        self.own_space()?.map_pages(mm, pfns, memory, access)
     }
 
     /// Like [`Channel::map_vram`], but at a virtual address aligned to `alignment`, a power of
@@ -315,26 +473,13 @@ impl<'a> Channel<'a> {
         alignment: u64,
         access: Access,
     ) -> Result<MappedRange> {
-        self.address_space
+        self.own_space()?
             .map_vram_aligned(mm, range, alignment, access)
-    }
-
-    /// Like [`Channel::map_vram_aligned`], for the page-aligned range `dma` of DMA addresses of
-    /// coherent system memory.
-    pub(crate) fn map_sysmem_aligned(
-        &mut self,
-        mm: &mut GpuMm<'_>,
-        dma: Range<u64>,
-        alignment: u64,
-        access: Access,
-    ) -> Result<MappedRange> {
-        self.address_space
-            .map_sysmem_aligned(mm, dma, alignment, access)
     }
 
     /// Tears down a mapping made by [`Channel::map_vram`] or [`Channel::map_vram_aligned`].
     pub(crate) fn unmap(&mut self, mm: &mut GpuMm<'_>, mapped: MappedRange) -> Result {
-        self.address_space.unmap(mm, mapped)
+        self.own_space()?.unmap(mm, mapped)
     }
 
     /// Runs the methods of `push`, and returns once the work they do is done.
@@ -352,20 +497,52 @@ impl<'a> Channel<'a> {
                 payload: sequence,
             },
         )?;
-        if words.len() * size_of::<u32>() > PUSH_BUFFER_SIZE {
+        self.submit(bar, mm, &[], &words)?;
+
+        self.sequence = sequence;
+        self.wait_semaphore(mm, sequence)
+    }
+
+    /// Has the channel run the push buffers of `entries`, then the methods of `tail`, from the
+    /// kernel's push buffer, and returns without waiting for them.
+    ///
+    /// The kernel's push buffer is overwritten: the work submitted before must be done.
+    pub(crate) fn submit(
+        &mut self,
+        bar: Bar0<'_>,
+        mm: &mut GpuMm<'_>,
+        entries: &[GpEntry],
+        tail: &[u32],
+    ) -> Result {
+        let control_va = self.control_va()?;
+        // The ring is empty: the work submitted before is done.
+        let count = entries.len() + usize::from(!tail.is_empty());
+        if count >= num::u32_as_usize(GPFIFO_ENTRIES)
+            || tail.len() * size_of::<u32>() > PUSH_BUFFER_SIZE
+        {
             return Err(EINVAL);
         }
         let control = self.control.range().start;
-        mm.write_vram(control + num::usize_as_u64(PUSH_BUFFER), &words)?;
 
-        let entry = self.hal.gp_entry(
-            control_va + num::usize_as_u64(PUSH_BUFFER),
-            u32::try_from(words.len())?,
-        )?;
-        let entry_offset = GPFIFO + num::u32_as_usize(self.put) * size_of::<GpEntry>();
-        mm.write_vram(control + num::usize_as_u64(entry_offset), &entry)?;
+        let mut ring = KVec::with_capacity(count, GFP_KERNEL)?;
+        ring.extend_from_slice(entries, GFP_KERNEL)?;
+        if !tail.is_empty() {
+            mm.write_vram(control + num::usize_as_u64(PUSH_BUFFER), tail)?;
+            ring.push(
+                self.hal.gp_entry(
+                    control_va + num::usize_as_u64(PUSH_BUFFER),
+                    u32::try_from(tail.len())?,
+                    false,
+                )?,
+                GFP_KERNEL,
+            )?;
+        }
 
-        self.put = (self.put + 1) % GPFIFO_ENTRIES;
+        for entry in &ring {
+            let entry_offset = GPFIFO + num::u32_as_usize(self.put) * size_of::<GpEntry>();
+            mm.write_vram(control + num::usize_as_u64(entry_offset), entry)?;
+            self.put = (self.put + 1) % GPFIFO_ENTRIES;
+        }
         mm.write_vram(
             self.userd.range().start + num::usize_as_u64(self.hal.userd_gp_put()),
             &[self.put],
@@ -373,10 +550,7 @@ impl<'a> Channel<'a> {
 
         // PRAMIN and the doorbell are both in BAR0: the channel sees the writes above when told to
         // look.
-        self.hal.ring_doorbell(bar, &self.engine, self.chid)?;
-
-        self.sequence = sequence;
-        self.wait_semaphore(mm, sequence)
+        self.hal.ring_doorbell(bar, &self.engine, self.chid)
     }
 
     /// Returns the GPU virtual address of the control memory.
@@ -414,9 +588,27 @@ impl<'a> Channel<'a> {
         result.map(|_| ())
     }
 
-    /// Frees the channel in GSP-RM, with the objects allocated on it. The memory it used may be
-    /// unmapped afterwards, before the rest of the channel is freed with [`Channel::free`].
+    /// Frees the channel in GSP-RM, with the objects allocated on it and its group. The memory it
+    /// used may be unmapped afterwards, before the rest of the channel is freed with
+    /// [`Channel::free`].
+    ///
+    /// The objects allocated on the channel are freed first, newest first, then the channel, the
+    /// context share and the group, like kernel RM frees them, rather than having GSP-RM free
+    /// children along with their parents.
     pub(crate) fn release(&mut self, dev: &device::Device, cmdq: &Cmdq<'_>) {
+        while let Some(object) = self.objects.pop() {
+            let _ = RmFree::new(self.client, object)
+                .send(dev, cmdq)
+                .inspect_err(|e| {
+                    dev_err!(
+                        dev,
+                        "channel {}: can't free object {:#x}: {:?}\n",
+                        self.chid,
+                        object.as_raw(),
+                        e
+                    )
+                });
+        }
         if let Some(handle) = self.handle.take() {
             let _ = RmFree::new(self.client, handle)
                 .send(dev, cmdq)
@@ -424,18 +616,71 @@ impl<'a> Channel<'a> {
                     dev_err!(dev, "channel: can't free channel {}: {:?}\n", self.chid, e)
                 });
         }
+        if let Some(context_share) = self.context_share.take() {
+            let _ = RmFree::new(self.client, context_share)
+                .send(dev, cmdq)
+                .inspect_err(|e| {
+                    dev_err!(
+                        dev,
+                        "channel {}: can't free the context share: {:?}\n",
+                        self.chid,
+                        e
+                    )
+                });
+        }
+        if let Some(group) = self.group.take() {
+            let _ = RmFree::new(self.client, group)
+                .send(dev, cmdq)
+                .inspect_err(|e| {
+                    dev_err!(
+                        dev,
+                        "channel {}: can't free the group: {:?}\n",
+                        self.chid,
+                        e
+                    )
+                });
+        }
     }
 
-    /// Frees the channel, with the objects allocated on it, and its address space, which mustn't
-    /// have mappings left but those of the channel. Its memory is freed when it is dropped.
-    pub(crate) fn free(&mut self, dev: &device::Device, cmdq: &Cmdq<'_>, mm: &mut GpuMm<'_>) {
+    /// Frees the channel of a client in GSP-RM, with the objects allocated on it, and forgets its
+    /// mappings: the client's address space is gone with the GPU.
+    pub(crate) fn abandon(&mut self, dev: &device::Device, cmdq: &Cmdq<'_>) {
         self.release(dev, cmdq);
         if let Some(mapped) = self.control_mapped.take() {
-            let _ = self.address_space.unmap(mm, mapped);
+            mapped.forget();
         }
-        let _ = self
-            .address_space
-            .free(dev, cmdq)
-            .inspect_err(|e| dev_err!(dev, "channel: can't free the address space: {:?}\n", e));
+    }
+
+    /// Frees the channel, with the objects allocated on it, and its address space of its own,
+    /// which mustn't have mappings left but those of the channel, or unmaps its mappings from
+    /// `client_space`, the client's one it runs in. Its memory is freed when it is dropped.
+    pub(crate) fn free(
+        &mut self,
+        dev: &device::Device,
+        cmdq: &Cmdq<'_>,
+        mm: &mut GpuMm<'_>,
+        client_space: Option<&mut AddressSpace>,
+    ) {
+        self.release(dev, cmdq);
+        let mapped = self.control_mapped.take();
+        let Ok(space) = self.space_mut(client_space) else {
+            dev_err!(
+                dev,
+                "channel {}: freed without its address space\n",
+                self.chid
+            );
+            if let Some(mapped) = mapped {
+                mapped.forget();
+            }
+            return;
+        };
+        if let Some(mapped) = mapped {
+            let _ = space.unmap(mm, mapped);
+        }
+        if let Space::Own(space) = &self.space {
+            let _ = space
+                .free(dev, cmdq)
+                .inspect_err(|e| dev_err!(dev, "channel: can't free the address space: {:?}\n", e));
+        }
     }
 }
