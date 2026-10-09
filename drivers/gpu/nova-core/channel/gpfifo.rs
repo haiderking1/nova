@@ -3,8 +3,9 @@
 //! GPFIFO channels.
 //!
 //! A kernel channel lives in an address space of its own, a client's channel in the client's.
-//! Its control memory holds the kernel's push buffer, the GPFIFO ring listing the push buffers to
-//! run, and a semaphore the channel releases once the work submitted before is done. The kernel's
+//! Its control memory, in system memory, holds the kernel's push buffer, the GPFIFO ring listing
+//! the push buffers to run, and a semaphore the channel releases once the work submitted before is
+//! done: the CPU writes and reads them without going through VRAM. The kernel's
 //! work is run synchronously: one push buffer at a time, waited for through the semaphore.
 
 use core::ops::Range;
@@ -12,12 +13,21 @@ use core::ops::Range;
 use kernel::{
     device,
     dma::Coherent,
-    io::poll::read_poll_timeout,
+    io::{
+        io_project,
+        poll::read_poll_timeout,
+        Io,
+        IoBase, //
+    },
     prelude::*,
     ptr::Alignment,
     sizes::{
         SZ_4K,
         SZ_64K, //
+    },
+    sync::barrier::{
+        dma_mb,
+        Write, //
     },
     time::Delta, //
 };
@@ -162,7 +172,8 @@ pub(crate) struct Channel<'a> {
     /// The buffers the GPU saves pending methods into on faults: the channel group's, one per
     /// runqueue, or the channel's own. The channel runs on the first runqueue.
     method_buffers: KVec<Coherent<'a, [u8]>>,
-    control: ContiguousVram,
+    /// The control memory, which the GPU accesses coherently with the CPU's caches.
+    control: Coherent<'a, [u8]>,
     /// GPU mapping of the control memory.
     control_mapped: Option<MappedRange>,
     /// Next GPFIFO entry to write.
@@ -214,7 +225,7 @@ impl<'a> Channel<'a> {
         };
         let instance = alloc_cleared(mm, SZ_4K)?;
         let userd = alloc_cleared(mm, SZ_4K)?;
-        let control = alloc_cleared(mm, CONTROL_SIZE)?;
+        let control = Coherent::<u8>::zeroed_slice(dev, CONTROL_SIZE, GFP_KERNEL)?;
 
         // Kernel channels have address spaces of their own, and are privileged.
         let privileged = matches!(space, NewSpace::Own(_));
@@ -264,9 +275,15 @@ impl<'a> Channel<'a> {
                       mm: &mut GpuMm<'_>,
                       client_space: Option<&mut AddressSpace>|
          -> Result {
-            let control = channel.control.range();
+            let start = channel.control.dma_address();
+            let control = start..start + num::usize_as_u64(channel.control.size());
             let space = channel.space_mut(client_space)?;
-            let control_mapped = space.map_vram(mm, control, Access::READ_WRITE)?;
+            let control_mapped = space.map_sysmem_aligned(
+                mm,
+                control,
+                num::usize_as_u64(SZ_4K),
+                Access::READ_WRITE,
+            )?;
             let gpfifo = control_mapped.start().into_raw() + num::usize_as_u64(GPFIFO);
 
             // The control memory's mapping created the page directories GSP-RM takes.
@@ -571,12 +588,10 @@ impl<'a> Channel<'a> {
         if count >= num::u32_as_usize(GPFIFO_ENTRIES) || tail.len() * size_of::<u32>() > tail_room {
             return Err(EINVAL);
         }
-        let control = self.control.range().start;
-
         let mut ring = KVec::with_capacity(count, GFP_KERNEL)?;
         ring.extend_from_slice(entries, GFP_KERNEL)?;
         if !tail.is_empty() {
-            mm.write_vram(control + num::usize_as_u64(tail_offset), tail)?;
+            self.write_control(tail_offset, tail.as_bytes())?;
             ring.push(
                 self.hal.gp_entry(
                     control_va + num::usize_as_u64(tail_offset),
@@ -589,17 +604,42 @@ impl<'a> Channel<'a> {
 
         for entry in &ring {
             let entry_offset = GPFIFO + num::u32_as_usize(self.put) * size_of::<GpEntry>();
-            mm.write_vram(control + num::usize_as_u64(entry_offset), entry)?;
+            self.write_control(entry_offset, entry.as_bytes())?;
             self.put = (self.put + 1) % GPFIFO_ENTRIES;
         }
+
+        // The GPU must see the push buffer and the ring above before `GPPut` moves.
+        dma_mb(Write);
         mm.write_vram(
             self.userd.range().start + num::usize_as_u64(self.hal.userd_gp_put()),
             &[self.put],
         )?;
 
-        // PRAMIN and the doorbell are both in BAR0: the channel sees the writes above when told to
-        // look.
+        // PRAMIN and the doorbell are both in BAR0: the channel sees `GPPut` when told to look.
         self.hal.ring_doorbell(bar, &self.engine, self.chid)
+    }
+
+    /// Writes `bytes` at `offset` of the control memory.
+    fn write_control(&self, offset: usize, bytes: &[u8]) -> Result {
+        let end = offset.checked_add(bytes.len()).ok_or(EINVAL)?;
+        let view = (&self.control).as_view();
+        io_project!(view, [try: offset..end]).copy_from_slice(bytes);
+
+        Ok(())
+    }
+
+    /// Returns the value of the semaphore.
+    fn semaphore(&self) -> u32 {
+        // SAFETY: `SEMAPHORE` is in the control memory, which the GPU writes coherently with the
+        // CPU's caches, and 4-byte aligned.
+        unsafe {
+            self.control
+                .as_ptr()
+                .cast::<u8>()
+                .add(SEMAPHORE)
+                .cast::<u32>()
+                .read_volatile()
+        }
     }
 
     /// Returns the GPU virtual address of the control memory.
@@ -614,11 +654,10 @@ impl<'a> Channel<'a> {
 
     /// Waits for the semaphore to be released with `value`.
     fn wait_semaphore(&self, mm: &mut GpuMm<'_>, value: u32) -> Result {
-        let semaphore = self.control.range().start + num::usize_as_u64(SEMAPHORE);
         let userd = self.userd.range().start;
 
         let result = read_poll_timeout(
-            || mm.read_vram(semaphore),
+            || Ok(self.semaphore()),
             |&released| released == value,
             Delta::from_micros(10),
             TIMEOUT,
@@ -626,9 +665,9 @@ impl<'a> Channel<'a> {
         if result.is_err() {
             let gp_get = mm.read_vram(userd + num::usize_as_u64(self.hal.userd_gp_get()));
             pr_err!(
-                "nova-core: channel {}: work not done: semaphore {:?}, GPGet {:?}, GPPut {}\n",
+                "nova-core: channel {}: work not done: semaphore {}, GPGet {:?}, GPPut {}\n",
                 self.chid,
-                mm.read_vram(semaphore),
+                self.semaphore(),
                 gp_get,
                 self.put
             );
