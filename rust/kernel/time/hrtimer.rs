@@ -716,7 +716,11 @@ pub trait RawHrTimerCallback {
 pub trait HrTimerCallback {
     /// The type whose [`RawHrTimerCallback::run`] method will be invoked when
     /// the timer expires.
-    type Pointer<'a>: RawHrTimerCallback;
+    ///
+    /// It may borrow `Self`, such as [`Pin<&'a Self>`], for a `Self` that borrows data itself.
+    type Pointer<'a>: RawHrTimerCallback
+    where
+        Self: 'a;
 
     /// Called by the timer logic when the timer fires.
     fn run(
