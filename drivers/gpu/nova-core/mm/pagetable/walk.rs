@@ -106,6 +106,30 @@ impl<M: MmuConfig> PtWalkInner<M> {
         table + index * entry_size
     }
 
+    /// Returns the address of the PTE of `vfn` in `pte_table`, the PTE-level table it is in.
+    pub(super) fn pte_addr(pte_table: VramAddress, vfn: Vfn) -> VramAddress {
+        let idx = M::level_index(VirtualAddress::from(vfn), M::PTE_LEVEL.as_index());
+        Self::entry_addr(pte_table, M::PTE_LEVEL, idx)
+    }
+
+    /// Returns whether `vfn` has the first PTE of its PTE-level table.
+    pub(super) fn starts_pte_table(vfn: Vfn) -> bool {
+        M::level_index(VirtualAddress::from(vfn), M::PTE_LEVEL.as_index()) == 0
+    }
+
+    /// Returns the PTE-level table `vfn` is in, if the page directories leading to it are
+    /// installed.
+    pub(super) fn pte_table(
+        &self,
+        pramin: &mut pramin::Pramin<'_>,
+        vfn: Vfn,
+    ) -> Result<Option<VramAddress>> {
+        Ok(match self.walk_pde_levels(pramin, vfn, |_| None)? {
+            WalkPdeResult::Complete { pte_table } => Some(pte_table),
+            WalkPdeResult::Missing { .. } => None,
+        })
+    }
+
     /// Create a new page table walker.
     pub(super) fn new(pdb_addr: VramAddress) -> Self {
         Self {

@@ -159,6 +159,30 @@ impl<'gpu> Pramin<'gpu> {
         Ok((addr - self.window_range.start).into_safe_cast())
     }
 
+    /// Writes `values` into the consecutive 64-bit words of VRAM from `vram_addr`, 8-byte aligned,
+    /// with a single ordering point after the last: reading back through the window is uncached,
+    /// and costs far more than the writes.
+    pub(super) fn write_u64s(&mut self, vram_addr: VramAddress, values: &[u64]) -> Result {
+        let mut addr = vram_addr;
+        for &value in values {
+            let offset = self.window_offset(addr, size_of::<u64>())?;
+            let view: Mmio<'_, u64> = io_project!(self.window, try: OffsetLoc::new(offset));
+            view.write_val(value);
+            addr = addr
+                .checked_add(size_of::<u64>().into_safe_cast())
+                .ok_or(EINVAL)?;
+        }
+
+        if !values.is_empty() {
+            // The ordering point, as `PraminAccess` inserts on drop.
+            let offset = self.window_offset(vram_addr, size_of::<u8>())?;
+            let view: Mmio<'_, u8> = io_project!(self.window, try: OffsetLoc::new(offset));
+            view.read_val();
+        }
+
+        Ok(())
+    }
+
     /// Return a typed MMIO view of a `T` at `vram_addr`.
     ///
     /// Returns an error if `vram_addr` is not aligned to `T`'s alignment, or if

@@ -2,7 +2,10 @@
 
 //! Page table mapping operations for NVIDIA GPUs.
 
-use core::marker::PhantomData;
+use core::{
+    marker::PhantomData,
+    ops::Range, //
+};
 
 use kernel::{
     gpu::buddy::{
@@ -23,8 +26,7 @@ use kernel::{
 use super::{
     walk::{
         PtWalkInner,
-        WalkPdeResult,
-        WalkResult, //
+        WalkPdeResult, //
     },
     Access,
     AperturePde,
@@ -40,6 +42,7 @@ use super::{
 };
 use crate::{
     mm::{
+        pramin,
         GpuMm,
         Pfn,
         Vfn,
@@ -176,11 +179,14 @@ impl<M: MmuConfig> PtMapInner<M> {
         let pt_upper_bound = M::pt_pages_upper_bound(num_pages);
         page_table_allocs.reserve(pt_upper_bound, GFP_KERNEL)?;
 
-        // Walk the hierarchy per-VFN to prepare pages for all missing PDEs.
+        // Walk the hierarchy to prepare pages for all missing PDEs, once per PTE-level table: the
+        // pages of a table share the path to it.
         for i in 0..num_pages {
             let i_u64: u64 = i.into_safe_cast();
             let vfn = Vfn::new(vfn_start.raw() + i_u64);
-            self.ensure_single_pte_path(mm, vfn, pt_pages)?;
+            if i == 0 || PtWalkInner::<M>::starts_pte_table(vfn) {
+                self.ensure_single_pte_path(mm, vfn, pt_pages)?;
+            }
         }
         Ok(())
     }
@@ -225,26 +231,65 @@ impl<M: MmuConfig> PtMapInner<M> {
             }
 
             // Write PTEs (all PDEs now installed in HW).
-            for (i, &pfn) in pfns.iter().enumerate() {
-                let i_u64: u64 = i.into_safe_cast();
-                let vfn = Vfn::new(vfn_start.raw() + i_u64);
-                let result = self.walker.walk_to_pte_lookup_with_window(pramin, vfn)?;
-
-                match result {
-                    WalkResult::Unmapped { pte_addr } | WalkResult::Mapped { pte_addr, .. } => {
-                        let pte = M::Pte::new(aperture, pfn, access);
-                        pte.write(pramin, pte_addr)?;
-                    }
-                    WalkResult::PageTableMissing => {
+            let mut ptes = KVec::new();
+            self.for_each_pte_run(
+                pramin,
+                vfn_start,
+                pfns.len(),
+                |pramin, run, vfn, pte_addr| {
+                    let Some(pte_addr) = pte_addr else {
                         kernel::pr_warn_once!("VMM: page table missing for VFN {vfn:?}\n");
                         return Err(EIO);
+                    };
+
+                    ptes.clear();
+                    for &pfn in &pfns[run] {
+                        ptes.push(M::Pte::new(aperture, pfn, access).into(), GFP_KERNEL)?;
                     }
-                }
-            }
+                    pramin.write_u64s(pte_addr, &ptes)
+                },
+            )?;
         }
 
         // Flush TLB.
         mm.tlb().flush(self.pdb_addr)
+    }
+
+    /// Splits the `num_pages` pages from `vfn_start` into runs whose PTEs follow each other in a
+    /// PTE-level table, and calls `f` with the indices of each run's pages, its first page, and
+    /// the address of its first PTE, if its page table is installed.
+    ///
+    /// The page directories are walked once per run: walks read them through PRAMIN, uncached,
+    /// which costs far more than writing PTEs.
+    fn for_each_pte_run(
+        &self,
+        pramin: &mut pramin::Pramin<'_>,
+        vfn_start: Vfn,
+        num_pages: usize,
+        mut f: impl FnMut(&mut pramin::Pramin<'_>, Range<usize>, Vfn, Option<VramAddress>) -> Result,
+    ) -> Result {
+        let vfn = |i: usize| -> Vfn {
+            let i_u64: u64 = i.into_safe_cast();
+            Vfn::new(vfn_start.raw() + i_u64)
+        };
+
+        let mut start = 0;
+        while start < num_pages {
+            let mut end = start + 1;
+            while end < num_pages && !PtWalkInner::<M>::starts_pte_table(vfn(end)) {
+                end += 1;
+            }
+
+            let first = vfn(start);
+            let pte_addr = self
+                .walker
+                .pte_table(pramin, first)?
+                .map(|table| PtWalkInner::<M>::pte_addr(table, first));
+            f(pramin, start..end, first, pte_addr)?;
+            start = end;
+        }
+
+        Ok(())
     }
 
     /// Invalidate PTEs for a range and flush TLB.
@@ -254,24 +299,21 @@ impl<M: MmuConfig> PtMapInner<M> {
         vfn_start: Vfn,
         num_pages: usize,
     ) -> Result {
-        let invalid_pte = M::Pte::invalid();
+        let invalid_pte: u64 = M::Pte::invalid().into();
 
         {
             let pramin = mm.pramin_mut();
-            for i in 0..num_pages {
-                let i_u64: u64 = i.into_safe_cast();
-                let vfn = Vfn::new(vfn_start.raw() + i_u64);
-                let result = self.walker.walk_to_pte_lookup_with_window(pramin, vfn)?;
+            let mut ptes = KVec::new();
+            self.for_each_pte_run(pramin, vfn_start, num_pages, |pramin, run, _, pte_addr| {
+                // Nothing is mapped without a page table.
+                let Some(pte_addr) = pte_addr else {
+                    return Ok(());
+                };
 
-                match result {
-                    WalkResult::Mapped { pte_addr, .. } | WalkResult::Unmapped { pte_addr } => {
-                        invalid_pte.write(pramin, pte_addr)?;
-                    }
-                    WalkResult::PageTableMissing => {
-                        continue;
-                    }
-                }
-            }
+                ptes.clear();
+                ptes.extend_with(run.len(), invalid_pte, GFP_KERNEL)?;
+                pramin.write_u64s(pte_addr, &ptes)
+            })?;
         }
 
         mm.tlb().flush(self.pdb_addr)
