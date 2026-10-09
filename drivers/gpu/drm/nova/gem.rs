@@ -14,6 +14,7 @@ use kernel::{
 };
 
 use nova_core::api::{
+    BufferRef,
     SystemBuffer,
     VramBuffer,
     VRAM_BUFFER_ALIGN, //
@@ -153,6 +154,14 @@ impl NovaObject {
         .ok_or(EINVAL)?;
 
         gem::Object::new(dev, size, placement)
+    }
+
+    /// Returns the memory of the object, for nova-core to map it.
+    pub(crate) fn buffer(&self) -> Result<BufferRef<'_>> {
+        Ok(match &self.memory {
+            Memory::Vram(buffer) => BufferRef::Vram(buffer.as_ref().ok_or(ENODEV)?),
+            Memory::System(buffer) => BufferRef::System(buffer),
+        })
     }
 
     /// Returns where the memory of the object is.

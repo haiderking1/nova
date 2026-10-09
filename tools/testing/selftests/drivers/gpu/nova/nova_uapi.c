@@ -332,4 +332,145 @@ TEST(dumb)
 	close(fd);
 }
 
+
+/* The kernel managed range of the address spaces of the tests, like NVK's on nouveau. */
+#define KERNEL_START	(1ull << 39)
+#define KERNEL_SIZE	(1ull << 39)
+
+static int nova_vm_init(int fd, __u64 addr, __u64 size)
+{
+	struct drm_nova_vm_init init = {
+		.kernel_managed_addr = addr,
+		.kernel_managed_size = size,
+	};
+
+	return ioctl(fd, DRM_IOCTL_NOVA_VM_INIT, &init) ? -errno : 0;
+}
+
+static int nova_vm_bind(int fd, struct drm_nova_vm_bind_op *ops, __u32 count)
+{
+	struct drm_nova_vm_bind bind = {
+		.op_count = count,
+		.op_ptr = (__u64)(uintptr_t)ops,
+	};
+
+	return ioctl(fd, DRM_IOCTL_NOVA_VM_BIND, &bind) ? -errno : 0;
+}
+
+static int nova_vm_map(int fd, __u64 addr, __u32 handle, __u64 offset, __u64 range, __u32 kind)
+{
+	struct drm_nova_vm_bind_op op = {
+		.op = DRM_NOVA_VM_BIND_OP_MAP,
+		.handle = handle,
+		.kind = kind,
+		.addr = addr,
+		.bo_offset = offset,
+		.range = range,
+	};
+
+	return nova_vm_bind(fd, &op, 1);
+}
+
+static int nova_vm_unmap(int fd, __u64 addr, __u64 range)
+{
+	struct drm_nova_vm_bind_op op = {
+		.op = DRM_NOVA_VM_BIND_OP_UNMAP,
+		.addr = addr,
+		.range = range,
+	};
+
+	return nova_vm_bind(fd, &op, 1);
+}
+
+TEST_F(nova, info_vm)
+{
+	struct drm_nova_info_vm vm = {};
+
+	ASSERT_EQ(sizeof(vm), nova_info(self->fd, DRM_NOVA_INFO_VM, &vm, sizeof(vm)));
+	TH_LOG("address spaces of %llu GiB", vm.va_size >> 30);
+	EXPECT_LE(KERNEL_START + KERNEL_SIZE, vm.va_size);
+}
+
+TEST_F(nova, vm_create)
+{
+	EXPECT_EQ(-EINVAL, nova_vm_unmap(self->fd, 1 << 20, 4096));
+	EXPECT_EQ(-EINVAL, nova_vm_init(self->fd, KERNEL_START, 0));
+	EXPECT_EQ(-EINVAL, nova_vm_init(self->fd, KERNEL_START + 1, KERNEL_SIZE));
+	EXPECT_EQ(-EINVAL, nova_vm_init(self->fd, KERNEL_START, 1ull << 60));
+	ASSERT_EQ(0, nova_vm_init(self->fd, KERNEL_START, KERNEL_SIZE));
+	EXPECT_EQ(-EEXIST, nova_vm_init(self->fd, KERNEL_START, KERNEL_SIZE));
+}
+
+TEST_F(nova, vm_mappings)
+{
+	int vram, system;
+
+	ASSERT_EQ(0, nova_vm_init(self->fd, KERNEL_START, KERNEL_SIZE));
+	vram = nova_gem_create(self->fd, 1 << 20, DRM_NOVA_GEM_VRAM);
+	ASSERT_LE(0, vram);
+	system = nova_gem_create(self->fd, 1 << 20, 0);
+	ASSERT_LE(0, system);
+
+	/* Both kinds of memory, block-linear and pitch-linear. */
+	EXPECT_EQ(0, nova_vm_map(self->fd, 1 << 20, vram, 0, 1 << 20, 0x06));
+	EXPECT_EQ(0, nova_vm_map(self->fd, 4 << 20, system, 0, 1 << 20, 0x00));
+
+	/* Over a mapping, splitting it, then unmapping parts of mappings. */
+	EXPECT_EQ(0, nova_vm_map(self->fd, (1 << 20) + (64 << 10), system, 64 << 10, 64 << 10, 0));
+	EXPECT_EQ(0, nova_vm_unmap(self->fd, (1 << 20) + (512 << 10), 4096));
+	EXPECT_EQ(0, nova_vm_unmap(self->fd, (4 << 20) - (64 << 10), 128 << 10));
+
+	/* Compressible kinds are mapped uncompressed. */
+	EXPECT_EQ(0, nova_vm_map(self->fd, 8 << 20, vram, 0, 1 << 20, 0x08));
+
+	/* A part of the object, the end of the address space below the kernel's range. */
+	EXPECT_EQ(0, nova_vm_map(self->fd, KERNEL_START - 4096, vram, (1 << 20) - 4096, 4096, 0));
+
+	EXPECT_EQ(0, nova_vm_unmap(self->fd, 0, KERNEL_START));
+
+	nova_gem_close(self->fd, vram);
+	nova_gem_close(self->fd, system);
+}
+
+TEST_F(nova, vm_mappings_invalid)
+{
+	int bo;
+
+	ASSERT_EQ(0, nova_vm_init(self->fd, KERNEL_START, KERNEL_SIZE));
+	bo = nova_gem_create(self->fd, 1 << 20, DRM_NOVA_GEM_VRAM);
+	ASSERT_LE(0, bo);
+
+	/* In the kernel's range, and past the end of the address space. */
+	EXPECT_EQ(-EINVAL, nova_vm_map(self->fd, KERNEL_START, bo, 0, 4096, 0));
+	EXPECT_EQ(-EINVAL, nova_vm_map(self->fd, KERNEL_START - 4096, bo, 0, 8192, 0));
+	EXPECT_EQ(-EINVAL, nova_vm_unmap(self->fd, KERNEL_START, 4096));
+	EXPECT_EQ(-EINVAL, nova_vm_map(self->fd, 1ull << 41, bo, 0, 4096, 0));
+	/* Unaligned, empty, past the end of the object. */
+	EXPECT_EQ(-EINVAL, nova_vm_map(self->fd, (1 << 20) + 1, bo, 0, 4096, 0));
+	EXPECT_EQ(-EINVAL, nova_vm_map(self->fd, 1 << 20, bo, 1, 4096, 0));
+	EXPECT_EQ(-EINVAL, nova_vm_map(self->fd, 1 << 20, bo, 0, 0, 0));
+	EXPECT_EQ(-EINVAL, nova_vm_map(self->fd, 1 << 20, bo, 4096, 1 << 20, 0));
+	/* Not a kind, and not an object. */
+	EXPECT_EQ(-EINVAL, nova_vm_map(self->fd, 1 << 20, bo, 0, 4096, 0x07));
+	EXPECT_EQ(-EINVAL, nova_vm_map(self->fd, 1 << 20, bo, 0, 4096, 0x100));
+	EXPECT_EQ(-ENOENT, nova_vm_map(self->fd, 1 << 20, bo + 1000, 0, 4096, 0));
+
+	nova_gem_close(self->fd, bo);
+}
+
+/* A mapping keeps its object, and closing the file unmaps everything. */
+TEST_F(nova, vm_keeps_objects)
+{
+	int bo;
+
+	ASSERT_EQ(0, nova_vm_init(self->fd, KERNEL_START, KERNEL_SIZE));
+	bo = nova_gem_create(self->fd, 64 << 20, DRM_NOVA_GEM_VRAM);
+	ASSERT_LE(0, bo);
+	for (int i = 0; i < 64; i++)
+		ASSERT_EQ(0, nova_vm_map(self->fd, (__u64)(i + 1) << 30, bo, 0, 64 << 20, 0));
+
+	nova_gem_close(self->fd, bo);
+	EXPECT_EQ(0, nova_vm_unmap(self->fd, 1ull << 30, 32ull << 30));
+}
+
 TEST_HARNESS_MAIN

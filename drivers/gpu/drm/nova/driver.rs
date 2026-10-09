@@ -159,5 +159,7 @@ impl drm::Driver for NovaDriver {
         (NOVA_INFO, drm_nova_info, ioctl::RENDER_ALLOW, File::info),
         (NOVA_GEM_CREATE, drm_nova_gem_create, ioctl::AUTH | ioctl::RENDER_ALLOW, File::gem_create),
         (NOVA_GEM_INFO, drm_nova_gem_info, ioctl::AUTH | ioctl::RENDER_ALLOW, File::gem_info),
+        (NOVA_VM_INIT, drm_nova_vm_init, ioctl::AUTH | ioctl::RENDER_ALLOW, File::vm_init),
+        (NOVA_VM_BIND, drm_nova_vm_bind, ioctl::AUTH | ioctl::RENDER_ALLOW, File::vm_bind),
     }
 }

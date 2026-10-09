@@ -5,9 +5,16 @@ use crate::driver::{
     NovaDevice,
     NovaDriver, //
 };
-use crate::gem::{
-    NovaObject,
-    Placement, //
+use crate::{
+    gem::{
+        NovaObject,
+        Placement, //
+    },
+    kms::with_api,
+    vm::{
+        BindOp,
+        Vm, //
+    },
 };
 use kernel::{
     alloc::flags::*,
@@ -21,12 +28,55 @@ use kernel::{
         IntoSafeCast, //
     },
     prelude::*,
-    transmute::AsBytes,
+    sync::{
+        aref::ARef,
+        new_mutex,
+        Mutex, //
+    },
+    transmute::{
+        AsBytes,
+        FromBytes, //
+    },
     uaccess::UserSlice,
     uapi,
 };
 
-pub(crate) struct File;
+/// An open DRM file.
+#[pin_data(PinnedDrop)]
+pub(crate) struct File {
+    /// The device, to free the address space.
+    drm: ARef<NovaDevice>,
+    /// The GPU virtual address space of the file, once created.
+    #[pin]
+    vm: Mutex<Option<Vm>>,
+}
+
+#[pinned_drop]
+impl PinnedDrop for File {
+    fn drop(self: Pin<&mut Self>) {
+        if let Some(vm) = self.vm.lock().take() {
+            // Without nova-core, the address space just goes away, as the GPU did.
+            let _ = with_api(&self.drm, |api| {
+                vm.free(api);
+                Ok(())
+            });
+        }
+    }
+}
+
+/// An operation on the mappings of the address space of a file, as userspace passes it.
+#[repr(transparent)]
+struct VmBindOp(uapi::drm_nova_vm_bind_op);
+
+// SAFETY: `drm_nova_vm_bind_op` only contains integers, for which all bit patterns are valid.
+unsafe impl FromBytes for VmBindOp {}
+
+/// Information on the GPU virtual address spaces returned to userspace.
+#[repr(transparent)]
+struct VmInfo(uapi::drm_nova_info_vm);
+
+// SAFETY: `VmInfo` has no interior mutability, and there are no uninitialized bytes.
+unsafe impl AsBytes for VmInfo {}
 
 /// GPU information returned to userspace.
 #[repr(transparent)]
@@ -139,8 +189,14 @@ fn write_info<T: AsBytes>(info: &mut uapi::drm_nova_info, value: T) -> Result {
 impl drm::file::DriverFile for File {
     type Driver = NovaDriver;
 
-    fn open(_dev: &NovaDevice) -> Result<Pin<KBox<Self>>> {
-        Ok(KBox::new(Self, GFP_KERNEL)?.into())
+    fn open(dev: &NovaDevice) -> Result<Pin<KBox<Self>>> {
+        KBox::pin_init(
+            try_pin_init!(Self {
+                drm: dev.into(),
+                vm <- new_mutex!(None, "nova_file_vm"),
+            }),
+            GFP_KERNEL,
+        )
     }
 }
 
@@ -197,6 +253,91 @@ impl File {
         Ok(0)
     }
 
+    /// IOCTL: vm_init: Create the GPU virtual address space of the file.
+    pub(crate) fn vm_init(
+        dev: &NovaDevice<Registered>,
+        reg_data: &DrmRegData<'_>,
+        req: &mut uapi::drm_nova_vm_init,
+        file: &drm::File<File>,
+    ) -> Result<u32> {
+        let kernel_end = req
+            .kernel_managed_addr
+            .checked_add(req.kernel_managed_size)
+            .ok_or(EINVAL)?;
+
+        let inner = file.inner();
+        let mut vm = inner.vm.lock();
+        if vm.is_some() {
+            return Err(EEXIST);
+        }
+        *vm = Some(
+            reg_data
+                .api
+                .with(|api| Vm::new(dev, &api, req.kernel_managed_addr..kernel_end))?,
+        );
+
+        Ok(0)
+    }
+
+    /// IOCTL: vm_bind: Operate on the mappings of the GPU virtual address space of the file.
+    pub(crate) fn vm_bind(
+        _dev: &NovaDevice<Registered>,
+        reg_data: &DrmRegData<'_>,
+        req: &mut uapi::drm_nova_vm_bind,
+        file: &drm::File<File>,
+    ) -> Result<u32> {
+        if req.flags != 0 {
+            return Err(EINVAL);
+        }
+        let count = usize::try_from(req.op_count)?;
+        let mut ops = UserSlice::new(
+            UserPtr::from_addr(req.op_ptr.into_safe_cast_arch()),
+            count.checked_mul(size_of::<VmBindOp>()).ok_or(EINVAL)?,
+        )
+        .reader();
+
+        let inner = file.inner();
+        let mut vm = inner.vm.lock();
+        let vm = Option::as_mut(&mut *vm).ok_or(EINVAL)?;
+
+        reg_data.api.with(|api| {
+            for _ in 0..count {
+                let VmBindOp(op) = ops.read()?;
+                if op.pad != 0 {
+                    return Err(EINVAL);
+                }
+
+                match op.op {
+                    uapi::DRM_NOVA_VM_BIND_OP_MAP => {
+                        let obj = NovaObject::lookup_handle(file, op.handle)?;
+                        vm.bind(
+                            &api,
+                            BindOp::Map {
+                                addr: op.addr,
+                                size: op.range,
+                                obj: &obj,
+                                offset: op.bo_offset,
+                                kind: u8::try_from(op.kind)?,
+                            },
+                        )?;
+                    }
+                    uapi::DRM_NOVA_VM_BIND_OP_UNMAP => vm.bind(
+                        &api,
+                        BindOp::Unmap {
+                            addr: op.addr,
+                            size: op.range,
+                        },
+                    )?,
+                    _ => return Err(EINVAL),
+                }
+            }
+
+            Ok(())
+        })?;
+
+        Ok(0)
+    }
+
     /// IOCTL: info: Query device information.
     pub(crate) fn info(
         _dev: &NovaDevice<Registered>,
@@ -207,6 +348,12 @@ impl File {
         match info.id {
             uapi::DRM_NOVA_INFO_GPU => write_info(info, GpuInfo::new(reg_data)?)?,
             uapi::DRM_NOVA_INFO_GRAPHICS => write_info(info, GraphicsInfo::new(reg_data)?)?,
+            uapi::DRM_NOVA_INFO_VM => write_info(
+                info,
+                VmInfo(uapi::drm_nova_info_vm {
+                    va_size: nova_core::api::VA_SIZE,
+                }),
+            )?,
             _ => return Err(EINVAL),
         }
 

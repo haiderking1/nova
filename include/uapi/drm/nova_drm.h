@@ -300,9 +300,133 @@ struct drm_nova_info_graphics {
 	__u32 class_compute;
 };
 
+/**
+ * DRM_NOVA_INFO_VM
+ *
+ * Query the GPU virtual address spaces of userspace. The result is returned in
+ * a &struct drm_nova_info_vm.
+ */
+#define DRM_NOVA_INFO_VM		0x02
+
+/**
+ * struct drm_nova_info_vm - GPU virtual address space information
+ */
+struct drm_nova_info_vm {
+	/**
+	 * @va_size: Size of the GPU virtual address spaces of userspace, in
+	 * bytes. Their addresses start at 0.
+	 */
+	__u64 va_size;
+};
+
+/**
+ * struct drm_nova_vm_init - create the GPU virtual address space of the file
+ *
+ * Userspace maps memory in the address space at the addresses it chooses, with
+ * &struct drm_nova_vm_bind, but in the kernel managed range, where the kernel
+ * maps what it needs for userspace, such as the memory of its channels. A file
+ * has one address space.
+ */
+struct drm_nova_vm_init {
+	/**
+	 * @kernel_managed_addr: Start of the kernel managed range, page aligned.
+	 */
+	__u64 kernel_managed_addr;
+
+	/**
+	 * @kernel_managed_size: Size of the kernel managed range, page aligned
+	 * and not 0.
+	 */
+	__u64 kernel_managed_size;
+};
+
+/**
+ * DRM_NOVA_VM_BIND_OP_MAP - map memory of a GEM object
+ *
+ * Mapping over existing mappings replaces the parts it covers.
+ */
+#define DRM_NOVA_VM_BIND_OP_MAP		0x0
+
+/**
+ * DRM_NOVA_VM_BIND_OP_UNMAP - unmap memory
+ *
+ * The parts of mappings outside of the range unmapped stay mapped.
+ */
+#define DRM_NOVA_VM_BIND_OP_UNMAP	0x1
+
+/**
+ * struct drm_nova_vm_bind_op - an operation on the mappings of the GPU virtual
+ * address space of the file
+ */
+struct drm_nova_vm_bind_op {
+	/**
+	 * @op: The operation, DRM_NOVA_VM_BIND_OP_*.
+	 */
+	__u32 op;
+
+	/**
+	 * @handle: DRM_NOVA_VM_BIND_OP_MAP: the handle of the GEM object to map.
+	 */
+	__u32 handle;
+
+	/**
+	 * @kind: DRM_NOVA_VM_BIND_OP_MAP: the PTE kind of the memory, how it is
+	 * laid out (NV_MMU_PTE_KIND_*). Memory isn't compressed: compressible
+	 * kinds are mapped as their uncompressed equivalent.
+	 */
+	__u32 kind;
+
+	/**
+	 * @pad: 32 bit padding, should be 0.
+	 */
+	__u32 pad;
+
+	/**
+	 * @addr: Address of the range, page aligned.
+	 */
+	__u64 addr;
+
+	/**
+	 * @bo_offset: DRM_NOVA_VM_BIND_OP_MAP: offset in the GEM object of the
+	 * memory mapped, page aligned.
+	 */
+	__u64 bo_offset;
+
+	/**
+	 * @range: Size of the range, page aligned and not 0.
+	 */
+	__u64 range;
+};
+
+/**
+ * struct drm_nova_vm_bind - operate on the mappings of the GPU virtual address
+ * space of the file
+ *
+ * The operations are carried out in order, before the ioctl returns. On
+ * failure, those before the one that failed are carried out.
+ */
+struct drm_nova_vm_bind {
+	/**
+	 * @op_count: Number of operations at @op_ptr.
+	 */
+	__u32 op_count;
+
+	/**
+	 * @flags: Should be 0.
+	 */
+	__u32 flags;
+
+	/**
+	 * @op_ptr: Pointer to an array of &struct drm_nova_vm_bind_op.
+	 */
+	__u64 op_ptr;
+};
+
 #define DRM_NOVA_INFO			0x00
 #define DRM_NOVA_GEM_CREATE		0x01
 #define DRM_NOVA_GEM_INFO		0x02
+#define DRM_NOVA_VM_INIT		0x03
+#define DRM_NOVA_VM_BIND		0x04
 
 /* Note: this is an enum so that it can be resolved by Rust bindgen. */
 enum {
@@ -312,6 +436,10 @@ enum {
 						   struct drm_nova_gem_create),
 	DRM_IOCTL_NOVA_GEM_INFO		= DRM_IOWR(DRM_COMMAND_BASE + DRM_NOVA_GEM_INFO,
 						   struct drm_nova_gem_info),
+	DRM_IOCTL_NOVA_VM_INIT		= DRM_IOW(DRM_COMMAND_BASE + DRM_NOVA_VM_INIT,
+						  struct drm_nova_vm_init),
+	DRM_IOCTL_NOVA_VM_BIND		= DRM_IOW(DRM_COMMAND_BASE + DRM_NOVA_VM_BIND,
+						  struct drm_nova_vm_bind),
 };
 
 #if defined(__cplusplus)
