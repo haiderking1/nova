@@ -43,6 +43,10 @@ use kernel::{
             Relaxed, //
         },
         rcu::rcu_barrier, //
+    },
+    time::{
+        msecs_to_jiffies,
+        Delta, //
     }, //
 };
 
@@ -523,6 +527,45 @@ impl Fence {
         let _ = self.lock();
 
         ret
+    }
+
+    /// Returns whether the fence was signaled, and the error it was signaled with, if any.
+    ///
+    /// Returns `Ok(false)` if it is not signaled yet, `Ok(true)` if it was without an error, and
+    /// the error otherwise.
+    #[inline]
+    pub fn status(&self) -> Result<bool> {
+        // SAFETY: `self.as_raw()` is a valid, initialized `struct dma_fence`.
+        let ret = unsafe { bindings::dma_fence_get_status(self.as_raw()) };
+        if ret < 0 {
+            return Err(Error::from_errno(ret));
+        }
+
+        Ok(ret > 0)
+    }
+
+    /// Waits for the fence to be signaled, for at most `timeout`, rounded up to jiffies.
+    ///
+    /// Returns whether the fence was signaled: `false` once `timeout` elapsed first. A waiter
+    /// that is `interruptible` returns early with `ERESTARTSYS` on a signal.
+    ///
+    /// This may sleep, so it must not be called in atomic context.
+    pub fn wait_timeout(&self, interruptible: bool, timeout: Delta) -> Result<bool> {
+        let msecs = u32::try_from(timeout.as_millis_ceil().max(0)).unwrap_or(u32::MAX);
+        let jiffies = isize::try_from(msecs_to_jiffies(msecs)).unwrap_or(isize::MAX);
+
+        // SAFETY: `self.as_raw()` is a valid, initialized `struct dma_fence`, which stays valid
+        // for the duration of the call as `self` holds a reference to it.
+        let ret =
+            unsafe { bindings::dma_fence_wait_timeout(self.as_raw(), interruptible, jiffies) };
+        if ret < 0 {
+            return Err(Error::from_errno(
+                i32::try_from(ret).unwrap_or(EINVAL.to_errno()),
+            ));
+        }
+
+        // A fence that signals as the wait times out still counts as signaled.
+        Ok(ret > 0 || self.is_signaled())
     }
 
     /// Lock the fence. A helper only to be used internally in this module.
