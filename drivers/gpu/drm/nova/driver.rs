@@ -154,6 +154,7 @@ impl drm::Driver for NovaDriver {
 
     const INFO: drm::DriverInfo = INFO;
     const FEAT_RENDER: bool = true;
+    const FEAT_SYNCOBJ: bool = true;
 
     kernel::declare_drm_ioctls! {
         (NOVA_INFO, drm_nova_info, ioctl::RENDER_ALLOW, File::info),

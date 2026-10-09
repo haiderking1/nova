@@ -553,15 +553,86 @@ static int nova_channel_destroy(int fd, __u32 channel)
 	return ioctl(fd, DRM_IOCTL_NOVA_CHANNEL_DESTROY, &destroy) ? -errno : 0;
 }
 
-static int nova_exec(int fd, __u32 channel, struct drm_nova_exec_push *pushes, __u32 count)
+static int nova_exec_sync(int fd, __u32 channel, struct drm_nova_exec_push *pushes,
+			  __u32 count, struct drm_nova_sync *waits, __u32 wait_count,
+			  struct drm_nova_sync *sigs, __u32 sig_count)
 {
 	struct drm_nova_exec exec = {
 		.channel = channel,
 		.push_count = count,
+		.wait_count = wait_count,
+		.sig_count = sig_count,
+		.wait_ptr = (__u64)(uintptr_t)waits,
+		.sig_ptr = (__u64)(uintptr_t)sigs,
 		.push_ptr = (__u64)(uintptr_t)pushes,
 	};
 
 	return ioctl(fd, DRM_IOCTL_NOVA_EXEC, &exec) ? -errno : 0;
+}
+
+/* Submits work, without waiting for it. */
+static int nova_exec(int fd, __u32 channel, struct drm_nova_exec_push *pushes, __u32 count)
+{
+	return nova_exec_sync(fd, channel, pushes, count, NULL, 0, NULL, 0);
+}
+
+static int syncobj_create(int fd)
+{
+	struct drm_syncobj_create create = {};
+
+	if (ioctl(fd, DRM_IOCTL_SYNCOBJ_CREATE, &create))
+		return -errno;
+
+	return create.handle;
+}
+
+static void syncobj_destroy(int fd, __u32 handle)
+{
+	struct drm_syncobj_destroy destroy = { .handle = handle };
+
+	ioctl(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &destroy);
+}
+
+/* The absolute CLOCK_MONOTONIC time @ms milliseconds from now, in ns. */
+static __s64 deadline_ms(__s64 ms)
+{
+	struct timespec now;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return (__s64)now.tv_sec * 1000000000 + now.tv_nsec + ms * 1000000;
+}
+
+/* Waits for point @point of @handle, or for its fence if 0, for at most @ms ms. */
+static int syncobj_wait(int fd, __u32 handle, __u64 point, __s64 ms)
+{
+	struct drm_syncobj_timeline_wait wait = {
+		.handles = (__u64)(uintptr_t)&handle,
+		.points = (__u64)(uintptr_t)&point,
+		.timeout_nsec = deadline_ms(ms),
+		.count_handles = 1,
+	};
+
+	return ioctl(fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &wait) ? -errno : 0;
+}
+
+/* Submits work and waits for it to be done. */
+static int nova_exec_wait(int fd, __u32 channel, struct drm_nova_exec_push *pushes,
+			  __u32 count)
+{
+	struct drm_nova_sync sig = { .flags = DRM_NOVA_SYNC_SYNCOBJ };
+	int handle, ret;
+
+	handle = syncobj_create(fd);
+	if (handle < 0)
+		return handle;
+	sig.handle = handle;
+
+	ret = nova_exec_sync(fd, channel, pushes, count, NULL, 0, &sig, 1);
+	if (!ret)
+		ret = syncobj_wait(fd, handle, 0, 5000);
+	syncobj_destroy(fd, handle);
+
+	return ret;
 }
 
 /* An object mapped for the CPU and at @va for the GPU. */
@@ -658,7 +729,7 @@ TEST_F(nova, exec_copy)
 	exec[1].range = 4 * push_copy_fill(push.map + words, gr.class_copy, DST_VA + (1 << 30),
 					   vram.size, 0x5eed5eed);
 	exec[1].flags = DRM_NOVA_EXEC_PUSH_NO_PREFETCH;
-	ASSERT_EQ(0, nova_exec(self->fd, channel, exec, 2));
+	ASSERT_EQ(0, nova_exec_wait(self->fd, channel, exec, 2));
 
 	EXPECT_EQ(-1, find_not(system.map, system.size, 0xc0ffee00));
 	EXPECT_EQ(-1, find_not(vram.map, vram.size, 0x5eed5eed));
@@ -724,7 +795,7 @@ TEST_F(nova, exec_graphics)
 		.va = PUSH_VA,
 		.range = (p - push.map) * 4,
 	};
-	ASSERT_EQ(0, nova_exec(self->fd, channel, &exec, 1));
+	ASSERT_EQ(0, nova_exec_wait(self->fd, channel, &exec, 1));
 	for (int i = 0; i < 4; i++)
 		EXPECT_EQ(data[i], dst.map[i]);
 	EXPECT_EQ(0, dst.map[4]);
@@ -759,12 +830,244 @@ TEST_F(nova, exec_latency)
 			.va = PUSH_VA,
 			.range = 4 * push_copy_fill(push.map, gr.class_copy, DST_VA, 4096, i),
 		};
-		ASSERT_EQ(0, nova_exec(self->fd, channel, &exec, 1));
+		ASSERT_EQ(0, nova_exec_wait(self->fd, channel, &exec, 1));
 		ASSERT_EQ(i, dst.map[1023]);
 	}
 	clock_gettime(CLOCK_MONOTONIC, &end);
 	TH_LOG("%d submissions, %ld us each", runs,
 	       ((end.tv_sec - start.tv_sec) * 1000000 + (end.tv_nsec - start.tv_nsec) / 1000) / runs);
+
+	EXPECT_EQ(0, nova_channel_destroy(self->fd, channel));
+	mapped_bo_destroy(self->fd, &push);
+	mapped_bo_destroy(self->fd, &dst);
+}
+
+/* EXEC returns once the work is submitted, before it is done. */
+TEST_F(nova, exec_async)
+{
+	struct drm_nova_info_graphics gr = graphics_info(self->fd);
+	struct drm_nova_sync sig = { .flags = DRM_NOVA_SYNC_SYNCOBJ };
+	const __u64 size = 512ull << 20;
+	struct drm_nova_exec_push exec;
+	struct mapped_bo push;
+	int big, channel;
+
+	ASSERT_EQ(0, nova_vm_init(self->fd, KERNEL_START, KERNEL_SIZE));
+	mapped_bo_create(_metadata, self->fd, &push, 4096, 0, PUSH_VA);
+	big = nova_gem_create(self->fd, size, DRM_NOVA_GEM_VRAM);
+	ASSERT_LE(0, big);
+	ASSERT_EQ(0, nova_vm_map(self->fd, DST_VA, big, 0, size, 0));
+	channel = nova_channel_create(self->fd, DRM_NOVA_ENGINE_COPY);
+	ASSERT_LE(0, channel);
+	sig.handle = syncobj_create(self->fd);
+	ASSERT_LT(0, sig.handle);
+
+	/* A fill of 512 MiB takes a millisecond or more. */
+	exec = (struct drm_nova_exec_push){
+		.va = PUSH_VA,
+		.range = 4 * push_copy_fill(push.map, gr.class_copy, DST_VA, size, 0x5a5a5a5a),
+	};
+	ASSERT_EQ(0, nova_exec_sync(self->fd, channel, &exec, 1, NULL, 0, &sig, 1));
+	EXPECT_EQ(-ETIME, syncobj_wait(self->fd, sig.handle, 0, 0));
+	EXPECT_EQ(0, syncobj_wait(self->fd, sig.handle, 0, 5000));
+
+	syncobj_destroy(self->fd, sig.handle);
+	EXPECT_EQ(0, nova_channel_destroy(self->fd, channel));
+	mapped_bo_destroy(self->fd, &push);
+	nova_gem_close(self->fd, big);
+}
+
+/*
+ * Work waits for the synchronization objects it is given: a fill of a buffer
+ * on one channel, then a fill of its start on another, which would be
+ * overwritten if it ran first.
+ */
+TEST_F(nova, exec_wait_other_channel)
+{
+	struct drm_nova_info_graphics gr = graphics_info(self->fd);
+	struct drm_nova_sync first = { .flags = DRM_NOVA_SYNC_SYNCOBJ };
+	struct drm_nova_sync second = { .flags = DRM_NOVA_SYNC_SYNCOBJ };
+	struct drm_nova_exec_push exec;
+	struct mapped_bo push, dst;
+	int a, b;
+
+	ASSERT_EQ(0, nova_vm_init(self->fd, KERNEL_START, KERNEL_SIZE));
+	mapped_bo_create(_metadata, self->fd, &push, 4096, 0, PUSH_VA);
+	mapped_bo_create(_metadata, self->fd, &dst, 4 << 20, 0, DST_VA);
+	a = nova_channel_create(self->fd, DRM_NOVA_ENGINE_COPY);
+	b = nova_channel_create(self->fd, DRM_NOVA_ENGINE_COPY);
+	ASSERT_LE(0, a);
+	ASSERT_LE(0, b);
+	first.handle = syncobj_create(self->fd);
+	second.handle = syncobj_create(self->fd);
+	ASSERT_LT(0, first.handle);
+	ASSERT_LT(0, second.handle);
+
+	exec = (struct drm_nova_exec_push){
+		.va = PUSH_VA,
+		.range = 4 * push_copy_fill(push.map, gr.class_copy, DST_VA, dst.size, 0x11111111),
+	};
+	ASSERT_EQ(0, nova_exec_sync(self->fd, a, &exec, 1, NULL, 0, &first, 1));
+	exec = (struct drm_nova_exec_push){
+		.va = PUSH_VA + 1024,
+		.range = 4 * push_copy_fill(push.map + 256, gr.class_copy, DST_VA, 4096, 0x22222222),
+	};
+	ASSERT_EQ(0, nova_exec_sync(self->fd, b, &exec, 1, &first, 1, &second, 1));
+	ASSERT_EQ(0, syncobj_wait(self->fd, second.handle, 0, 5000));
+
+	EXPECT_EQ(-1, find_not(dst.map, 4096, 0x22222222));
+	EXPECT_EQ(-1, find_not(dst.map + 1024, dst.size - 4096, 0x11111111));
+
+	syncobj_destroy(self->fd, first.handle);
+	syncobj_destroy(self->fd, second.handle);
+	EXPECT_EQ(0, nova_channel_destroy(self->fd, a));
+	EXPECT_EQ(0, nova_channel_destroy(self->fd, b));
+	mapped_bo_destroy(self->fd, &push);
+	mapped_bo_destroy(self->fd, &dst);
+}
+
+/* Work signals points of timelines, and waits for them. */
+TEST_F(nova, exec_timeline)
+{
+	struct drm_nova_info_graphics gr = graphics_info(self->fd);
+	struct drm_nova_sync point[2] = {
+		{ .flags = DRM_NOVA_SYNC_TIMELINE_SYNCOBJ, .timeline_value = 1 },
+		{ .flags = DRM_NOVA_SYNC_TIMELINE_SYNCOBJ, .timeline_value = 2 },
+	};
+	struct drm_nova_sync done = { .flags = DRM_NOVA_SYNC_SYNCOBJ };
+	struct drm_nova_exec_push exec;
+	struct mapped_bo push, dst;
+	int a, b, timeline;
+
+	ASSERT_EQ(0, nova_vm_init(self->fd, KERNEL_START, KERNEL_SIZE));
+	mapped_bo_create(_metadata, self->fd, &push, 4096, 0, PUSH_VA);
+	mapped_bo_create(_metadata, self->fd, &dst, 12288, 0, DST_VA);
+	a = nova_channel_create(self->fd, DRM_NOVA_ENGINE_COPY);
+	b = nova_channel_create(self->fd, DRM_NOVA_ENGINE_COPY);
+	ASSERT_LE(0, a);
+	ASSERT_LE(0, b);
+	timeline = syncobj_create(self->fd);
+	done.handle = syncobj_create(self->fd);
+	ASSERT_LT(0, timeline);
+	ASSERT_LT(0, done.handle);
+	point[0].handle = timeline;
+	point[1].handle = timeline;
+
+	/* Points 1 and 2 on one channel, then work on another waiting for point 2. */
+	for (int i = 0; i < 2; i++) {
+		exec = (struct drm_nova_exec_push){
+			.va = PUSH_VA + i * 256,
+			.range = 4 * push_copy_fill(push.map + i * 64, gr.class_copy,
+						    DST_VA + i * 4096, 4096, i + 1),
+		};
+		ASSERT_EQ(0, nova_exec_sync(self->fd, a, &exec, 1, NULL, 0, &point[i], 1));
+	}
+	exec = (struct drm_nova_exec_push){
+		.va = PUSH_VA + 512,
+		.range = 4 * push_copy_fill(push.map + 128, gr.class_copy, DST_VA + 8192, 4096, 3),
+	};
+	ASSERT_EQ(0, nova_exec_sync(self->fd, b, &exec, 1, &point[1], 1, &done, 1));
+
+	ASSERT_EQ(0, syncobj_wait(self->fd, done.handle, 0, 5000));
+	EXPECT_EQ(0, syncobj_wait(self->fd, timeline, 1, 0));
+	EXPECT_EQ(0, syncobj_wait(self->fd, timeline, 2, 0));
+	for (int i = 0; i < 3; i++)
+		EXPECT_EQ(-1, find_not(dst.map + i * 1024, 4096, i + 1));
+
+	syncobj_destroy(self->fd, timeline);
+	syncobj_destroy(self->fd, done.handle);
+	EXPECT_EQ(0, nova_channel_destroy(self->fd, a));
+	EXPECT_EQ(0, nova_channel_destroy(self->fd, b));
+	mapped_bo_destroy(self->fd, &push);
+	mapped_bo_destroy(self->fd, &dst);
+}
+
+/* Invalid synchronization objects fail EXEC before anything runs. */
+TEST_F(nova, exec_sync_invalid)
+{
+	struct drm_nova_info_graphics gr = graphics_info(self->fd);
+	struct drm_nova_sync sync = { .flags = DRM_NOVA_SYNC_SYNCOBJ };
+	struct drm_nova_exec_push exec;
+	struct mapped_bo push, dst;
+	int channel, empty;
+
+	ASSERT_EQ(0, nova_vm_init(self->fd, KERNEL_START, KERNEL_SIZE));
+	mapped_bo_create(_metadata, self->fd, &push, 4096, 0, PUSH_VA);
+	mapped_bo_create(_metadata, self->fd, &dst, 4096, 0, DST_VA);
+	channel = nova_channel_create(self->fd, DRM_NOVA_ENGINE_COPY);
+	ASSERT_LE(0, channel);
+	empty = syncobj_create(self->fd);
+	ASSERT_LT(0, empty);
+	exec = (struct drm_nova_exec_push){
+		.va = PUSH_VA,
+		.range = 4 * push_copy_fill(push.map, gr.class_copy, DST_VA, 4096, 0x0bad0bad),
+	};
+
+	/* No such object, to wait for or to signal. */
+	sync.handle = empty + 100;
+	EXPECT_EQ(-ENOENT, nova_exec_sync(self->fd, channel, &exec, 1, &sync, 1, NULL, 0));
+	EXPECT_EQ(-ENOENT, nova_exec_sync(self->fd, channel, &exec, 1, NULL, 0, &sync, 1));
+	/* An object without a fence to wait for. */
+	sync.handle = empty;
+	EXPECT_EQ(-EINVAL, nova_exec_sync(self->fd, channel, &exec, 1, &sync, 1, NULL, 0));
+	/* A binary object with a point, a point 0, unknown flags. */
+	sync.timeline_value = 1;
+	EXPECT_EQ(-EINVAL, nova_exec_sync(self->fd, channel, &exec, 1, NULL, 0, &sync, 1));
+	sync = (struct drm_nova_sync){ .flags = DRM_NOVA_SYNC_TIMELINE_SYNCOBJ, .handle = empty };
+	EXPECT_EQ(-EINVAL, nova_exec_sync(self->fd, channel, &exec, 1, NULL, 0, &sync, 1));
+	sync = (struct drm_nova_sync){ .flags = 1 << 8, .handle = empty };
+	EXPECT_EQ(-EINVAL, nova_exec_sync(self->fd, channel, &exec, 1, NULL, 0, &sync, 1));
+
+	/* None of these ran: the channel's first work does. */
+	exec = (struct drm_nova_exec_push){
+		.va = PUSH_VA,
+		.range = 4 * push_copy_fill(push.map, gr.class_copy, DST_VA, 4096, 0x600d600d),
+	};
+	ASSERT_EQ(0, nova_exec_wait(self->fd, channel, &exec, 1));
+	EXPECT_EQ(-1, find_not(dst.map, 4096, 0x600d600d));
+
+	syncobj_destroy(self->fd, empty);
+	EXPECT_EQ(0, nova_channel_destroy(self->fd, channel));
+	mapped_bo_destroy(self->fd, &push);
+	mapped_bo_destroy(self->fd, &dst);
+}
+
+/*
+ * Submissions queue up without waiting, more than the ring and the kernel's
+ * push buffer hold at once, and run in order.
+ */
+TEST_F(nova, exec_queue)
+{
+	struct drm_nova_info_graphics gr = graphics_info(self->fd);
+	struct drm_nova_exec_push exec;
+	struct mapped_bo push, dst;
+	struct timespec start, end;
+	const int runs = 1000;
+	__u32 words = 0;
+	int channel;
+
+	ASSERT_EQ(0, nova_vm_init(self->fd, KERNEL_START, KERNEL_SIZE));
+	mapped_bo_create(_metadata, self->fd, &push, 256 << 10, 0, PUSH_VA);
+	mapped_bo_create(_metadata, self->fd, &dst, 4096, 0, DST_VA);
+	channel = nova_channel_create(self->fd, DRM_NOVA_ENGINE_COPY);
+	ASSERT_LE(0, channel);
+
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	for (int i = 0; i < runs; i++) {
+		__u32 n = push_copy_fill(push.map + words, gr.class_copy, DST_VA, 4096, i);
+
+		exec = (struct drm_nova_exec_push){ .va = PUSH_VA + words * 4, .range = n * 4 };
+		words += n;
+		if (i < runs - 1) {
+			ASSERT_EQ(0, nova_exec(self->fd, channel, &exec, 1));
+		} else {
+			ASSERT_EQ(0, nova_exec_wait(self->fd, channel, &exec, 1));
+		}
+	}
+	clock_gettime(CLOCK_MONOTONIC, &end);
+	TH_LOG("%d queued submissions, %ld us each", runs,
+	       ((end.tv_sec - start.tv_sec) * 1000000 + (end.tv_nsec - start.tv_nsec) / 1000) / runs);
+	EXPECT_EQ(-1, find_not(dst.map, 4096, runs - 1));
 
 	EXPECT_EQ(0, nova_channel_destroy(self->fd, channel));
 	mapped_bo_destroy(self->fd, &push);

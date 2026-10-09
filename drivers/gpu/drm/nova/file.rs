@@ -25,9 +25,14 @@ use crate::{
 };
 use kernel::{
     alloc::flags::*,
+    dma_buf::{
+        Fence,
+        FenceChain, //
+    },
     drm::{
         self,
         gem::BaseObject,
+        syncobj::SyncObj,
         Registered, //
     },
     num::casts::{
@@ -84,6 +89,69 @@ struct ExecPush(uapi::drm_nova_exec_push);
 
 // SAFETY: `drm_nova_exec_push` only contains integers, for which all bit patterns are valid.
 unsafe impl FromBytes for ExecPush {}
+
+/// A synchronization object to wait for or to signal, as userspace passes it.
+#[repr(transparent)]
+struct ExecSync(uapi::drm_nova_sync);
+
+// SAFETY: `drm_nova_sync` only contains integers, for which all bit patterns are valid.
+unsafe impl FromBytes for ExecSync {}
+
+impl ExecSync {
+    /// Returns the point of the timeline of the synchronization object, or 0 for its fence.
+    ///
+    /// Fails with `EINVAL` if the flags or the point are invalid.
+    fn point(&self) -> Result<u64> {
+        let sync = &self.0;
+        if sync.flags & !uapi::DRM_NOVA_SYNC_TYPE_MASK != 0 {
+            return Err(EINVAL);
+        }
+
+        match (
+            sync.flags & uapi::DRM_NOVA_SYNC_TYPE_MASK,
+            sync.timeline_value,
+        ) {
+            (uapi::DRM_NOVA_SYNC_SYNCOBJ, 0) => Ok(0),
+            (uapi::DRM_NOVA_SYNC_TIMELINE_SYNCOBJ, point) if point != 0 => Ok(point),
+            _ => Err(EINVAL),
+        }
+    }
+}
+
+/// A synchronization object to signal, ready to take the fence of the work: nothing that may
+/// fail is left once the work is submitted.
+struct Signal {
+    syncobj: ARef<SyncObj>,
+    /// The node of the timeline point to add, and the point, or `None` to replace the fence.
+    point: Option<(FenceChain, u64)>,
+}
+
+impl Signal {
+    /// Gives `fence` to the synchronization object.
+    fn signal(self, fence: &Fence) {
+        match self.point {
+            Some((chain, point)) => self.syncobj.add_point(chain, fence, point),
+            None => self.syncobj.replace_fence(Some(fence)),
+        }
+    }
+}
+
+/// Reads `count` [`ExecSync`]s from userspace at `ptr`.
+fn read_syncs(ptr: u64, count: u32) -> Result<KVVec<ExecSync>> {
+    let count = usize::try_from(count)?;
+    let mut reader = UserSlice::new(
+        UserPtr::from_addr(ptr.into_safe_cast_arch()),
+        count.checked_mul(size_of::<ExecSync>()).ok_or(EINVAL)?,
+    )
+    .reader();
+
+    let mut syncs = KVVec::with_capacity(count, GFP_KERNEL)?;
+    for _ in 0..count {
+        syncs.push(reader.read()?, GFP_KERNEL)?;
+    }
+
+    Ok(syncs)
+}
 
 /// Limits of work submission returned to userspace.
 #[repr(transparent)]
@@ -465,9 +533,43 @@ impl File {
             )?;
         }
 
-        reg_data
+        // Everything that may fail but waiting and the submission is done first, so that once the
+        // work is submitted, its fence can be given to every synchronization object to signal.
+        let mut waits = KVVec::with_capacity(usize::try_from(req.wait_count)?, GFP_KERNEL)?;
+        for sync in read_syncs(req.wait_ptr, req.wait_count)?.iter() {
+            waits.push(
+                SyncObj::find_fence(file, sync.0.handle, sync.point()?)?,
+                GFP_KERNEL,
+            )?;
+        }
+        let mut signals = KVVec::with_capacity(usize::try_from(req.sig_count)?, GFP_KERNEL)?;
+        for sync in read_syncs(req.sig_ptr, req.sig_count)?.iter() {
+            let point = match sync.point()? {
+                0 => None,
+                point => Some((FenceChain::new()?, point)),
+            };
+            signals.push(
+                Signal {
+                    syncobj: SyncObj::lookup(file, sync.0.handle)?,
+                    point,
+                },
+                GFP_KERNEL,
+            )?;
+        }
+
+        // TODO: have the channel wait for them, rather than the submitter, once there is a
+        // scheduler to hold the work until they signal.
+        for fence in waits.iter() {
+            fence.wait(true)?;
+            fence.status()?;
+        }
+
+        let fence = reg_data
             .api
             .with(|api| api.channel_exec(req.channel, &pushes))?;
+        for signal in signals.drain_all() {
+            signal.signal(&fence);
+        }
 
         Ok(0)
     }

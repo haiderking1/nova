@@ -548,11 +548,57 @@ struct drm_nova_exec_push {
 };
 
 /**
+ * DRM_NOVA_SYNC_SYNCOBJ - a binary synchronization object
+ */
+#define DRM_NOVA_SYNC_SYNCOBJ		0x0
+
+/**
+ * DRM_NOVA_SYNC_TIMELINE_SYNCOBJ - a point of the timeline of a
+ * synchronization object
+ */
+#define DRM_NOVA_SYNC_TIMELINE_SYNCOBJ	0x1
+
+/**
+ * DRM_NOVA_SYNC_TYPE_MASK - the bits of the type of a &struct drm_nova_sync
+ */
+#define DRM_NOVA_SYNC_TYPE_MASK		0xf
+
+/**
+ * struct drm_nova_sync - a synchronization object to wait for or to signal
+ */
+struct drm_nova_sync {
+	/**
+	 * @flags: Its type, one of DRM_NOVA_SYNC_*, in DRM_NOVA_SYNC_TYPE_MASK.
+	 */
+	__u32 flags;
+
+	/**
+	 * @handle: The handle of the synchronization object.
+	 */
+	__u32 handle;
+
+	/**
+	 * @timeline_value: DRM_NOVA_SYNC_TIMELINE_SYNCOBJ: the point of its
+	 * timeline, not 0. DRM_NOVA_SYNC_SYNCOBJ: should be 0.
+	 */
+	__u64 timeline_value;
+};
+
+/**
  * struct drm_nova_exec - run push buffers on a channel
  *
- * The push buffers run in order, and the ioctl returns once they are done.
- * It fails with -ETIMEDOUT if they take too long, after which the channel runs
- * no more work: further submissions fail with -ENODEV.
+ * The push buffers run in order, after the work submitted to the channel
+ * before, once the fences of the synchronization objects to wait for signal.
+ * The ioctl returns once they are submitted, without waiting for them to be
+ * done: the synchronization objects to signal then get the fence that signals
+ * once they are.
+ *
+ * The ioctl waits for the fences to wait for, and for the channel to have room
+ * as the work submitted before completes. It fails with -ETIMEDOUT if that work
+ * makes no progress for too long, after which the channel runs no more work:
+ * its fences signal with an error, and further submissions fail with -ENODEV.
+ * It fails with the error a fence to wait for signaled with, without running
+ * the push buffers.
  */
 struct drm_nova_exec {
 	/**
@@ -565,6 +611,26 @@ struct drm_nova_exec {
 	 * &struct drm_nova_info_exec.push_max.
 	 */
 	__u32 push_count;
+
+	/**
+	 * @wait_count: Number of synchronization objects at @wait_ptr to wait for.
+	 */
+	__u32 wait_count;
+
+	/**
+	 * @sig_count: Number of synchronization objects at @sig_ptr to signal.
+	 */
+	__u32 sig_count;
+
+	/**
+	 * @wait_ptr: Pointer to an array of &struct drm_nova_sync to wait for.
+	 */
+	__u64 wait_ptr;
+
+	/**
+	 * @sig_ptr: Pointer to an array of &struct drm_nova_sync to signal.
+	 */
+	__u64 sig_ptr;
 
 	/**
 	 * @push_ptr: Pointer to an array of &struct drm_nova_exec_push.
