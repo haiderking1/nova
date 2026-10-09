@@ -5,7 +5,10 @@ use crate::driver::{
     NovaDevice,
     NovaDriver, //
 };
-use crate::gem::NovaObject;
+use crate::gem::{
+    NovaObject,
+    Placement, //
+};
 use kernel::{
     alloc::flags::*,
     drm::{
@@ -149,7 +152,17 @@ impl File {
         req: &mut uapi::drm_nova_gem_create,
         file: &drm::File<File>,
     ) -> Result<u32> {
-        let obj = NovaObject::new(dev, req.size.try_into()?)?;
+        let placement = match req.flags {
+            0 => Placement::System,
+            // System memory is always visible to the CPU.
+            uapi::DRM_NOVA_GEM_CPU_VISIBLE => Placement::System,
+            uapi::DRM_NOVA_GEM_VRAM => Placement::Vram { cpu_visible: false },
+            flags if flags == uapi::DRM_NOVA_GEM_VRAM | uapi::DRM_NOVA_GEM_CPU_VISIBLE => {
+                Placement::Vram { cpu_visible: true }
+            }
+            _ => return Err(EINVAL),
+        };
+        let obj = NovaObject::new(dev, req.size.try_into()?, placement)?;
 
         req.handle = obj.create_handle(file)?;
 
@@ -165,7 +178,21 @@ impl File {
     ) -> Result<u32> {
         let bo = NovaObject::lookup_handle(file, req.handle)?;
 
+        let (flags, cpu_visible) = match bo.placement() {
+            Placement::System => (uapi::DRM_NOVA_GEM_CPU_VISIBLE, true),
+            Placement::Vram { cpu_visible: false } => (uapi::DRM_NOVA_GEM_VRAM, false),
+            Placement::Vram { cpu_visible: true } => (
+                uapi::DRM_NOVA_GEM_VRAM | uapi::DRM_NOVA_GEM_CPU_VISIBLE,
+                true,
+            ),
+        };
+        req.flags = flags;
         req.size = bo.size().try_into()?;
+        req.mmap_offset = if cpu_visible {
+            bo.create_mmap_offset()?
+        } else {
+            0
+        };
 
         Ok(0)
     }

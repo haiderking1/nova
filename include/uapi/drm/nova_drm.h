@@ -71,7 +71,25 @@ enum drm_nova_chipid {
 };
 
 /**
+ * DRM_NOVA_GEM_VRAM - the memory of the object is in VRAM
+ *
+ * Otherwise, it is in system memory, which the GPU accesses coherently with
+ * the CPU's caches, and which the CPU maps cached.
+ */
+#define DRM_NOVA_GEM_VRAM		(1 << 0)
+
+/**
+ * DRM_NOVA_GEM_CPU_VISIBLE - the CPU can map the object
+ *
+ * The CPU maps VRAM objects write-combined, through the GPU's VRAM BAR. System
+ * memory objects are always visible to the CPU.
+ */
+#define DRM_NOVA_GEM_CPU_VISIBLE	(1 << 1)
+
+/**
  * struct drm_nova_gem_create - create a new DRM GEM object
+ *
+ * The memory of the object is zeroed.
  */
 struct drm_nova_gem_create {
 	/**
@@ -80,12 +98,15 @@ struct drm_nova_gem_create {
 	__u32 handle;
 
 	/**
-	 * @pad: 32 bit padding, should be 0.
+	 * @flags: Where the memory of the object is and how it is accessed:
+	 * DRM_NOVA_GEM_* flags. 0 is system memory.
 	 */
-	__u32 pad;
+	__u32 flags;
 
 	/**
-	 * @size: The size of the new DRM GEM object.
+	 * @size: The size of the new DRM GEM object. It is rounded up to the
+	 * page size, or to 64 KiB, the size of the GPU's large pages, in VRAM.
+	 * &struct drm_nova_gem_info returns the rounded size.
 	 */
 	__u64 size;
 };
@@ -100,14 +121,21 @@ struct drm_nova_gem_info {
 	__u32 handle;
 
 	/**
-	 * @pad: 32 bit padding, should be 0.
+	 * @flags: Where the memory of the object is and how it is accessed:
+	 * DRM_NOVA_GEM_* flags.
 	 */
-	__u32 pad;
+	__u32 flags;
 
 	/**
 	 * @size: The size of the DRM GEM obejct.
 	 */
 	__u64 size;
+
+	/**
+	 * @mmap_offset: The offset to pass to mmap() on the DRM file to map
+	 * the object, 0 if the CPU can't map it.
+	 */
+	__u64 mmap_offset;
 };
 
 /**
