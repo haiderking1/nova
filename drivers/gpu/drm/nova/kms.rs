@@ -293,7 +293,13 @@ impl plane::DriverPlane for NovaPlane {
 
         // The plane covers the whole mode: no positioning, scaling or updates while disabled.
         let crtc_state = state.add_crtc_state(crtc)?;
-        new_state.atomic_helper_check(&crtc_state, false, false)
+        new_state.atomic_helper_check(&crtc_state, false, false)?;
+
+        // After a modeset, nova-core's scanout holds nothing of the frame before, e.g. new
+        // framebuffers for a new mode: the whole frame is copied, whatever the damage.
+        new_state.atomic_helper_check_damage(state);
+
+        Ok(())
     }
 
     fn atomic_update(commit: plane::PlaneAtomicCommit<'_, Self>) {
