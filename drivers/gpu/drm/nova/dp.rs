@@ -152,9 +152,9 @@ impl<'a> BootDp<'a> {
     }
 
     /// Readies the link for head `head` to show `mode`: like NVIDIA's driver, has the link run at
-    /// the slowest configuration that carries the mode. If it doesn't yet, detaches the head and
-    /// trains the link to it, or to the next faster ones if that fails. The next modeset of the
-    /// head attaches it again.
+    /// the slowest configuration that carries the mode. If it doesn't yet, or settings of the
+    /// display engine wait for a full modeset, detaches the head and trains the link to it, or to
+    /// the next faster ones if that fails. The next modeset of the head attaches it again.
     ///
     /// Fails with `EIO` if no configuration trains, leaving the head detached.
     pub(crate) fn ready_for(&self, api: &NovaCoreApi<'_>, head: u32, mode: &ModeTimings) -> Result {
@@ -165,7 +165,9 @@ impl<'a> BootDp<'a> {
             .filter(|link| api.dp_mode_fits(head, link, enhanced_framing, mode))
             .peekable();
         let current = api.boot_display_dp_link()?;
-        if fitting.peek() == Some(&&current) {
+        // Settings of the display engine waiting for a full modeset get one, the link being
+        // trained again as for any other.
+        if fitting.peek() == Some(&&current) && !api.display_modeset_pending() {
             return Ok(());
         }
 
