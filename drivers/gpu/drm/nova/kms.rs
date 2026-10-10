@@ -3,11 +3,12 @@
 //! Display support (kernel mode setting).
 //!
 //! nova-drm drives the display the system firmware set up: one output (primary plane, CRTC,
-//! encoder and connector), on the head and output the firmware lit. Frames are copied by the CPU
-//! from shadow-plane framebuffers into the back buffer of nova-core's own scanout, which is then
-//! flipped, so frames show whole. Through that scanout, nova-core sets the modes of the monitor's
-//! EDID that the display's link carries. Without it, frames are copied into the firmware's
-//! framebuffer, which shows on screen as it is drawn, and only the firmware's mode works.
+//! encoder and connector), on the head and output the firmware lit. The GPU's copy engine copies
+//! frames from the framebuffers, in VRAM or system memory, into the back buffer of nova-core's own
+//! scanout, which is then flipped, so frames show whole. Through that scanout, nova-core sets the
+//! modes of the monitor's EDID that the display's link carries. Without it, frames are copied into
+//! the firmware's framebuffer, which shows on screen as it is drawn, and only the firmware's mode
+//! works.
 //!
 //! With nova-core's scanout, the CRTC has vblanks: nova-core passes on the vblank interrupts of the
 //! head showing the scanout. A flip returns once the frame flipped is on screen, so a commit's
@@ -80,7 +81,9 @@ use kernel::{
 };
 
 use nova_core::api::{
+    BufferRef,
     ConnectorType,
+    DisplayCopy,
     ModeTimings,
     NovaCoreApi,
     PresentMode,
@@ -93,12 +96,8 @@ use crate::driver::{
     NovaDriver, //
 };
 
-/// Largest framebuffer userspace may create, like C drivers using shadow planes.
+/// Largest framebuffer userspace may create, the size of the largest scanouts.
 const MAX_FB_SIZE: u32 = 4096;
-
-/// Bytes per pixel of the framebuffers the plane accepts (XRGB8888) and of the boot displays
-/// nova-drm drives.
-const CPP: usize = 4;
 
 /// Pixel layout of XRGB8888, as `screen_info` reports it.
 const XRGB8888_LAYOUT: PixelFormat = PixelFormat {
@@ -163,11 +162,10 @@ impl KmsDriver for NovaDriver {
         let Some(display) = drm.boot_display.as_ref() else {
             return Ok(());
         };
-        if usize::from(display.format.bits_per_pixel) != CPP * 8 {
-            pr_warn!(
-                "nova-drm: boot display has {} bits per pixel, only 32 are supported\n",
-                display.format.bits_per_pixel
-            );
+        // Frames are copied as they are: without nova-core's scanout, into the framebuffer of the
+        // boot display, whose pixels must then be XRGB8888 too.
+        if display.scanout.is_none() && display.format != XRGB8888_LAYOUT {
+            pr_warn!("nova-drm: boot display's pixels aren't XRGB8888, the only supported format\n");
             return Ok(());
         }
 
@@ -326,11 +324,59 @@ impl plane::DriverPlane for NovaPlane {
     }
 }
 
-/// Draws the frame of `new_state` into the back buffer of nova-core's scanout, and flips it as
+/// Most rectangles copied for a frame: more are copied as the smallest one containing them.
+const MAX_COPIES: usize = 64;
+
+/// Has `copy` copy the `rects` of the framebuffer of `state`, areas in framebuffer coordinates, to
+/// where the plane shows them, from the memory of the framebuffer's GEM object.
+fn copy_framebuffer(
+    state: &PlaneStateMutator<'_, PlaneState<NovaPlaneState>>,
+    rects: &[Rect],
+    copy: impl FnOnce(BufferRef<'_>, u64, u32, &[DisplayCopy]) -> Result,
+) -> Result {
+    let Some(fb) = state.framebuffer() else {
+        return Ok(());
+    };
+    let object = fb.gem_object(0).ok_or(EINVAL)?;
+    let pitch = fb.pitch(0).ok_or(EINVAL)?;
+    let offset = fb.offset(0).ok_or(EINVAL)?;
+
+    let whole;
+    let rects = if rects.len() > MAX_COPIES {
+        whole = rects.iter().skip(1).fold(rects[0], |all, rect| union(&all, rect));
+        core::slice::from_ref(&whole)
+    } else {
+        rects
+    };
+
+    // The plane shows `src` of the framebuffer at `dst`.
+    let (src, dst) = (state.src(), state.dst());
+    let mut copies = KVec::with_capacity(rects.len(), GFP_KERNEL)?;
+    for rect in rects {
+        copies.push(
+            DisplayCopy {
+                src_x: u32::try_from(rect.x1)?,
+                src_y: u32::try_from(rect.y1)?,
+                dst_x: u32::try_from(dst.x1 + (rect.x1 - src.x1))?,
+                dst_y: u32::try_from(dst.y1 + (rect.y1 - src.y1))?,
+                width: u32::try_from(rect.x2 - rect.x1)?,
+                height: u32::try_from(rect.y2 - rect.y1)?,
+            },
+            GFP_KERNEL,
+        )?;
+    }
+    if copies.is_empty() {
+        return Ok(());
+    }
+
+    copy(object.buffer()?, u64::from(offset), pitch, &copies)
+}
+
+/// Copies the frame of `new_state` into the back buffer of nova-core's scanout, and flips it as
 /// `present` says.
 ///
 /// The back buffer holds the frame before the one shown: the parts of the framebuffer that changed
-/// since either are drawn.
+/// since either are copied.
 fn draw_to_scanout(
     drm: &NovaDevice,
     old_state: &PlaneState<NovaPlaneState>,
@@ -346,48 +392,30 @@ fn draw_to_scanout(
         return Ok(());
     };
 
-    let (src, dst) = (new_state.src(), new_state.dst());
-    let mut row_buf = KVec::new();
+    let mut rects = KVec::new();
     let mut damage = None;
+    for rect in new_state.damage(old_state) {
+        damage = Some(damage.map_or(rect, |damage| union(&damage, &rect)));
+        rects.push(rect, GFP_KERNEL)?;
+    }
+    // What changed in the frame before, which the back buffer misses unless copied again.
+    let previous = old_state
+        .damage
+        .and_then(|rect| intersection(&rect, &new_state.src()));
+    if let Some(previous) = previous {
+        if !rects
+            .iter()
+            .any(|rect| intersection(&previous, rect) == Some(previous))
+        {
+            rects.push(previous, GFP_KERNEL)?;
+        }
+    }
 
     registered.registration_data_with(|reg| {
         reg.api.with(|api| {
-            // The scanout has the size of the CRTC's mode, set before the planes are updated.
-            let scanout = api.scanout_mode().ok_or(ENODEV)?;
-            if dst.x1 < 0
-                || dst.y1 < 0
-                || i64::from(dst.x2) > i64::from(scanout.width)
-                || i64::from(dst.y2) > i64::from(scanout.height)
-            {
-                return Err(EINVAL);
-            }
-            let stride = usize::try_from(scanout.stride)?;
-            let state: &PlaneStateMutator<'_, _> = new_state;
-            let draw = |rect: &Rect, row_buf: &mut KVec<u8>| {
-                // `rect` is in framebuffer coordinates; the plane shows `src` at `dst`.
-                let x = usize::try_from(dst.x1 + (rect.x1 - src.x1))?;
-
-                state.read_rows(0, rect, row_buf, |fb_y, row| {
-                    let y = usize::try_from(dst.y1 + (i32::try_from(fb_y)? - src.y1))?;
-
-                    api.write_scanout(y * stride + x * CPP, row)
-                })
-            };
-
-            // What changed in the frame before, which the back buffer misses unless drawn again.
-            let mut previous = old_state.damage.and_then(|rect| intersection(&rect, &src));
-
-            for rect in state.damage(old_state) {
-                draw(&rect, &mut row_buf)?;
-                damage = Some(damage.map_or(rect, |damage| union(&damage, &rect)));
-                if previous.is_some_and(|previous| intersection(&previous, &rect) == Some(previous))
-                {
-                    previous = None;
-                }
-            }
-            if let Some(previous) = previous {
-                draw(&previous, &mut row_buf)?;
-            }
+            copy_framebuffer(new_state, &rects, |buffer, offset, pitch, copies| {
+                api.copy_to_scanout(buffer, offset, pitch, copies)
+            })?;
 
             api.flip_scanout(present)
         })
@@ -425,64 +453,26 @@ fn copy_to_boot_display(
     old_state: &PlaneState<NovaPlaneState>,
     new_state: &PlaneStateMutator<'_, PlaneState<NovaPlaneState>>,
 ) -> Result {
-    let Some(display) = drm.boot_display.as_ref() else {
-        return Ok(());
-    };
     // Nothing to do if the device is going away.
     let Some(registered) = drm.registration_guard() else {
         return Ok(());
     };
 
-    let (src, dst) = (new_state.src(), new_state.dst());
-    let stride = usize::try_from(display.stride)?;
-    let mut row_buf = KVec::new();
-    let mut convert_buf = KVec::new();
+    let mut rects = KVec::new();
+    for rect in new_state.damage(old_state) {
+        rects.push(rect, GFP_KERNEL)?;
+    }
 
     registered.registration_data_with(|reg| {
         reg.api.with(|api| {
-            for damage in new_state.damage(old_state) {
-                // Damage is in framebuffer coordinates; the plane shows `src` at `dst`.
-                let x = usize::try_from(dst.x1 + (damage.x1 - src.x1))?;
-
-                new_state.read_rows(0, &damage, &mut row_buf, |fb_y, row| {
-                    let y = usize::try_from(dst.y1 + (i32::try_from(fb_y)? - src.y1))?;
-                    let pixels = convert(&display.format, row, &mut convert_buf)?;
-
-                    api.write_boot_display(y * stride + x * CPP, pixels)
-                })?;
-            }
-
-            Ok(())
+            copy_framebuffer(new_state, &rects, |buffer, offset, pitch, copies| {
+                api.copy_to_boot_display(buffer, offset, pitch, copies)
+            })
         })
     })
 }
 
-/// Converts a row of XRGB8888 pixels to the pixel layout of `display`, which has 32 bits per
-/// pixel, using `buf` if needed.
-fn convert<'a>(format: &PixelFormat, row: &'a [u8], buf: &'a mut KVec<u8>) -> Result<&'a [u8]> {
-    if *format == XRGB8888_LAYOUT {
-        return Ok(row);
-    }
-
-    let channel = |c: &Channel, value: u32| match c.length {
-        0 => 0,
-        l @ 1..=8 => (value >> (8 - l)) << c.offset,
-        l => (value << (l - 8)) << c.offset,
-    };
-
-    buf.clear();
-    for pixel in row.chunks_exact(CPP) {
-        let xrgb = u32::from_le_bytes([pixel[0], pixel[1], pixel[2], pixel[3]]);
-        let encoded = channel(&format.red, (xrgb >> 16) & 0xff)
-            | channel(&format.green, (xrgb >> 8) & 0xff)
-            | channel(&format.blue, xrgb & 0xff);
-        buf.extend_from_slice(&encoded.to_le_bytes(), GFP_KERNEL)?;
-    }
-
-    Ok(buf)
-}
-
-/// State of the boot display's plane, whose framebuffer the CPU copies to the display.
+/// State of the boot display's plane, whose framebuffer the GPU copies to the display.
 #[derive(Clone, Default)]
 pub(crate) struct NovaPlaneState {
     /// Smallest rectangle containing what changed in the framebuffer in the frame of this state,
@@ -492,7 +482,7 @@ pub(crate) struct NovaPlaneState {
 
 impl DriverPlaneState for NovaPlaneState {
     type Plane = NovaPlane;
-    type Kind = plane::Shadow;
+    type Kind = plane::Plain;
 }
 
 /// The CRTC scanning out the boot display.

@@ -32,8 +32,6 @@ pub(crate) struct NovaDriver;
 pub(crate) struct BootDisplay {
     /// Its mode, the only one that works.
     pub(crate) mode: OwnedDisplayMode,
-    /// Distance between the starts of two lines of its framebuffer, in bytes.
-    pub(crate) stride: u32,
     /// Pixel layout of its framebuffer.
     pub(crate) format: PixelFormat,
     /// Type of connector it is shown through.
@@ -122,7 +120,6 @@ impl auxiliary::Driver for NovaDriver {
                         0,
                         0,
                     ),
-                    stride: mode.stride,
                     format: mode.format,
                     connector,
                     scanout,
