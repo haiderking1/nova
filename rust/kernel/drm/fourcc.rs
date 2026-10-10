@@ -18,3 +18,6 @@ pub(crate) const FORMAT_MOD_INVALID: u64 = 0xffffffffffffff;
 
 /// 32 bpp RGB
 pub const XRGB888: u32 = fourcc_code(b'X', b'R', b'2', b'4');
+
+/// 32 bpp ARGB
+pub const ARGB8888: u32 = fourcc_code(b'A', b'R', b'2', b'4');
