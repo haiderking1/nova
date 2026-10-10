@@ -189,8 +189,8 @@ impl NovaCoreApi<'_> {
     }
 
     /// Checks that nova-core can show `mode` on the boot display, through its scanout: fails with
-    /// `ERANGE` if the display's link, as trained, can't carry it, `EINVAL` if its timings are
-    /// invalid.
+    /// `EINVAL` if its timings are invalid. Whether the display's link carries it is for
+    /// [`NovaCoreApi::dp_mode_fits()`] to tell.
     pub fn check_mode(&self, mode: &ModeTimings) -> Result {
         self.gpu.check_mode(mode)
     }

@@ -93,6 +93,7 @@ use nova_core::api::{
     VblankHandler, //
 };
 
+use crate::dp::BootDp;
 use crate::driver::{
     BootDisplay,
     NovaDevice,
@@ -222,6 +223,17 @@ pub(crate) fn with_api<R>(
     let registered = drm.registration_guard().ok_or(ENODEV)?;
 
     registered.registration_data_with(|reg| reg.api.with(|api| f(&api)))
+}
+
+/// Runs `f` with nova-core's API and the boot display's DisplayPort link, if nova-drm can train
+/// it, unless the device is going away.
+fn with_api_dp<R>(
+    drm: &NovaDevice,
+    f: impl FnOnce(&NovaCoreApi<'_>, Option<&BootDp<'_>>) -> Result<R>,
+) -> Result<R> {
+    let registered = drm.registration_guard().ok_or(ENODEV)?;
+
+    registered.registration_data_with(|reg| reg.api.with(|api| f(&api, reg.dp.as_ref())))
 }
 
 /// Returns the timings of `mode`, which must be progressive.
@@ -528,7 +540,26 @@ impl crtc::DriverCrtc for NovaCrtc {
         let Ok(timings) = mode_timings(mode) else {
             return ModeStatus::NO_INTERLACE;
         };
-        match with_api(drm, |api| api.check_mode(&timings)) {
+        let Ok(head) = scanout_head(drm) else {
+            return ModeStatus::BAD;
+        };
+        let checked = with_api_dp(drm, |api, dp| {
+            api.check_mode(&timings)?;
+            // The DisplayPort link must carry the mode: trained again if nova-drm can, as it is
+            // otherwise.
+            let carried = match (dp, api.boot_display_dp_link()) {
+                (Some(dp), _) => dp.carries(api, head, &timings),
+                // Enhanced framing, if the link has it, needs more of the blanking.
+                (None, Ok(link)) => api.dp_mode_fits(head, &link, true, &timings),
+                (None, Err(_)) => true,
+            };
+            if carried {
+                Ok(())
+            } else {
+                Err(ERANGE)
+            }
+        });
+        match checked {
             Ok(()) => ModeStatus::OK,
             Err(ERANGE) => ModeStatus::CLOCK_HIGH,
             Err(_) => ModeStatus::BAD,
@@ -554,7 +585,13 @@ impl crtc::DriverCrtc for NovaCrtc {
         let mode = new_state.adjusted_mode();
         let set = scanout_head(drm).and_then(|head| {
             let timings = mode_timings(mode)?;
-            with_api(drm, |api| api.set_mode(head, &timings))
+            with_api_dp(drm, |api, dp| {
+                // Even if the link can't be readied, the head is attached again with the mode.
+                if let Some(dp) = dp {
+                    let _ = dp.ready_for(api, head, &timings);
+                }
+                api.set_mode(head, &timings)
+            })
         });
         pr_info!(
             "enabling {}x{}@{}: mode changed {:?}\n",

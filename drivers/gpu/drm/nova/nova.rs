@@ -2,6 +2,7 @@
 
 //! Nova DRM Driver
 
+mod dp;
 mod driver;
 mod file;
 mod gem;

@@ -1376,21 +1376,15 @@ impl<'gpu> Gpu<'gpu> {
         hal.set_vblank_interrupt(self.gsp_resources.bar, usize::try_from(head)?, enable)
     }
 
-    /// Checks that the boot display's head can scan out `mode`: that its raster is valid, and
-    /// that the boot display's DisplayPort link, as trained, carries it.
+    /// Checks that the boot display's head can scan out `mode`: that its raster is valid. Whether
+    /// the display's link carries it is for [`Self::dp_mode_fits`] to tell.
     pub(crate) fn check_mode(&self, mode: &ModeTimings) -> Result {
         HeadRaster::new(mode)?;
 
-        let head = {
-            let output = self.display_engine.lock();
-            let output = output.as_ref().ok_or(ENODEV)?;
-            output.scanout.as_ref().ok_or(ENODEV)?.mode().head
-        };
-        if let Ok(link) = self.boot_display_dp_link() {
-            // Enhanced framing, if the link has it, needs more of the blanking.
-            if !self.dp_mode_fits(head, &link, true, mode) {
-                return Err(ERANGE);
-            }
+        let output = self.display_engine.lock();
+        let output = output.as_ref().ok_or(ENODEV)?;
+        if output.scanout.is_none() {
+            return Err(ENODEV);
         }
 
         Ok(())

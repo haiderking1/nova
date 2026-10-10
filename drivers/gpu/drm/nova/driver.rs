@@ -16,6 +16,7 @@ use kernel::{
     sync::aref::ARef, //
 };
 
+use crate::dp::BootDp;
 use crate::file::File;
 use crate::gem::NovaGemObject;
 
@@ -64,6 +65,8 @@ impl Drop for Nova<'_> {
 /// DRM registration data, accessible from ioctl handlers via the registration guard.
 pub(crate) struct DrmRegData<'bound> {
     pub(crate) api: NovaCoreApiHandle<'bound>,
+    /// The DisplayPort link of the boot display, if it's shown through one nova-drm can train.
+    pub(crate) dp: Option<BootDp<'bound>>,
 }
 
 /// Convienence type alias for the DRM device type for this driver
@@ -127,8 +130,24 @@ impl auxiliary::Driver for NovaDriver {
             })
             .transpose()?;
 
+        // Modes the firmware's link doesn't carry need the link trained again, for which the
+        // sink's capabilities are read over the link's AUX channel.
+        let dp = (connector == ConnectorType::DisplayPort)
+            .then(|| {
+                BootDp::probe(adev)
+                    .inspect_err(|err| {
+                        dev_warn!(
+                            adev,
+                            "can't probe the DP link, keeping the firmware's: {:?}\n",
+                            err
+                        )
+                    })
+                    .ok()
+            })
+            .flatten();
+
         let drm = drm::UnregisteredDevice::<Self>::new(adev, Ok(NovaData { boot_display }))?;
-        let reg_data = DrmRegData { api };
+        let reg_data = DrmRegData { api, dp };
         // SAFETY: `reg` is stored in `Nova` and dropped when the driver is unbound; it is
         // never forgotten.
         let reg = unsafe { drm::Registration::new(adev.as_ref(), drm, reg_data, 0)? };
