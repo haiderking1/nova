@@ -43,6 +43,8 @@ pub(crate) enum RmControlMsgFunction {
     DispDpGetCaps = bindings::NV0073_CTRL_CMD_DP_GET_CAPS,
     /// Get the configuration of a digital display (DFP) of the board.
     DispDfpGetInfo = bindings::NV0073_CTRL_CMD_DFP_GET_INFO,
+    /// Have the display engine fetch less ahead of scanout.
+    DispSetMempoolWarForBlitTearing = bindings::NV5070_CTRL_CMD_SET_MEMPOOL_WAR_FOR_BLIT_TEARING,
     /// Get the EDID of a display.
     DispSpecificGetEdidV2 = bindings::NV0073_CTRL_CMD_SPECIFIC_GET_EDID_V2,
     /// Get the static configuration of the display engine.
@@ -103,6 +105,9 @@ impl TryFrom<u32> for RmControlMsgFunction {
             bindings::NV0073_CTRL_CMD_DP_CTRL => Ok(Self::DispDpCtrl),
             bindings::NV0073_CTRL_CMD_DP_GET_CAPS => Ok(Self::DispDpGetCaps),
             bindings::NV0073_CTRL_CMD_DFP_GET_INFO => Ok(Self::DispDfpGetInfo),
+            bindings::NV5070_CTRL_CMD_SET_MEMPOOL_WAR_FOR_BLIT_TEARING => {
+                Ok(Self::DispSetMempoolWarForBlitTearing)
+            }
             bindings::NV2080_CTRL_CMD_INTERNAL_DISPLAY_GET_STATIC_INFO => {
                 Ok(Self::InternalDisplayGetStaticInfo)
             }
@@ -1905,3 +1910,28 @@ unsafe impl FromBytes for CopyServerReservedPdesParams {}
 
 // SAFETY: Padding is explicit and will not contain uninitialized data.
 unsafe impl AsBytes for CopyServerReservedPdesParams {}
+
+/// Wrapper for [`bindings::NV5070_CTRL_SET_MEMPOOL_WAR_FOR_BLIT_TEARING_PARAMS`].
+#[repr(transparent)]
+pub(crate) struct DispMempoolWarParams(
+    bindings::NV5070_CTRL_SET_MEMPOOL_WAR_FOR_BLIT_TEARING_PARAMS,
+);
+
+impl DispMempoolWarParams {
+    /// Creates the parameters to have the display engine of subdevice 0 fetch less ahead of
+    /// scanout if `engage`, or as much as it is configured to otherwise.
+    pub(crate) fn new(engage: bool) -> Self {
+        Self(
+            bindings::NV5070_CTRL_SET_MEMPOOL_WAR_FOR_BLIT_TEARING_PARAMS {
+                bEngageWAR: u8::from(engage),
+                ..Default::default()
+            },
+        )
+    }
+}
+
+// SAFETY: This struct only contains integer types for which all bit patterns are valid.
+unsafe impl FromBytes for DispMempoolWarParams {}
+
+// SAFETY: The padding of this struct is explicit, as fields.
+unsafe impl AsBytes for DispMempoolWarParams {}

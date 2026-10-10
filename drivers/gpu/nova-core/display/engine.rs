@@ -38,6 +38,7 @@ use crate::{
         disp::notifier,
         rm::commands::{
             DispGetStaticInfo,
+            DispSetMempoolWar,
             DispWriteInstMem,
             RmControl,
             RmFree, //
@@ -180,6 +181,9 @@ struct Channels<'a> {
     output: Option<HeadOutput>,
     /// Whether head [`HEAD`] was detached from its output, for the next modeset to attach it again.
     detached: bool,
+    /// Whether settings that take effect at the next full modeset, one detaching the head, wait
+    /// for it.
+    modeset_pending: bool,
 }
 
 impl<'a> DisplayEngine<'a> {
@@ -324,6 +328,14 @@ impl<'a> DisplayEngine<'a> {
         self.channels.as_mut().ok_or(ENODEV)?.detach(bar, head)
     }
 
+    /// Returns whether settings that take effect at the next full modeset wait for it: one
+    /// detaching the head with [`Self::detach`] first.
+    pub(crate) fn modeset_pending(&self) -> bool {
+        self.channels
+            .as_ref()
+            .is_some_and(|channels| channels.modeset_pending)
+    }
+
     /// Returns the bits per pixel head `head` sends its output, as the core channel has it armed.
     pub(crate) fn output_bpp(&self, bar: Bar0<'_>, head: u32) -> Option<u32> {
         self.channels.as_ref()?.hal.armed_output_bpp(bar, head)
@@ -443,6 +455,10 @@ impl<'a> Channels<'a> {
             log_exception(self.dev, bar, 0);
             log_exception(self.dev, bar, WINDOW + 1);
         })?;
+        // Detaching the head made the modeset a full one, which settings waiting for it took.
+        if self.detached {
+            self.modeset_pending = false;
+        }
         self.detached = false;
 
         match window {
@@ -520,8 +536,17 @@ impl<'a> Channels<'a> {
                 notifier_slot: 0,
                 output: hal.armed_output(bar, HEAD),
                 detached: false,
+                modeset_pending: false,
             };
             channels.check_core(dev, bar)?;
+            // The display engine fetches ahead of scanout as much as its memory pool holds: as
+            // GSP-RM sets it up, flips armed after about mid-frame missed the next vblank. Have it
+            // fetch less, from the next modeset on, as the workaround for blit tearing it is named
+            // after does: flips armed until right before the vblank then make it.
+            channels.modeset_pending = RmControl::new(client, root, DispSetMempoolWar::new(true))
+                .send(dev, cmdq)
+                .inspect_err(|e| dev_warn!(dev, "display: can't reduce the fetch-ahead: {:?}\n", e))
+                .is_ok();
             Ok(channels)
         };
 

@@ -252,6 +252,7 @@ pub const MC_ENGINE_IDX_CE0: u32 = 15;
 pub const MC_ENGINE_IDX_CE16: u32 = 31;
 pub const MC_ENGINE_IDX_GR0: u32 = 84;
 pub const MC_ENGINE_IDX_GR7: u32 = 91;
+pub const NV5070_CTRL_CMD_SET_MEMPOOL_WAR_FOR_BLIT_TEARING: u32 = 1349517593;
 pub const NV0073_CTRL_CMD_DFP_GET_INFO: u32 = 7541056;
 pub const NV0073_CTRL_DFP_FLAGS_DP_LINK_BW_1_62GBPS: u32 = 1;
 pub const NV0073_CTRL_DFP_FLAGS_DP_LINK_BW_2_70GBPS: u32 = 2;
@@ -2044,6 +2045,18 @@ pub struct NV0073_CTRL_DP_GET_LINK_CONFIG_PARAMS {
     pub laneCount: u32_,
     pub linkBW: u32_,
     pub dp2LinkBW: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV5070_CTRL_CMD_BASE_PARAMS {
+    pub subdeviceIndex: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV5070_CTRL_SET_MEMPOOL_WAR_FOR_BLIT_TEARING_PARAMS {
+    pub base: NV5070_CTRL_CMD_BASE_PARAMS,
+    pub bEngageWAR: u8_,
+    pub __bindgen_padding_0: [u8; 3usize],
 }
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone, MaybeZeroable)]

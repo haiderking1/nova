@@ -1504,6 +1504,13 @@ impl<'gpu> Gpu<'gpu> {
         Ok((code, transferred.len()))
     }
 
+    /// Returns whether settings of the display engine take effect at the next full modeset only,
+    /// one detaching the head with [`Self::detach_head`] first, and wait for it.
+    pub(crate) fn display_modeset_pending(&self) -> bool {
+        Option::as_ref(&self.display_engine.lock())
+            .is_some_and(|output| output.engine.modeset_pending())
+    }
+
     /// Detaches head `head` from its output, and returns once the display engine did: the head
     /// then drives no display, for the output's link to be trained. The next [`Self::set_mode`]
     /// attaches it again.

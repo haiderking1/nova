@@ -1347,3 +1347,23 @@ rm_control!(
     DpCtrlParams,
     |p| *p
 );
+
+/// RM control command having the display engine fetch less ahead of scanout, from the next
+/// modeset on (`NV5070_CTRL_CMD_SET_MEMPOOL_WAR_FOR_BLIT_TEARING`).
+pub(crate) struct DispSetMempoolWar(DispMempoolWarParams);
+
+impl DispSetMempoolWar {
+    /// Creates the command, engaging the reduced fetch-ahead if `engage`.
+    pub(crate) fn new(engage: bool) -> Self {
+        Self(DispMempoolWarParams::new(engage))
+    }
+}
+
+rm_control!(
+    DispSetMempoolWar,
+    DisplayRoot,
+    DispSetMempoolWarForBlitTearing,
+    DispMempoolWarParams,
+    (),
+    |_p| ()
+);

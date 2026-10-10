@@ -239,6 +239,12 @@ impl NovaCoreApi<'_> {
         self.gpu.boot_display_dp_aux(request, addr, buf)
     }
 
+    /// Returns whether settings of the display engine wait for a full modeset to take effect: one
+    /// detaching the head with [`NovaCoreApi::detach_head()`] first.
+    pub fn display_modeset_pending(&self) -> bool {
+        self.gpu.display_modeset_pending()
+    }
+
     /// Detaches head `head` from its output, and returns once the display engine did: the head
     /// then drives no display, and the output's link may be trained. The next
     /// [`NovaCoreApi::set_mode()`] attaches the head again.
