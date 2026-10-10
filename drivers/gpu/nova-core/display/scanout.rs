@@ -2,8 +2,8 @@
 
 //! Nova's own scanout: two framebuffers in VRAM that the window shows in turns.
 //!
-//! The CPU draws into the framebuffer that isn't shown, the back buffer, through BAR1, then
-//! flips: the window shows the back buffer from the next frame on, and the framebuffer shown
+//! The copy engine copies frames into the framebuffer that isn't shown, the back buffer, which is
+//! then flipped: the window shows the back buffer from the next frame on, and the framebuffer shown
 //! before becomes the back buffer. Frames are thus never shown half-drawn.
 
 use kernel::{
@@ -33,7 +33,7 @@ use super::{
 /// Bytes per pixel of the framebuffers, which are XRGB8888.
 const CPP: u32 = 4;
 
-/// A framebuffer of the scanout, mapped into BAR1 for the CPU to draw into.
+/// A framebuffer of the scanout, mapped into BAR1 for the CPU to clear it.
 struct Framebuffer {
     _vram: ContiguousVram,
     mapped: MappedRange,
@@ -189,14 +189,6 @@ impl Scanout {
     /// Returns the surface of the back buffer, the framebuffer that isn't shown.
     pub(crate) fn back(&self) -> &Surface {
         &self.framebuffers[self.back].surface
-    }
-
-    /// Writes `data` at `offset` into the back buffer.
-    ///
-    /// `offset` is in bytes from the start of the framebuffer (see [`ScanoutMode`] for its
-    /// layout). `offset` and the length of `data` must be multiples of 4.
-    pub(crate) fn write(&self, bar_user: &BarUser<'_>, offset: usize, data: &[u8]) -> Result {
-        bar_user.write(&self.framebuffers[self.back].mapped, offset, data)
     }
 
     /// Shows the back buffer from the next frame on, or right away as `present` says, and returns

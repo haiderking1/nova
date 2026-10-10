@@ -128,10 +128,7 @@ use crate::{
     mm::{
         bar_user::BarUser,
         pagetable::MmuVersion,
-        vmm::{
-            MappedRange,
-            Memory, //
-        },
+        vmm::Memory,
         GpuMm,
         Pfn,
         VramAddress,
@@ -497,11 +494,6 @@ pub(crate) struct Gpu<'gpu> {
     pub(crate) spec: Spec,
     /// The display the system firmware set up on this GPU, if any.
     pub(crate) boot_display: Option<BootDisplay>,
-    /// BAR1 mapping of the boot display's framebuffer, for the CPU to draw into.
-    ///
-    /// Unmapped in [`Gpu`]'s `PinnedDrop`, while `mm` and `bar_user` are still alive.
-    #[pin]
-    boot_scanout: Mutex<Option<MappedRange>>,
     /// GSP event interrupt registration, and the enable of its subtree.
     ///
     /// Must be kept declared *before* `gsp_resources`, so that the handler is unregistered, and
@@ -674,9 +666,6 @@ impl<'gpu> Gpu<'gpu> {
                 dev_warn!(dev, "ignoring the firmware display: {:?}\n", err);
                 None
             }),
-
-            // Mapped by `Gpu::map_boot_display()` once the GPU is up.
-            boot_scanout <- new_mutex!(None, "nova_boot_scanout"),
 
             tree: Tree::new(
                 pdev,
@@ -1003,60 +992,6 @@ impl<'gpu> Gpu<'gpu> {
             .inspect_err(|_| dev_err!(dev, "GFW boot did not complete\n"))
     }
 
-    /// Maps the framebuffer of the boot display into BAR1, so the CPU can draw into it with
-    /// [`Gpu::write_boot_display()`]. Does nothing without a boot display.
-    pub(crate) fn map_boot_display(
-        self: Pin<&mut Self>,
-        #[cfg_attr(not(CONFIG_NOVA_CORE_SELFTESTS), allow(unused_variables))] pdev: &pci::Device<
-            device::Bound,
-        >,
-    ) -> Result {
-        let this = self.project();
-        let mut mm = this.mm.lock();
-        let Some(display) = this.boot_display.as_ref() else {
-            return Ok(());
-        };
-
-        // BAR1 maps whole pages; the end of the last line may not be page-aligned.
-        let page_size: u64 = PAGE_SIZE.into_safe_cast();
-        let end = display
-            .vram
-            .end
-            .into_raw()
-            .checked_next_multiple_of(page_size)
-            .ok_or(EOVERFLOW)?;
-        let vram = display.vram.start..VramAddress::from_raw(end);
-
-        let bar_user = this.bar_user.as_ref().get_ref();
-        let mapped = bar_user.map_vram(&mut mm, vram)?;
-
-        #[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
-        if let Err(err) = crate::mm::boot_display_test::check_bar1_mapping(
-            pdev.as_ref(),
-            &mut mm,
-            bar_user,
-            &mapped,
-            display,
-        ) {
-            dev_err!(pdev, "boot display: BAR1 mapping check failed: {:?}\n", err);
-        }
-
-        *this.boot_scanout.lock() = Some(mapped);
-
-        Ok(())
-    }
-
-    /// Writes `data` at `offset` into the framebuffer of the boot display, which shows on screen.
-    ///
-    /// `offset` and the length of `data` must be multiples of 4. Fails with `ENODEV` if the boot
-    /// display isn't mapped.
-    pub(crate) fn write_boot_display(&self, offset: usize, data: &[u8]) -> Result {
-        let scanout = self.boot_scanout.lock();
-        let mapped = scanout.as_ref().ok_or(ENODEV)?;
-
-        self.bar_user.write(mapped, offset, data)
-    }
-
     /// Sets up the context of the graphics engine, which channels on it need.
     ///
     /// Must be done before any other channel is allocated.
@@ -1242,21 +1177,6 @@ impl<'gpu> Gpu<'gpu> {
             .as_ref()
             .and_then(|output| output.scanout.as_ref())
             .map(Scanout::mode)
-    }
-
-    /// Writes `data` at `offset` into the back buffer of Nova's own scanout, which shows on
-    /// screen from the next [`Gpu::flip_scanout()`].
-    ///
-    /// `offset` and the length of `data` must be multiples of 4. Fails with `ENODEV` if the
-    /// scanout isn't set up.
-    pub(crate) fn write_scanout(&self, offset: usize, data: &[u8]) -> Result {
-        let output = self.display_engine.lock();
-        let scanout = output
-            .as_ref()
-            .and_then(|output| output.scanout.as_ref())
-            .ok_or(ENODEV)?;
-
-        scanout.write(&self.bar_user, offset, data)
     }
 
     /// Shows the back buffer of Nova's own scanout from the next frame on, and returns once the
@@ -1958,6 +1878,11 @@ impl<'gpu> Gpu<'gpu> {
             if let Err(err) = crate::mm::boot_display_test::draw(dev, &mut mm, display, regions) {
                 dev_err!(dev, "boot display test pattern failed: {:?}\n", err);
             }
+            if let Err(err) =
+                crate::mm::boot_display_test::check_bar1(dev, &mut mm, &this.bar_user, display)
+            {
+                dev_err!(dev, "boot display: BAR1 mapping check failed: {:?}\n", err);
+            }
         }
     }
 }
@@ -1982,16 +1907,6 @@ impl PinnedDrop for Gpu<'_> {
         let mut mm = this.mm.lock();
 
         // Before any field is dropped: unmapping needs `mm`, `bar_user` and a running GSP.
-        let mapped = this.boot_scanout.lock().take();
-        if let Some(mapped) = mapped {
-            let _ = this
-                .bar_user
-                .as_ref()
-                .get_ref()
-                .unmap(&mut mm, mapped)
-                .inspect_err(|e| pr_err!("failed to unmap the boot display: {:?}\n", e));
-        }
-
         // Before `gsp_resources` is dropped: freeing RM objects needs a running GSP.
         let gsp_resources = this.gsp_resources.as_ref().get_ref();
         let dev = gsp_resources.device.as_ref();

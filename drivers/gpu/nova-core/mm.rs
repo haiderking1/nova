@@ -435,10 +435,32 @@ pub(crate) mod boot_display_test {
     /// Pixels written per PRAMIN access: amortizes the window check and ordering read.
     const CHUNK: usize = 64;
 
+    /// Maps the framebuffer of `display` into BAR1, checks the mapping with
+    /// [`check_bar1_mapping()`], and unmaps it.
+    pub(crate) fn check_bar1(
+        dev: &device::Device<device::Bound>,
+        mm: &mut GpuMm<'_>,
+        bar_user: &BarUser<'_>,
+        display: &BootDisplay,
+    ) -> Result {
+        // BAR1 maps whole pages; the end of the last line may not be page-aligned.
+        let page_size: u64 = PAGE_SIZE.into_safe_cast();
+        let end = display
+            .vram
+            .end
+            .into_raw()
+            .checked_next_multiple_of(page_size)
+            .ok_or(EOVERFLOW)?;
+        let mapped = bar_user.map_vram(mm, display.vram.start..VramAddress::from_raw(end))?;
+
+        let checked = check_bar1_mapping(dev, mm, bar_user, &mapped, display);
+        bar_user.unmap(mm, mapped).and(checked)
+    }
+
     /// Checks that `mapped`, the BAR1 mapping of `display`'s framebuffer, maps each page to the
     /// right VRAM: writes a marker into every page through BAR1 and reads VRAM back through
     /// PRAMIN. Logs the pages that map elsewhere, and for the first ones where their writes land.
-    pub(crate) fn check_bar1_mapping(
+    fn check_bar1_mapping(
         dev: &device::Device<device::Bound>,
         mm: &mut GpuMm<'_>,
         bar_user: &BarUser<'_>,

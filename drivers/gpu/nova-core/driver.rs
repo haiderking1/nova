@@ -145,11 +145,6 @@ impl pci::Driver for NovaCoreDriver {
                 #[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
                 gpu.as_mut().run_selftests(pdev);
 
-                // Not fatal: without it the display just isn't usable.
-                if let Err(err) = gpu.as_mut().map_boot_display(pdev) {
-                    dev_warn!(pdev, "can't map the boot display: {:?}\n", err);
-                }
-
                 // Not fatal: only work on the graphics engine needs it. First, as it must be done
                 // before any other channel is allocated.
                 if let Err(err) = gpu.as_mut().init_graphics() {
