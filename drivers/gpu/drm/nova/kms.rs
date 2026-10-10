@@ -23,7 +23,10 @@ use core::marker::PhantomPinned;
 use kernel::{
     auxiliary,
     drm::{
-        fourcc::XRGB888,
+        fourcc::{
+            ARGB8888,
+            XRGB888, //
+        },
         kms::{
             atomic::{
                 AtomicCommitTail,
@@ -170,10 +173,11 @@ impl KmsDriver for NovaDriver {
         }
 
         let possible_crtcs = 1 << 0;
+        // Frames are copied as they are into XRGB8888 framebuffers, whose display ignores alpha.
         let primary = Plane::new(
             drm,
             possible_crtcs,
-            &[XRGB888],
+            &[XRGB888, ARGB8888],
             None,
             plane::Type::Primary,
             None,
