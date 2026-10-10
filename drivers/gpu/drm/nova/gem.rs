@@ -9,12 +9,18 @@ use kernel::{
     },
     mm::virt::VmaNew,
     page,
+    new_mutex,
     prelude::*,
-    sync::aref::ARef,
+    sync::{
+        aref::ARef,
+        Mutex, //
+    },
 };
 
 use nova_core::api::{
     BufferRef,
+    DisplaySource,
+    NovaCoreApi,
     SystemBuffer,
     VramBuffer,
     VRAM_BUFFER_ALIGN, //
@@ -51,6 +57,10 @@ pub(crate) struct NovaObject {
     /// The device, to give the object's memory back to nova-core.
     drm: ARef<NovaDevice>,
     memory: Memory,
+    /// The mapping of `memory` for the copy engine, which copies it to the display, from the
+    /// first time it's shown on.
+    #[pin]
+    display_source: Mutex<Option<DisplaySource>>,
 }
 
 impl gem::DriverObject for NovaObject {
@@ -77,6 +87,7 @@ impl gem::DriverObject for NovaObject {
 
                 Ok(memory)
             })?,
+            display_source <- new_mutex!(None, "nova_gem_display_source"),
         })
     }
 
@@ -121,8 +132,23 @@ impl Memory {
 #[pinned_drop]
 impl PinnedDrop for NovaObject {
     fn drop(self: Pin<&mut Self>) {
-        // SAFETY: `memory` isn't structurally pinned.
+        // SAFETY: `memory` isn't structurally pinned, and `display_source` isn't moved.
         let this = unsafe { self.get_unchecked_mut() };
+
+        // The copy engine stops mapping the memory before it's freed.
+        let mut source = this.display_source.lock().take();
+        if source.is_some() {
+            let _ = with_api(&this.drm, |api| {
+                if let Some(source) = source.take() {
+                    api.unmap_display_source(source);
+                }
+                Ok(())
+            });
+        }
+        // Without nova-core, the mapping went away with it.
+        if let Some(source) = source {
+            source.forget();
+        }
 
         if let Memory::Vram(buffer) = &mut this.memory {
             if let Some(buffer) = buffer.take() {
@@ -162,6 +188,21 @@ impl NovaObject {
             Memory::Vram(buffer) => BufferRef::Vram(buffer.as_ref().ok_or(ENODEV)?),
             Memory::System(buffer) => BufferRef::System(buffer),
         })
+    }
+
+    /// Runs `f` with the mapping of the object's memory for the copy engine, which copies it to
+    /// the display. The mapping is made the first time, and lasts as long as the object.
+    pub(crate) fn with_display_source<R>(
+        &self,
+        api: &NovaCoreApi<'_>,
+        f: impl FnOnce(&DisplaySource) -> Result<R>,
+    ) -> Result<R> {
+        let mut source = self.display_source.lock();
+        if source.is_none() {
+            *source = Some(api.map_display_source(self.buffer()?)?);
+        }
+
+        f(source.as_ref().ok_or(EINVAL)?)
     }
 
     /// Returns where the memory of the object is.

@@ -146,6 +146,13 @@ pub(crate) mod copy_c7b5 {
     /// Source: bits 48:32 of its GPU virtual address, then bits 31:0 in the next method, followed
     /// by the destination's, like [`OFFSET_OUT_UPPER`].
     pub(crate) const OFFSET_IN_UPPER: u32 = bindings::NVC7B5_OFFSET_IN_UPPER;
+    /// Memory that physical destination addresses are in.
+    pub(crate) const SET_DST_PHYS_MODE: u32 = bindings::NVC7B5_SET_DST_PHYS_MODE;
+    /// [`SET_DST_PHYS_MODE`]: VRAM.
+    pub(crate) const PHYS_MODE_VRAM: u32 = bindings::NVC7B5_SET_DST_PHYS_MODE_TARGET_LOCAL_FB;
+    /// [`LAUNCH_DMA`] flag: the destination address is physical, in the memory
+    /// [`SET_DST_PHYS_MODE`] gives. Field position is that of `NVC7B5_LAUNCH_DMA_DST_TYPE`.
+    pub(crate) const LAUNCH_DST_PHYSICAL: u32 = bindings::NVC7B5_LAUNCH_DMA_DST_TYPE_PHYSICAL << 13;
     /// Destination: bits 48:32 of its GPU virtual address, then bits 31:0 in the next method.
     pub(crate) const OFFSET_OUT_UPPER: u32 = bindings::NVC7B5_OFFSET_OUT_UPPER;
     /// Pitches of the source and the destination in bytes, then the length of a line in elements

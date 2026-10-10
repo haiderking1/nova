@@ -25,6 +25,7 @@ use crate::{
         },
         ChannelMemory, EngineInfo,
     },
+    mm::VramAddress,
 };
 
 use super::gpfifo::Channel;
@@ -87,13 +88,14 @@ pub(crate) struct Release {
     pub(crate) payload: u32,
 }
 
-/// A copy of `lines` lines of `line_bytes` bytes, the first from GPU virtual address `src` to
-/// `dst`, the next ones `src_pitch` and `dst_pitch` bytes further.
+/// A copy of `lines` lines of `line_bytes` bytes, the first from GPU virtual address `src` to VRAM
+/// address `dst`, which the copy engine writes without a mapping, the next ones `src_pitch` and
+/// `dst_pitch` bytes further.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PitchCopy {
     pub(crate) src: u64,
     pub(crate) src_pitch: u32,
-    pub(crate) dst: u64,
+    pub(crate) dst: VramAddress,
     pub(crate) dst_pitch: u32,
     pub(crate) line_bytes: u32,
     pub(crate) lines: u32,

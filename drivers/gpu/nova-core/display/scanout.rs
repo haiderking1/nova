@@ -71,6 +71,28 @@ pub struct DisplayCopy {
     pub height: u32,
 }
 
+/// A buffer mapped for the copy engine, which copies it to the display.
+///
+/// Made by [`NovaCoreApi::map_display_source()`], it must be given back to
+/// [`NovaCoreApi::unmap_display_source()`] before the buffer is freed.
+///
+/// [`NovaCoreApi::map_display_source()`]: crate::api::NovaCoreApi::map_display_source
+/// [`NovaCoreApi::unmap_display_source()`]: crate::api::NovaCoreApi::unmap_display_source
+pub struct DisplaySource {
+    /// The buffer's mapping in the address space of the kernel's copy channel.
+    pub(crate) mapped: MappedRange,
+    /// Size of the buffer in bytes.
+    pub(crate) size: u64,
+}
+
+impl DisplaySource {
+    /// Drops the mapping without tearing it down, for when nova-core is gone, and the address
+    /// space of its copy channel with it.
+    pub fn forget(self) {
+        self.mapped.forget();
+    }
+}
+
 /// Two framebuffers that the window shows in turns.
 ///
 /// The framebuffers must be unmapped with [`Scanout::unmap`].

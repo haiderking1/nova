@@ -40,6 +40,7 @@ pub use crate::{
     },
     display::{
         DisplayCopy,
+        DisplaySource,
         ModeTimings,
         PresentMode,
         ScanoutMode,
@@ -147,20 +148,34 @@ impl NovaCoreApi<'_> {
         self.gpu.flip_scanout(present)
     }
 
-    /// Copies the `rects` of the XRGB8888 pixels of `buffer`, whose lines are `pitch` bytes apart
+    /// Maps `buffer` for the GPU's copy engine, to copy it to the display with
+    /// [`NovaCoreApi::copy_to_scanout()`] or [`NovaCoreApi::copy_to_boot_display()`].
+    ///
+    /// The mapping lasts until given back to [`NovaCoreApi::unmap_display_source()`], which must
+    /// be done before `buffer` is freed. Fails with `ENODEV` if the copy engine isn't set up.
+    pub fn map_display_source(&self, buffer: BufferRef<'_>) -> Result<DisplaySource> {
+        self.gpu.map_display_source(buffer)
+    }
+
+    /// Tears down `source`, a mapping made by [`NovaCoreApi::map_display_source()`].
+    pub fn unmap_display_source(&self, source: DisplaySource) {
+        self.gpu.unmap_display_source(source)
+    }
+
+    /// Copies the `rects` of the XRGB8888 pixels of `source`, whose lines are `pitch` bytes apart
     /// from byte `offset` on, into the back buffer of Nova's own scanout. The GPU's copy engine
     /// copies them; returns once it's done.
     ///
     /// Fails with `ENODEV` if the scanout isn't set up, and with `EINVAL` if a rectangle isn't
-    /// within `buffer` or the scanout.
+    /// within `source` or the scanout.
     pub fn copy_to_scanout(
         &self,
-        buffer: BufferRef<'_>,
+        source: &DisplaySource,
         offset: u64,
         pitch: u32,
         rects: &[DisplayCopy],
     ) -> Result {
-        self.gpu.copy_to_scanout(buffer, offset, pitch, rects)
+        self.gpu.copy_to_scanout(source, offset, pitch, rects)
     }
 
     /// Like [`NovaCoreApi::copy_to_scanout()`], into the framebuffer of the boot display, which
@@ -169,12 +184,12 @@ impl NovaCoreApi<'_> {
     /// Fails with `ENODEV` without a usable boot display.
     pub fn copy_to_boot_display(
         &self,
-        buffer: BufferRef<'_>,
+        source: &DisplaySource,
         offset: u64,
         pitch: u32,
         rects: &[DisplayCopy],
     ) -> Result {
-        self.gpu.copy_to_boot_display(buffer, offset, pitch, rects)
+        self.gpu.copy_to_boot_display(source, offset, pitch, rects)
     }
 
     /// Enables the vblank interrupt of head `head` if `enable`, or disables it. Doesn't sleep, so

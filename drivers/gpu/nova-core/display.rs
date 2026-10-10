@@ -28,6 +28,7 @@ pub use mode::ModeTimings;
 pub(crate) use scanout::Scanout;
 pub use scanout::{
     DisplayCopy,
+    DisplaySource,
     ScanoutMode, //
 };
 pub use vblank::VblankHandler;

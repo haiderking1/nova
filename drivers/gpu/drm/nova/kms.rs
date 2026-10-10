@@ -81,9 +81,9 @@ use kernel::{
 };
 
 use nova_core::api::{
-    BufferRef,
     ConnectorType,
     DisplayCopy,
+    DisplaySource,
     ModeTimings,
     NovaCoreApi,
     PresentMode,
@@ -328,11 +328,13 @@ impl plane::DriverPlane for NovaPlane {
 const MAX_COPIES: usize = 64;
 
 /// Has `copy` copy the `rects` of the framebuffer of `state`, areas in framebuffer coordinates, to
-/// where the plane shows them, from the memory of the framebuffer's GEM object.
+/// where the plane shows them, from the memory of the framebuffer's GEM object, as mapped for the
+/// copy engine with `api`.
 fn copy_framebuffer(
+    api: &NovaCoreApi<'_>,
     state: &PlaneStateMutator<'_, PlaneState<NovaPlaneState>>,
     rects: &[Rect],
-    copy: impl FnOnce(BufferRef<'_>, u64, u32, &[DisplayCopy]) -> Result,
+    copy: impl FnOnce(&DisplaySource, u64, u32, &[DisplayCopy]) -> Result,
 ) -> Result {
     let Some(fb) = state.framebuffer() else {
         return Ok(());
@@ -369,7 +371,7 @@ fn copy_framebuffer(
         return Ok(());
     }
 
-    copy(object.buffer()?, u64::from(offset), pitch, &copies)
+    object.with_display_source(api, |source| copy(source, u64::from(offset), pitch, &copies))
 }
 
 /// Copies the frame of `new_state` into the back buffer of nova-core's scanout, and flips it as
@@ -413,8 +415,8 @@ fn draw_to_scanout(
 
     registered.registration_data_with(|reg| {
         reg.api.with(|api| {
-            copy_framebuffer(new_state, &rects, |buffer, offset, pitch, copies| {
-                api.copy_to_scanout(buffer, offset, pitch, copies)
+            copy_framebuffer(&api, new_state, &rects, |source, offset, pitch, copies| {
+                api.copy_to_scanout(source, offset, pitch, copies)
             })?;
 
             api.flip_scanout(present)
@@ -465,8 +467,8 @@ fn copy_to_boot_display(
 
     registered.registration_data_with(|reg| {
         reg.api.with(|api| {
-            copy_framebuffer(new_state, &rects, |buffer, offset, pitch, copies| {
-                api.copy_to_boot_display(buffer, offset, pitch, copies)
+            copy_framebuffer(&api, new_state, &rects, |source, offset, pitch, copies| {
+                api.copy_to_boot_display(source, offset, pitch, copies)
             })
         })
     })

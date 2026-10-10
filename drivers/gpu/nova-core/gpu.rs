@@ -67,6 +67,7 @@ use crate::{
         Display,
         DisplayCopy,
         DisplayEngine,
+        DisplaySource,
         DisplayId,
         InternalHandles,
         ModeTimings,
@@ -1270,15 +1271,54 @@ impl<'gpu> Gpu<'gpu> {
         scanout.flip(&mut output.engine, self.gsp_resources.bar, present)
     }
 
-    /// Copies the `rects` of the XRGB8888 pixels of `buffer`, whose lines are `pitch` bytes apart
+    /// Maps `buffer` for the copy engine, to copy it to the display with
+    /// [`Gpu::copy_to_scanout()`] or [`Gpu::copy_to_boot_display()`].
+    ///
+    /// The mapping must be given back to [`Gpu::unmap_display_source()`] before `buffer` is
+    /// freed. Fails with `ENODEV` if the kernel's copy channel isn't set up.
+    pub(crate) fn map_display_source(&self, buffer: BufferRef<'_>) -> Result<DisplaySource> {
+        let (pfns, memory, size) = match buffer {
+            BufferRef::Vram(buffer) => (buffer.pfns()?, Memory::Vram, buffer.size()),
+            BufferRef::System(buffer) => {
+                (buffer.dma_pfns()?, Memory::SystemCoherent, buffer.size())
+            }
+        };
+
+        // `copy` is locked before `mm`.
+        let mut copy = self.copy.lock();
+        let copy = Option::as_mut(&mut *copy).ok_or(ENODEV)?;
+        let mut mm = self.mm.lock();
+
+        Ok(DisplaySource {
+            mapped: copy.map_pages(&mut mm, &pfns, memory)?,
+            size: num::usize_as_u64(size),
+        })
+    }
+
+    /// Tears down `source`, a mapping made by [`Gpu::map_display_source()`].
+    pub(crate) fn unmap_display_source(&self, source: DisplaySource) {
+        // `copy` is locked before `mm`.
+        let mut copy = self.copy.lock();
+        match Option::as_mut(&mut *copy) {
+            Some(copy) => {
+                if let Err(err) = copy.unmap(&mut self.mm.lock(), source.mapped) {
+                    pr_err!("failed to unmap a display source: {:?}\n", err);
+                }
+            }
+            // The copy channel is gone, and its address space with it.
+            None => source.mapped.forget(),
+        }
+    }
+
+    /// Copies the `rects` of the XRGB8888 pixels of `source`, whose lines are `pitch` bytes apart
     /// from byte `offset` on, into the back buffer of Nova's own scanout, which shows on screen
     /// from the next [`Gpu::flip_scanout()`]. The copy engine copies them; returns once it's done.
     ///
     /// Fails with `ENODEV` if the scanout or the kernel's copy channel isn't set up, and with
-    /// `EINVAL` if a rectangle isn't within `buffer` or the scanout.
+    /// `EINVAL` if a rectangle isn't within `source` or the scanout.
     pub(crate) fn copy_to_scanout(
         &self,
-        buffer: BufferRef<'_>,
+        source: &DisplaySource,
         offset: u64,
         pitch: u32,
         rects: &[DisplayCopy],
@@ -1297,7 +1337,7 @@ impl<'gpu> Gpu<'gpu> {
             height: back.height,
         };
 
-        self.copy_to_vram(buffer, offset, pitch, rects, &dst)
+        self.copy_to_vram(source, offset, pitch, rects, &dst)
     }
 
     /// Like [`Gpu::copy_to_scanout()`], into the framebuffer of the boot display, which shows on
@@ -1306,7 +1346,7 @@ impl<'gpu> Gpu<'gpu> {
     /// Fails with `ENODEV` without a boot display.
     pub(crate) fn copy_to_boot_display(
         &self,
-        buffer: BufferRef<'_>,
+        source: &DisplaySource,
         offset: u64,
         pitch: u32,
         rects: &[DisplayCopy],
@@ -1319,14 +1359,15 @@ impl<'gpu> Gpu<'gpu> {
             height: display.height,
         };
 
-        self.copy_to_vram(buffer, offset, pitch, rects, &dst)
+        self.copy_to_vram(source, offset, pitch, rects, &dst)
     }
 
-    /// Copies the `rects` of `buffer`, laid out as [`Gpu::copy_to_scanout()`] says, into `dst`
-    /// with the copy engine, and returns once the copy is done.
+    /// Copies the `rects` of `source`, laid out as [`Gpu::copy_to_scanout()`] says, into `dst`
+    /// with the copy engine, which writes VRAM without a mapping, and returns once the copy is
+    /// done.
     fn copy_to_vram(
         &self,
-        buffer: BufferRef<'_>,
+        source: &DisplaySource,
         offset: u64,
         pitch: u32,
         rects: &[DisplayCopy],
@@ -1335,18 +1376,9 @@ impl<'gpu> Gpu<'gpu> {
         /// Bytes per XRGB8888 pixel.
         const CPP: u64 = 4;
 
-        let (pfns, memory, buffer_size) = match buffer {
-            BufferRef::Vram(buffer) => (buffer.pfns()?, Memory::Vram, buffer.size()),
-            BufferRef::System(buffer) => {
-                (buffer.dma_pfns()?, Memory::SystemCoherent, buffer.size())
-            }
-        };
-        let buffer_size = num::usize_as_u64(buffer_size);
-        let (pitch, dst_pitch) = (u64::from(pitch), u64::from(dst.pitch));
-
-        // Offsets of the first pixels copied of each rectangle, from the start of `buffer` and of
-        // `dst`, once checked to be within both.
-        let mut offsets = KVec::with_capacity(rects.len(), GFP_KERNEL)?;
+        let src_va = source.mapped.start().into_raw();
+        let dst_pitch = u64::from(dst.pitch);
+        let mut copies = KVec::with_capacity(rects.len(), GFP_KERNEL)?;
         for rect in rects {
             let fits = |start: u32, len: u32, end: u32| {
                 len > 0 && start.checked_add(len).is_some_and(|last| last <= end)
@@ -1358,69 +1390,35 @@ impl<'gpu> Gpu<'gpu> {
 
             let line_bytes = u64::from(rect.width) * CPP;
             let src = offset
-                .checked_add(u64::from(rect.src_y) * pitch + u64::from(rect.src_x) * CPP)
+                .checked_add(u64::from(rect.src_y) * u64::from(pitch) + u64::from(rect.src_x) * CPP)
                 .ok_or(EINVAL)?;
             let src_end = src
-                .checked_add(u64::from(rect.height - 1) * pitch + line_bytes)
+                .checked_add(u64::from(rect.height - 1) * u64::from(pitch) + line_bytes)
                 .ok_or(EINVAL)?;
-            if u64::from(rect.src_x) * CPP + line_bytes > pitch || src_end > buffer_size {
+            if u64::from(rect.src_x) * CPP + line_bytes > u64::from(pitch) || src_end > source.size
+            {
                 return Err(EINVAL);
             }
 
             let dst_offset = u64::from(rect.dst_y) * dst_pitch + u64::from(rect.dst_x) * CPP;
-            offsets.push((src, dst_offset), GFP_KERNEL)?;
+            copies.push(
+                PitchCopy {
+                    src: src_va + src,
+                    src_pitch: pitch,
+                    dst: VramAddress::from_raw(dst.addr.into_raw() + dst_offset),
+                    dst_pitch: dst.pitch,
+                    line_bytes: u32::try_from(line_bytes)?,
+                    lines: rect.height,
+                },
+                GFP_KERNEL,
+            )?;
         }
-
-        // The pages `dst` is in, which the copy channel maps whole.
-        let page_size = num::usize_as_u64(PAGE_SIZE);
-        let dst_start = dst.addr.into_raw();
-        let dst_pages = dst_start - dst_start % page_size;
-        let dst_end = (u64::from(dst.height) * dst_pitch)
-            .checked_add(dst_start)
-            .and_then(|end| end.checked_next_multiple_of(page_size))
-            .ok_or(EOVERFLOW)?;
 
         // `copy` is locked before `mm`.
         let mut copy = self.copy.lock();
         let copy = Option::as_mut(&mut *copy).ok_or(ENODEV)?;
-        let mut mm = self.mm.lock();
 
-        let src_mapped = copy.map_pages(&mut mm, &pfns, memory)?;
-        let dst_mapped = match copy.map_vram(
-            &mut mm,
-            VramAddress::from_raw(dst_pages)..VramAddress::from_raw(dst_end),
-        ) {
-            Ok(mapped) => mapped,
-            Err(err) => {
-                let _ = copy.unmap(&mut mm, src_mapped);
-                return Err(err);
-            }
-        };
-
-        let src_va = src_mapped.start().into_raw();
-        let dst_va = dst_mapped.start().into_raw() + (dst_start - dst_pages);
-        let copied = (|| {
-            let mut copies = KVec::with_capacity(rects.len(), GFP_KERNEL)?;
-            for (rect, (src, dst_offset)) in rects.iter().zip(offsets.iter()) {
-                copies.push(
-                    PitchCopy {
-                        src: src_va + src,
-                        src_pitch: u32::try_from(pitch)?,
-                        dst: dst_va + dst_offset,
-                        dst_pitch: dst.pitch,
-                        line_bytes: u32::try_from(u64::from(rect.width) * CPP)?,
-                        lines: rect.height,
-                    },
-                    GFP_KERNEL,
-                )?;
-            }
-
-            copy.copy(self.gsp_resources.bar, &mut mm, &copies)
-        })();
-
-        let dst_unmapped = copy.unmap(&mut mm, dst_mapped);
-        let src_unmapped = copy.unmap(&mut mm, src_mapped);
-        copied.and(dst_unmapped).and(src_unmapped)
+        copy.copy(self.gsp_resources.bar, &mut self.mm.lock(), &copies)
     }
 
     /// Enables the vblank interrupt of head `head` if `enable`, or disables it. Doesn't sleep.
