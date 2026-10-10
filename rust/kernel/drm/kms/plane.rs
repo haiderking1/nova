@@ -621,6 +621,25 @@ pub trait RawPlaneState: AsRawPlaneState {
         })
     }
 
+    /// Drop the damage clips of this plane state if its CRTC needs a modeset, after which nothing
+    /// is left of the frame before: [`PlaneStateMutator::damage()`] then reports the whole plane.
+    ///
+    /// Planes with [damage clips enabled](Plane::enable_fb_damage_clips) should run it in their
+    /// atomic check. See [`drm_atomic_helper_check_plane_damage()`].
+    ///
+    /// [`drm_atomic_helper_check_plane_damage()`]: srctree/drivers/gpu/drm/drm_damage_helper.c
+    fn atomic_helper_check_damage<D>(&mut self, state: &AtomicStateComposer<D>)
+    where
+        D: KmsDriver,
+        Self::Plane: ModeObject<Driver = D>,
+    {
+        // SAFETY: `state` is the atomic state being checked, which this plane state is part of,
+        // and we're passing the mutable reference from `self.as_raw_mut()` directly to DRM.
+        unsafe {
+            bindings::drm_atomic_helper_check_plane_damage(state.as_raw(), self.as_raw_mut())
+        }
+    }
+
     /// Return the framebuffer currently set for this plane state
     #[inline]
     fn framebuffer<D>(&self) -> Option<&Framebuffer<D>>
