@@ -134,6 +134,39 @@ impl NovaCoreApi<'_> {
         self.gpu.flip_scanout(present)
     }
 
+    /// Shows the XRGB8888 pixels of `buffer`, whose lines are `pitch` bytes apart from byte
+    /// `offset` on, in place of the framebuffers of Nova's own scanout: the display engine reads
+    /// them from the buffer, from the next frame on, or right away with [`PresentMode::Immediate`],
+    /// tearing. Returns once what was shown before isn't read anymore.
+    ///
+    /// The window reads the buffer until the next [`NovaCoreApi::flip_scanout()`],
+    /// [`NovaCoreApi::show_frame_from_scanout()`] or `show_buffer()` returns, or the buffer is
+    /// given back to [`NovaCoreApi::free_vram()`], which shows the frame from the scanout first.
+    /// The framebuffers of the scanout hold none of the frames shown from buffers.
+    ///
+    /// Fails with `ENODEV` if the scanout isn't set up, and with `EINVAL` if the display engine
+    /// can't read the buffer as it is: it must be contiguous and hold a whole frame of the
+    /// scanout's size (see [`NovaCoreApi::scanout_mode()`]), at an offset and pitch the display
+    /// engine can read. Such buffers are copied to the scanout instead.
+    pub fn show_buffer(
+        &self,
+        buffer: &VramBuffer,
+        offset: u64,
+        pitch: u32,
+        present: PresentMode,
+    ) -> Result {
+        self.gpu.show_buffer(buffer, offset, pitch, present)
+    }
+
+    /// Shows the frame shown from a buffer through [`NovaCoreApi::show_buffer()`], if one is, from
+    /// Nova's own scanout instead: copies it into the back buffer, which is then flipped. Returns
+    /// once the buffer isn't read anymore.
+    ///
+    /// Fails with `ENODEV` if the scanout isn't set up.
+    pub fn show_frame_from_scanout(&self) -> Result {
+        self.gpu.show_frame_from_scanout()
+    }
+
     /// Maps `buffer` for the GPU's copy engine, to copy it to the display with
     /// [`NovaCoreApi::copy_to_scanout()`] or [`NovaCoreApi::copy_to_boot_display()`].
     ///

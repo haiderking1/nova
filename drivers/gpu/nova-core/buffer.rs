@@ -34,9 +34,13 @@ use crate::{
     mm::{
         vmm::MappedRange,
         Pfn,
+        VramAddress,
         PAGE_SIZE, //
     },
-    num::IntoSafeCast,
+    num::{
+        self,
+        IntoSafeCast, //
+    },
 };
 
 /// Alignment and size granularity of VRAM buffers: the size of the GPU's large pages, like the
@@ -82,6 +86,28 @@ impl VramBuffer {
     /// Returns whether the CPU can access the buffer, through a window in BAR1.
     pub fn cpu_visible(&self) -> bool {
         self.window.is_some()
+    }
+
+    /// Returns the VRAM address the buffer starts at, if it is contiguous: its blocks follow each
+    /// other.
+    pub(crate) fn contiguous_start(&self) -> Option<VramAddress> {
+        let mut blocks = self.blocks.iter();
+        let first = blocks.next()?;
+        let start = first.offset();
+        let needed = start.checked_add(num::usize_as_u64(self.size))?;
+
+        let mut end = start + first.size();
+        for block in blocks {
+            if end >= needed {
+                break;
+            }
+            if block.offset() != end {
+                return None;
+            }
+            end += block.size();
+        }
+
+        (end >= needed).then(|| VramAddress::from_raw(start))
     }
 
     /// Returns the frame numbers of the VRAM pages of the buffer, in order.

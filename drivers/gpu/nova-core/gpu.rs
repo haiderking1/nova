@@ -8,6 +8,7 @@ use kernel::{
     dma_buf::Fence,
     fmt,
     gpu::buddy::{
+        GpuBuddyAllocFlag,
         GpuBuddyAllocFlags,
         GpuBuddyAllocMode,
         GpuBuddyParams, //
@@ -25,6 +26,10 @@ use kernel::{
     },
     sync::{
         aref::ARef,
+        atomic::{
+            Atomic,
+            Relaxed, //
+        },
         new_spinlock_irq,
         Arc,
         Mutex,
@@ -74,6 +79,7 @@ use crate::{
         PresentMode,
         Scanout,
         ScanoutMode,
+        Surface,
         VblankHandler,
         VblankHandlerSlot, //
     },
@@ -529,6 +535,11 @@ pub(crate) struct Gpu<'gpu> {
     /// is still running.
     #[pin]
     display_engine: Mutex<Option<DisplayOutput<'gpu>>>,
+    /// Start of the VRAM of the client buffer the window shows a frame from, or [`NO_BUFFER`].
+    ///
+    /// Set with `display_engine` locked, as [`DisplayOutput::shown`] is. Buffers being freed are
+    /// checked against it without the lock, which only flips wait for.
+    shown_buffer: Atomic<u64>,
     /// The context of the graphics engine, once set up by [`Gpu::init_graphics()`].
     gr: Option<GrContext<'gpu>>,
     /// The kernel's channel on a copy engine, which clears new VRAM buffers, once set up by
@@ -887,6 +898,7 @@ impl<'gpu> Gpu<'gpu> {
 
             // Set up by `Gpu::init_display_engine()`, which needs to allocate VRAM.
             display_engine <- new_mutex!(None, "nova_display_engine"),
+            shown_buffer: Atomic::new(NO_BUFFER),
 
             // Set up by `Gpu::init_graphics()`, which needs to allocate VRAM.
             gr: None,
@@ -1188,6 +1200,7 @@ impl<'gpu> Gpu<'gpu> {
             engine,
             scanout,
             dp,
+            shown: None,
         });
 
         Ok(())
@@ -1211,7 +1224,142 @@ impl<'gpu> Gpu<'gpu> {
         let output = Option::as_mut(&mut guard).ok_or(ENODEV)?;
         let scanout = output.scanout.as_mut().ok_or(ENODEV)?;
 
-        scanout.flip(&mut output.engine, self.gsp_resources.bar, present)
+        scanout.flip(&mut output.engine, self.gsp_resources.bar, present)?;
+        self.set_shown(output, None);
+
+        Ok(())
+    }
+
+    /// Shows the XRGB8888 pixels of `buffer`, whose lines are `pitch` bytes apart from byte
+    /// `offset` on, in place of the framebuffers of Nova's own scanout, from the next frame on or
+    /// right away as `present` says. Returns once what was shown before isn't read anymore.
+    ///
+    /// Until the scanout is flipped again, the window reads the buffer: if it is freed by
+    /// [`Gpu::free_vram()`] before, the frame is shown from the scanout instead (see
+    /// [`Gpu::show_frame_from_scanout()`]).
+    ///
+    /// Fails with `ENODEV` if the scanout isn't set up, and with `EINVAL` if the display engine
+    /// can't read the buffer as it is: it must be contiguous and hold a whole frame of the
+    /// scanout's size, laid out as the display engine reads it.
+    pub(crate) fn show_buffer(
+        &self,
+        buffer: &VramBuffer,
+        offset: u64,
+        pitch: u32,
+        present: PresentMode,
+    ) -> Result {
+        /// Bytes per XRGB8888 pixel.
+        const CPP: u64 = 4;
+
+        let mut guard = self.display_engine.lock();
+        let output = Option::as_mut(&mut guard).ok_or(ENODEV)?;
+        let mode = output.scanout.as_ref().map(Scanout::mode).ok_or(ENODEV)?;
+
+        // The display engine reads the frame from VRAM as it is, through no page tables: it must
+        // be within the buffer, which must be contiguous.
+        let start = buffer.contiguous_start().ok_or(EINVAL)?;
+        let size = num::usize_as_u64(buffer.size());
+        let end = u64::from(pitch)
+            .checked_mul(u64::from(mode.height.checked_sub(1).ok_or(EINVAL)?))
+            .and_then(|lines| lines.checked_add(u64::from(mode.width) * CPP))
+            .and_then(|frame| frame.checked_add(offset))
+            .ok_or(EINVAL)?;
+        if end > size {
+            return Err(EINVAL);
+        }
+        let surface = Surface {
+            addr: VramAddress::from_raw(start.into_raw().checked_add(offset).ok_or(EINVAL)?),
+            width: mode.width,
+            height: mode.height,
+            pitch,
+        };
+        // Before anything is sent to the display engine: failing with `EINVAL` changes nothing.
+        surface.check()?;
+
+        output
+            .engine
+            .show(self.gsp_resources.bar, &surface, present)?;
+        let frame = ShownFrame {
+            buffer: start..VramAddress::from_raw(start.into_raw() + size),
+            offset,
+            pitch,
+        };
+        self.set_shown(output, Some(frame));
+
+        Ok(())
+    }
+
+    /// Shows the frame the window shows from a client's buffer, if it shows one, from Nova's own
+    /// scanout instead: copies it into the back buffer, which is then flipped. Returns once the
+    /// buffer isn't read anymore, so that it can be freed.
+    ///
+    /// Fails with `ENODEV` if the scanout isn't set up.
+    pub(crate) fn show_frame_from_scanout(&self) -> Result {
+        let mut guard = self.display_engine.lock();
+        match Option::as_mut(&mut guard) {
+            Some(output) => self.unshow_buffer(output),
+            None => Ok(()),
+        }
+    }
+
+    /// Like [`Gpu::show_frame_from_scanout()`], with the display engine locked as `output`.
+    fn unshow_buffer(&self, output: &mut DisplayOutput<'_>) -> Result {
+        let Some(shown) = output.shown.as_ref() else {
+            return Ok(());
+        };
+        let scanout = output.scanout.as_mut().ok_or(ENODEV)?;
+        let back = scanout.back();
+        let dst = VramPixels {
+            addr: back.addr,
+            pitch: back.pitch,
+            width: back.width,
+            height: back.height,
+        };
+
+        // Even without its frame, the scanout is shown: the buffer mustn't be read anymore.
+        if let Err(err) = self.copy_vram_frame(shown, &dst) {
+            pr_err!("display: can't copy the frame to the scanout: {:?}\n", err);
+        }
+        let bar = self.gsp_resources.bar;
+        scanout.flip(&mut output.engine, bar, PresentMode::Vsync)?;
+        self.set_shown(output, None);
+
+        Ok(())
+    }
+
+    /// Copies the frame `shown`, of the size of `dst`, into `dst` with the copy engine, and
+    /// returns once the copy is done.
+    fn copy_vram_frame(&self, shown: &ShownFrame, dst: &VramPixels) -> Result {
+        let page_size: u64 = PAGE_SIZE.into_safe_cast();
+        let (start, end) = (shown.buffer.start.into_raw(), shown.buffer.end.into_raw());
+        let mut pfns = KVVec::new();
+        for pfn in start / page_size..end / page_size {
+            pfns.push(Pfn::new(pfn), GFP_KERNEL)?;
+        }
+        let size = end - start;
+        let source = self.map_for_copy(&pfns, Memory::Vram, size)?;
+
+        let whole = DisplayCopy {
+            src_x: 0,
+            src_y: 0,
+            dst_x: 0,
+            dst_y: 0,
+            width: dst.width,
+            height: dst.height,
+        };
+        let copied = self.copy_to_vram(&source, shown.offset, shown.pitch, &[whole], dst);
+        self.unmap_display_source(source);
+
+        copied
+    }
+
+    /// Records that the window shows `shown`, or a framebuffer of the scanout if [`None`].
+    fn set_shown(&self, output: &mut DisplayOutput<'_>, shown: Option<ShownFrame>) {
+        let start = shown
+            .as_ref()
+            .map_or(NO_BUFFER, |shown| shown.buffer.start.into_raw());
+        output.shown = shown;
+        self.shown_buffer.store(start, Relaxed);
     }
 
     /// Maps `buffer` for the copy engine, to copy it to the display with
@@ -1227,14 +1375,21 @@ impl<'gpu> Gpu<'gpu> {
             }
         };
 
+        self.map_for_copy(&pfns, memory, num::usize_as_u64(size))
+    }
+
+    /// Maps the `size` bytes of `memory` of pages `pfns` for the copy engine.
+    ///
+    /// Fails with `ENODEV` if the kernel's copy channel isn't set up.
+    fn map_for_copy(&self, pfns: &[Pfn], memory: Memory, size: u64) -> Result<DisplaySource> {
         // `copy` is locked before `mm`.
         let mut copy = self.copy.lock();
         let copy = Option::as_mut(&mut *copy).ok_or(ENODEV)?;
         let mut mm = self.mm.lock();
 
         Ok(DisplaySource {
-            mapped: copy.map_pages(&mut mm, &pfns, memory)?,
-            size: num::usize_as_u64(size),
+            mapped: copy.map_pages(&mut mm, pfns, memory)?,
+            size,
         })
     }
 
@@ -1554,7 +1709,10 @@ impl<'gpu> Gpu<'gpu> {
         let display = self.boot_output.ok_or(ENODEV)?.into_raw();
         let mut output = self.display_engine.lock();
         let DisplayOutput {
-            engine, scanout, ..
+            engine,
+            scanout,
+            shown,
+            ..
         } = Option::as_mut(&mut output).ok_or(ENODEV)?;
 
         let size = (u32::from(mode.hdisplay), u32::from(mode.vdisplay));
@@ -1567,7 +1725,9 @@ impl<'gpu> Gpu<'gpu> {
             match new.show_back(|surface| engine.set_mode(bar, head, display, mode, Some(surface)))
             {
                 Ok(changed) => {
-                    // The window doesn't show the old scanout anymore.
+                    // The window shows neither the old scanout nor a client's buffer anymore.
+                    *shown = None;
+                    self.shown_buffer.store(NO_BUFFER, Relaxed);
                     if let Some(old) = scanout.replace(new) {
                         let _ = old.unmap(&mut mm, &self.bar_user).inspect_err(|e| {
                             dev_err!(dev, "display: can't unmap the old scanout: {:?}\n", e)
@@ -1650,15 +1810,21 @@ impl<'gpu> Gpu<'gpu> {
         let copy = Option::as_mut(&mut *copy).ok_or(ENODEV)?;
         let mut mm = self.mm.lock();
 
-        let blocks = KBox::pin_init(
-            mm.buddy().alloc_blocks(
-                GpuBuddyAllocMode::Simple,
-                size.into_safe_cast(),
-                Alignment::new::<VRAM_BUFFER_ALIGN>(),
-                GpuBuddyAllocFlags::default(),
-            ),
-            GFP_KERNEL,
-        )?;
+        // Contiguous if possible, for the display to show the buffer as it is, as a framebuffer;
+        // in blocks wherever there is room otherwise.
+        let alloc = |flags: GpuBuddyAllocFlags| {
+            KBox::pin_init(
+                mm.buddy().alloc_blocks(
+                    GpuBuddyAllocMode::Simple,
+                    size.into_safe_cast(),
+                    Alignment::new::<VRAM_BUFFER_ALIGN>(),
+                    flags,
+                ),
+                GFP_KERNEL,
+            )
+        };
+        let blocks = alloc(GpuBuddyAllocFlag::Contiguous.into())
+            .or_else(|_| alloc(GpuBuddyAllocFlags::default()))?;
         let mut buffer = VramBuffer::new(blocks, size);
         let pfns = buffer.pfns()?;
 
@@ -1806,8 +1972,24 @@ impl<'gpu> Gpu<'gpu> {
         copy.unmap(mm, mapped).and(filled)
     }
 
-    /// Frees `buffer`, tearing down its window in BAR1.
+    /// Frees `buffer`, tearing down its window in BAR1. If the window shows a frame from it, the
+    /// frame is shown from Nova's own scanout first.
     pub(crate) fn free_vram(&self, mut buffer: VramBuffer) {
+        // The window doesn't read the buffer once its VRAM is free: a frame shown from it is shown
+        // from Nova's own scanout instead.
+        let start = buffer.contiguous_start().map(VramAddress::into_raw);
+        if start.is_some_and(|start| self.shown_buffer.load(Relaxed) == start) {
+            let mut guard = self.display_engine.lock();
+            if let Some(output) = Option::as_mut(&mut guard) {
+                let shown = output.shown.as_ref().map(|frame| frame.buffer.start);
+                if shown.map(VramAddress::into_raw) == start {
+                    let _ = self.unshow_buffer(output).inspect_err(|e| {
+                        pr_err!("display: a freed buffer may still be shown: {:?}\n", e)
+                    });
+                }
+            }
+        }
+
         if let Some(mapped) = buffer.take_window() {
             let mut mm = self.mm.lock();
             let _ = self
@@ -2071,6 +2253,22 @@ struct DisplayOutput<'gpu> {
     /// What the GPU and the board allow the DisplayPort link of the boot display, if it is shown
     /// through one.
     dp: Option<DpGpuCaps>,
+    /// The frame the window shows straight from a client's buffer, if it shows one rather than a
+    /// framebuffer of the scanout.
+    shown: Option<ShownFrame>,
+}
+
+/// [`Gpu::shown_buffer`] while the window shows no client buffer: no VRAM starts there.
+const NO_BUFFER: u64 = u64::MAX;
+
+/// A frame the window shows straight from a client's buffer, through [`Gpu::show_buffer()`].
+struct ShownFrame {
+    /// The VRAM of the buffer, which is contiguous.
+    buffer: Range<VramAddress>,
+    /// Offset of the frame in the buffer, in bytes.
+    offset: u64,
+    /// Distance between the starts of two lines of the frame, in bytes.
+    pitch: u32,
 }
 
 #[pinned_drop]
