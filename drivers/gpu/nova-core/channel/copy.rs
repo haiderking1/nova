@@ -20,6 +20,7 @@ use crate::{
             Memory, //
         },
         GpuMm,
+        MmAccess,
         Pfn,
         VirtualAddress,
         VramAddress, //
@@ -114,7 +115,7 @@ impl<'a> CopyChannel<'a> {
     pub(crate) fn fill(
         &mut self,
         bar: Bar0<'_>,
-        mm: &mut GpuMm<'_>,
+        mm: &mut impl MmAccess,
         addr: VirtualAddress,
         pitch: u32,
         width: u32,
@@ -134,7 +135,7 @@ impl<'a> CopyChannel<'a> {
     pub(crate) fn copy(
         &mut self,
         bar: Bar0<'_>,
-        mm: &mut GpuMm<'_>,
+        mm: &mut impl MmAccess,
         copies: &[PitchCopy],
     ) -> Result {
         let mut push = KVec::new();

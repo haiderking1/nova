@@ -37,7 +37,7 @@ use crate::{
     mm::{
         pagetable::Access,
         vmm::MappedRange,
-        GpuMm, //
+        MmAccess, //
     },
     num,
 };
@@ -138,7 +138,7 @@ impl<'a> ClientChannel<'a> {
     pub(crate) fn new(
         dev: &'a device::Device<device::Bound>,
         cmdq: &Cmdq<'_>,
-        mm: &mut GpuMm<'_>,
+        mm: &mut impl MmAccess,
         chipset: Chipset,
         rm: &RmDevice,
         gr: Option<&GrContext<'_>>,
@@ -191,7 +191,7 @@ impl<'a> ClientChannel<'a> {
         &mut self,
         dev: &device::Device,
         cmdq: &Cmdq<'_>,
-        mm: &mut GpuMm<'_>,
+        mm: &mut impl MmAccess,
         rm: &RmDevice,
         gr: Option<&GrContext<'_>>,
         space: &mut AddressSpace,
@@ -200,12 +200,14 @@ impl<'a> ClientChannel<'a> {
         let semaphore = self.timeline.semaphore();
         let start = semaphore.dma_address();
         let end = start + num::usize_as_u64(semaphore.size());
-        self.fence_mapped = Some(space.map_sysmem_aligned(
-            mm,
-            start..end,
-            num::usize_as_u64(PAGE_SIZE),
-            Access::READ_WRITE,
-        )?);
+        self.fence_mapped = Some(mm.with(|mm| {
+            space.map_sysmem_aligned(
+                mm,
+                start..end,
+                num::usize_as_u64(PAGE_SIZE),
+                Access::READ_WRITE,
+            )
+        })?);
 
         let chid = self.channel.chid();
         let hal = self.channel.hal();
@@ -334,7 +336,7 @@ impl<'a> ClientChannel<'a> {
     pub(crate) fn submit(
         &mut self,
         bar: Bar0<'_>,
-        mm: &mut GpuMm<'_>,
+        mm: &mut impl MmAccess,
         pushes: &[PushBuffer],
     ) -> Result<ARef<Fence>> {
         let hal = self.channel.hal();
@@ -415,16 +417,16 @@ impl<'a> ClientChannel<'a> {
         &mut self,
         dev: &device::Device,
         cmdq: &Cmdq<'_>,
-        mm: &mut GpuMm<'_>,
+        mm: &mut impl MmAccess,
         space: &mut AddressSpace,
     ) {
         // The memory stays mapped until GSP-RM freed the channel.
         self.channel.release(dev, cmdq);
         if let Some(mut context) = self.context.take() {
-            context.unmap(mm, space);
+            mm.with(|mm| context.unmap(mm, space));
         }
         if let Some(mapped) = self.fence_mapped.take() {
-            let _ = space.unmap(mm, mapped);
+            let _ = mm.with(|mm| space.unmap(mm, mapped));
         }
         self.channel.free(dev, cmdq, mm, Some(space));
         // The work done before counts, the rest never will be.

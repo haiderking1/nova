@@ -50,6 +50,7 @@ use crate::{
         },
         ContiguousVram,
         GpuMm,
+        MmAccess,
         Pfn,
         VirtualAddress,
         VramAddress,
@@ -113,7 +114,7 @@ impl AddressSpace {
     pub(crate) fn new(
         dev: &device::Device,
         cmdq: &Cmdq<'_>,
-        mm: &mut GpuMm<'_>,
+        mm: &mut impl MmAccess,
         mmu_version: MmuVersion,
         client: Handle<Client>,
         device: Handle<Device>,
@@ -142,9 +143,13 @@ impl AddressSpace {
             }
         };
 
-        // An empty root page directory: no mappings.
-        let pdb = mm.alloc_contiguous(SZ_4K, Alignment::new::<SZ_4K>())?;
-        mm.clear_vram(pdb.range())?;
+        // An empty root page directory: no mappings. The memory manager is only taken for it, not
+        // while GSP-RM allocates the address space.
+        let pdb = mm.with(|mm| -> Result<_> {
+            let pdb = mm.alloc_contiguous(SZ_4K, Alignment::new::<SZ_4K>())?;
+            mm.clear_vram(pdb.range())?;
+            Ok(pdb)
+        })?;
         let pdb_addr = pdb.range().start;
         let vmm = Vmm::new(pdb_addr, mmu_version, VA_SIZE)?;
         match &layout {

@@ -36,6 +36,7 @@ use crate::{
         },
         vmm::Memory,
         GpuMm,
+        MmAccess,
         PAGE_SIZE, //
     },
     num,
@@ -78,7 +79,7 @@ impl ClientVm {
     pub(crate) fn new(
         dev: &device::Device,
         cmdq: &Cmdq<'_>,
-        mm: &mut GpuMm<'_>,
+        mm: &mut impl MmAccess,
         chipset: Chipset,
         kernel: Range<u64>,
         id: usize,

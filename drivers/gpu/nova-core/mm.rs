@@ -60,7 +60,8 @@ use kernel::{
         Alignable,
         Alignment, //
     },
-    sizes::SZ_4K, //
+    sizes::SZ_4K,
+    sync::Mutex, //
 };
 
 use crate::{
@@ -92,6 +93,29 @@ pub(crate) struct GpuMm<'gpu> {
     buddy: GpuBuddy,
     pramin: pramin::Pramin<'gpu>,
     tlb: Pin<KBox<Tlb<'gpu>>>,
+}
+
+/// Access to the GPU memory manager for code that needs it only now and then, between which it
+/// may wait, such as for GSP-RM: the manager itself, which the caller already locked, or the mutex
+/// it is behind, which is then locked for each use only.
+///
+/// The manager accesses VRAM through PRAMIN, a single window, so it is shared by locking it whole:
+/// whatever holds it, other users of VRAM wait for, among them the display's per-frame copies.
+pub(crate) trait MmAccess {
+    /// Runs `f` with the memory manager.
+    fn with<R>(&mut self, f: impl for<'g> FnOnce(&mut GpuMm<'g>) -> R) -> R;
+}
+
+impl MmAccess for GpuMm<'_> {
+    fn with<R>(&mut self, f: impl for<'g> FnOnce(&mut GpuMm<'g>) -> R) -> R {
+        f(self)
+    }
+}
+
+impl MmAccess for &Mutex<GpuMm<'_>> {
+    fn with<R>(&mut self, f: impl for<'g> FnOnce(&mut GpuMm<'g>) -> R) -> R {
+        f(&mut self.lock())
+    }
 }
 
 impl<'gpu> GpuMm<'gpu> {

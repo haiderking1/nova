@@ -72,6 +72,7 @@ use crate::{
         },
         ContiguousVram,
         GpuMm,
+        MmAccess,
         Pfn,
         VramAddress, //
     },
@@ -191,7 +192,7 @@ impl<'a> Channel<'a> {
     pub(crate) fn new(
         dev: &'a device::Device<device::Bound>,
         cmdq: &Cmdq<'_>,
-        mm: &mut GpuMm<'_>,
+        mm: &mut impl MmAccess,
         chipset: Chipset,
         rm: &RmDevice,
         engine: EngineInfo,
@@ -223,8 +224,8 @@ impl<'a> Channel<'a> {
             mm.clear_vram(vram.range())?;
             Ok(vram)
         };
-        let instance = alloc_cleared(mm, SZ_4K)?;
-        let userd = alloc_cleared(mm, SZ_4K)?;
+        let instance = mm.with(|mm| alloc_cleared(mm, SZ_4K))?;
+        let userd = mm.with(|mm| alloc_cleared(mm, SZ_4K))?;
         let control = Coherent::<u8>::zeroed_slice(dev, CONTROL_SIZE, GFP_KERNEL)?;
 
         // Kernel channels have address spaces of their own, and are privileged.
@@ -271,24 +272,19 @@ impl<'a> Channel<'a> {
             sequence: 0,
         };
 
-        let set_up = |channel: &mut Self,
-                      mm: &mut GpuMm<'_>,
-                      client_space: Option<&mut AddressSpace>|
-         -> Result {
+        // The memory manager is only taken for the memory: GSP-RM's work goes on without it.
+        let mut set_up = |channel: &mut Self, client_space: Option<&mut AddressSpace>| -> Result {
             let start = channel.control.dma_address();
             let control = start..start + num::usize_as_u64(channel.control.size());
             let space = channel.space_mut(client_space)?;
-            let control_mapped = space.map_sysmem_aligned(
-                mm,
-                control,
-                num::usize_as_u64(SZ_4K),
-                Access::READ_WRITE,
-            )?;
+            let control_mapped = mm.with(|mm| {
+                space.map_sysmem_aligned(mm, control, num::usize_as_u64(SZ_4K), Access::READ_WRITE)
+            })?;
             let gpfifo = control_mapped.start().into_raw() + num::usize_as_u64(GPFIFO);
 
             // The control memory's mapping created the page directories GSP-RM takes.
             let shared = if mode == Mode::Split {
-                space.share_with_rm(dev, cmdq, mm)
+                mm.with(|mm| space.share_with_rm(dev, cmdq, mm))
             } else {
                 Ok(())
             };
@@ -334,7 +330,7 @@ impl<'a> Channel<'a> {
             Ok(())
         };
 
-        match set_up(&mut channel, mm, client_space.as_deref_mut()) {
+        match set_up(&mut channel, client_space.as_deref_mut()) {
             Ok(()) => Ok(channel),
             Err(err) => {
                 channel.free(dev, cmdq, mm, client_space);
@@ -505,7 +501,7 @@ impl<'a> Channel<'a> {
     }
 
     /// Runs the methods of `push`, and returns once the work they do is done.
-    pub(crate) fn run(&mut self, bar: Bar0<'_>, mm: &mut GpuMm<'_>, push: &[u32]) -> Result {
+    pub(crate) fn run(&mut self, bar: Bar0<'_>, mm: &mut impl MmAccess, push: &[u32]) -> Result {
         let control_va = self.control_va()?;
         let sequence = self.sequence.wrapping_add(1);
 
@@ -532,7 +528,7 @@ impl<'a> Channel<'a> {
     pub(crate) fn submit(
         &mut self,
         bar: Bar0<'_>,
-        mm: &mut GpuMm<'_>,
+        mm: &mut impl MmAccess,
         entries: &[GpEntry],
         tail: &[u32],
     ) -> Result {
@@ -553,7 +549,7 @@ impl<'a> Channel<'a> {
     pub(crate) fn submit_queued(
         &mut self,
         bar: Bar0<'_>,
-        mm: &mut GpuMm<'_>,
+        mm: &mut impl MmAccess,
         entries: &[GpEntry],
         tail: &[u32],
         slot: usize,
@@ -577,7 +573,7 @@ impl<'a> Channel<'a> {
     fn submit_at(
         &mut self,
         bar: Bar0<'_>,
-        mm: &mut GpuMm<'_>,
+        mm: &mut impl MmAccess,
         entries: &[GpEntry],
         tail: &[u32],
         tail_offset: usize,
@@ -610,10 +606,9 @@ impl<'a> Channel<'a> {
 
         // The GPU must see the push buffer and the ring above before `GPPut` moves.
         dma_mb(Write);
-        mm.write_vram(
-            self.userd.range().start + num::usize_as_u64(self.hal.userd_gp_put()),
-            &[self.put],
-        )?;
+        // The memory manager is only taken for this write: the copies of the display wait for it.
+        let gp_put = self.userd.range().start + num::usize_as_u64(self.hal.userd_gp_put());
+        mm.with(|mm| mm.write_vram(gp_put, &[self.put]))?;
 
         // PRAMIN and the doorbell are both in BAR0: the channel sees `GPPut` when told to look.
         self.hal.ring_doorbell(bar, &self.engine, self.chid)
@@ -653,7 +648,7 @@ impl<'a> Channel<'a> {
     }
 
     /// Waits for the semaphore to be released with `value`.
-    fn wait_semaphore(&self, mm: &mut GpuMm<'_>, value: u32) -> Result {
+    fn wait_semaphore(&self, mm: &mut impl MmAccess, value: u32) -> Result {
         let userd = self.userd.range().start;
 
         let result = read_poll_timeout(
@@ -663,7 +658,8 @@ impl<'a> Channel<'a> {
             TIMEOUT,
         );
         if result.is_err() {
-            let gp_get = mm.read_vram(userd + num::usize_as_u64(self.hal.userd_gp_get()));
+            let gp_get =
+                mm.with(|mm| mm.read_vram(userd + num::usize_as_u64(self.hal.userd_gp_get())));
             pr_err!(
                 "nova-core: channel {}: work not done: semaphore {}, GPGet {:?}, GPPut {}\n",
                 self.chid,
@@ -746,7 +742,7 @@ impl<'a> Channel<'a> {
         &mut self,
         dev: &device::Device,
         cmdq: &Cmdq<'_>,
-        mm: &mut GpuMm<'_>,
+        mm: &mut impl MmAccess,
         client_space: Option<&mut AddressSpace>,
     ) {
         self.release(dev, cmdq);
@@ -763,7 +759,7 @@ impl<'a> Channel<'a> {
             return;
         };
         if let Some(mapped) = mapped {
-            let _ = space.unmap(mm, mapped);
+            let _ = mm.with(|mm| space.unmap(mm, mapped));
         }
         if let Space::Own(space) = &self.space {
             let _ = space

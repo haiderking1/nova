@@ -50,6 +50,7 @@ use crate::{
         vmm::MappedRange,
         ContiguousVram,
         GpuMm,
+        MmAccess,
         VramAddress, //
     },
     num,
@@ -607,15 +608,17 @@ impl GrContext<'_> {
         &self,
         dev: &device::Device,
         cmdq: &Cmdq<'_>,
-        mm: &mut GpuMm<'_>,
+        mm: &mut impl MmAccess,
         rm: &RmDevice,
         channel: &Channel<'_>,
         space: &mut AddressSpace,
         privileged: bool,
     ) -> Result<ChannelContext> {
-        let (mut context, entries) = self.map_channel_context(mm, space, privileged)?;
+        // The memory manager is only taken for the mappings: not while GSP-RM promotes the context.
+        let (mut context, entries) =
+            mm.with(|mm| self.map_channel_context(mm, space, privileged))?;
         if let Err(err) = promote(dev, cmdq, rm, channel, &entries) {
-            context.unmap(mm, space);
+            mm.with(|mm| context.unmap(mm, space));
             return Err(err);
         }
 

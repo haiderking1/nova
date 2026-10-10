@@ -1357,11 +1357,12 @@ impl<'gpu> Gpu<'gpu> {
             )?;
         }
 
-        // `copy` is locked before `mm`.
+        // `copy` is locked before `mm`, which is only locked to start the copy: waiting for it to
+        // be done doesn't keep the users of VRAM waiting.
         let mut copy = self.copy.lock();
         let copy = Option::as_mut(&mut *copy).ok_or(ENODEV)?;
 
-        copy.copy(self.gsp_resources.bar, &mut self.mm.lock(), &copies)
+        copy.copy(self.gsp_resources.bar, &mut &self.mm, &copies)
     }
 
     /// Enables the vblank interrupt of head `head` if `enable`, or disables it. Doesn't sleep.
@@ -1825,7 +1826,7 @@ impl<'gpu> Gpu<'gpu> {
         let vm = ClientVm::new(
             gsp_resources.device.as_ref(),
             &gsp_resources.gsp.cmdq,
-            &mut self.mm.lock(),
+            &mut &self.mm,
             self.spec.chipset,
             kernel,
             id,
@@ -1887,7 +1888,8 @@ impl<'gpu> Gpu<'gpu> {
             let mut channel = ClientChannel::new(
                 dev,
                 cmdq,
-                &mut self.mm.lock(),
+                // Locked for the channel's memory only: not while GSP-RM sets the channel up.
+                &mut &self.mm,
                 self.spec.chipset,
                 rm,
                 self.gr.as_ref(),
@@ -1898,7 +1900,7 @@ impl<'gpu> Gpu<'gpu> {
             )?;
             let timeline = channel.timeline().clone();
             if let Err(err) = self.timelines_ref.add(timeline.clone()) {
-                channel.free(dev, cmdq, &mut self.mm.lock(), space);
+                channel.free(dev, cmdq, &mut &self.mm, space);
                 return Err(err);
             }
             let channel =
@@ -1939,7 +1941,7 @@ impl<'gpu> Gpu<'gpu> {
             channel.free(
                 gsp_resources.device.as_ref(),
                 &gsp_resources.gsp.cmdq,
-                &mut self.mm.lock(),
+                &mut &self.mm,
                 vm.space_mut(),
             );
             self.timelines_ref.remove(channel.timeline());
@@ -1969,7 +1971,7 @@ impl<'gpu> Gpu<'gpu> {
         // Without `mm` locked: other channels' work goes on meanwhile.
         channel.wait_for_room(pushes.len())?;
 
-        channel.submit(self.gsp_resources.bar, &mut self.mm.lock(), pushes)
+        channel.submit(self.gsp_resources.bar, &mut &self.mm, pushes)
     }
 
     /// Returns the GPU's timer, a count of nanoseconds that work on the GPU timestamps with.
