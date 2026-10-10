@@ -28,6 +28,16 @@ pub(crate) mod core_c67d {
 
     /// Sets the context DMA of the notifier written on the next update.
     pub(crate) const SET_CONTEXT_DMA_NOTIFIER: u32 = bindings::NVC67D_SET_CONTEXT_DMA_NOTIFIER;
+    /// Sets how the next update writes its notifier: the mode in bit 0, the offset of the notifier
+    /// in its context DMA in bits 11:4, in units of 16 bytes, and whether it's written in bit 12.
+    pub(crate) const SET_NOTIFIER_CONTROL: u32 = bindings::NVC67D_SET_NOTIFIER_CONTROL;
+    /// [`SET_NOTIFIER_CONTROL`] mode writing the notifier.
+    pub(crate) const NOTIFIER_MODE_WRITE: u32 = bindings::NVC67D_SET_NOTIFIER_CONTROL_MODE_WRITE;
+    /// [`SET_NOTIFIER_CONTROL`] bit having the notifier written.
+    pub(crate) const NOTIFIER_NOTIFY: u32 =
+        bindings::NVC67D_SET_NOTIFIER_CONTROL_NOTIFY_ENABLE << 12;
+    /// [`sor_set_control`] value of a SOR no head drives.
+    pub(crate) const SOR_CONTROL_NONE: u32 = bindings::NVC67D_SOR_SET_CONTROL_OWNER_MASK_NONE;
     /// Cursor channels the next update waits for.
     pub(crate) const SET_INTERLOCK_FLAGS: u32 = bindings::NVC67D_SET_INTERLOCK_FLAGS;
     /// Window channels the next update waits for, one bit per window.
@@ -45,6 +55,26 @@ pub(crate) mod core_c67d {
     /// if set (`NVC67D_HEAD_SET_CONTROL_OUTPUT_RESOURCE`).
     pub(crate) const fn head_set_control_output_resource(head: u32) -> u32 {
         0x2004 + head * 0x400
+    }
+
+    /// Bits per pixel the output of a head sends, of the pixel depth in bits 7:4 of
+    /// [`head_set_control_output_resource`] (`NVC67D_HEAD_SET_CONTROL_OUTPUT_RESOURCE_PIXEL_DEPTH`),
+    /// or `None` for an invalid depth.
+    pub(crate) const fn output_resource_bpp(output: u32) -> Option<u32> {
+        match output >> 4 & 0xf {
+            0x0 => Some(16), // BPP_16_422
+            0x1 => Some(18), // BPP_18_444
+            0x2 => Some(20), // BPP_20_422
+            0x3 => Some(24), // BPP_24_422
+            0x4 => Some(24), // BPP_24_444
+            0x5 => Some(30), // BPP_30_444
+            0x6 => Some(32), // BPP_32_422
+            0x7 => Some(36), // BPP_36_444
+            0x8 => Some(48), // BPP_48_444
+            0x9 => Some(16), // BPP_16_444
+            0xa => Some(18), // BPP_18_444NP
+            _ => None,
+        }
     }
 
     /// Pixel clock of head `head`, in Hz in bits 30:0 (`NVC67D_HEAD_SET_PIXEL_CLOCK_FREQUENCY`).

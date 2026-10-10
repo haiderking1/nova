@@ -43,6 +43,7 @@ use crate::{
         },
         fw::{
             rm::*,
+            GspMsgRmError,
             GspMsgRmStatus,
             MsgFunction, //
         },
@@ -127,6 +128,21 @@ impl<T: RmControlCommand> RmControl<T> {
         self.cmd
             .parse_reply(&reply.params)
             .map_err(GspRpcError::Transport)
+    }
+
+    /// Sends an RM control command and returns RM's status with the reply, which some commands
+    /// fill in when they fail too, to tell why.
+    pub(crate) fn send_with_status(
+        self,
+        dev: &device::Device,
+        cmdq: &Cmdq<'_>,
+    ) -> Result<(Result<(), GspMsgRmError>, T::Reply)> {
+        let reply = cmdq
+            .send_command(RawRmControl(&self))
+            .map_err(Error::from)?;
+        let status = reply.status.log_if_warning(dev, T::FUNCTION);
+
+        Ok((status, self.cmd.parse_reply(&reply.params)?))
     }
 }
 
@@ -1254,4 +1270,80 @@ rm_control!(
     DpGetLinkConfigParams,
     DpLinkConfig,
     |p| p.config()
+);
+
+/// RM control command querying the configuration the board gives a digital display.
+pub(crate) struct DfpGetInfo(DfpGetInfoParams);
+
+impl DfpGetInfo {
+    /// Creates the command for `display_id`.
+    pub(crate) fn new(display_id: u32) -> Self {
+        Self(DfpGetInfoParams::new(display_id))
+    }
+}
+
+rm_control!(
+    DfpGetInfo,
+    DisplayCommon,
+    DispDfpGetInfo,
+    DfpGetInfoParams,
+    Option<u32>,
+    |p| p.max_link_bw()
+);
+
+/// RM control command querying what the DisplayPort outputs of the GPU can do.
+pub(crate) struct DpGetCaps(DpGetCapsParams);
+
+impl DpGetCaps {
+    /// Creates the command.
+    pub(crate) fn new() -> Self {
+        Self(DpGetCapsParams::new())
+    }
+}
+
+rm_control!(
+    DpGetCaps,
+    DisplayCommon,
+    DispDpGetCaps,
+    DpGetCapsParams,
+    DpGpuCaps,
+    |p| p.caps().ok_or(ENODEV)?
+);
+
+/// RM control command carrying out a transfer on the AUX channel of a DisplayPort display.
+pub(crate) struct DpAux(DpAuxParams);
+
+impl DpAux {
+    /// Creates the command for the transfer `params`.
+    pub(crate) fn new(params: DpAuxParams) -> Self {
+        Self(params)
+    }
+}
+
+rm_control!(
+    DpAux,
+    DisplayCommon,
+    DispDpAuxchCtrl,
+    DpAuxParams,
+    DpAuxParams,
+    |p| *p
+);
+
+/// RM control command training the link of a DisplayPort display.
+pub(crate) struct DpCtrl(DpCtrlParams);
+
+impl DpCtrl {
+    /// Creates the command for the training `params`.
+    pub(crate) fn new(params: DpCtrlParams) -> Self {
+        Self(params)
+    }
+}
+
+rm_control!(
+    DpCtrl,
+    DisplayCommon,
+    DispDpCtrl,
+    DpCtrlParams,
+    DpCtrlParams,
+    |p| *p
 );

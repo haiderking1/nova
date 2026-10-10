@@ -52,6 +52,24 @@ pub(crate) struct WindowImage<'a> {
     pub(super) present: PresentMode,
 }
 
+/// The output a head drives: the SOR it owns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HeadOutput {
+    /// Index of the SOR.
+    pub(crate) sor: u32,
+    /// Control of the SOR, as when the head drives it: the heads driving it and its protocol.
+    pub(crate) control: u32,
+}
+
+/// Where a core channel update reports its progress.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CoreNotifier {
+    /// Handle of the context DMA of the notifier.
+    pub(crate) ctxdma: u32,
+    /// Offset of the notifier in its context DMA, in bytes: a multiple of 16.
+    pub(crate) offset: u32,
+}
+
 pub(crate) trait DisplayHal: Sync {
     /// Allocates the display object `handle` under `device`, the parent of the display channels.
     fn alloc_display(
@@ -116,25 +134,48 @@ pub(crate) trait DisplayHal: Sync {
     /// head.
     fn take_vblanks(&self, bar: Bar0<'_>) -> u32;
 
+    /// Returns the output head `head` drives, as the core channel has it armed, if any.
+    fn armed_output(&self, bar: Bar0<'_>, head: u32) -> Option<HeadOutput>;
+
+    /// Returns the bits per pixel head `head` sends its output, as the core channel has it armed.
+    fn armed_output_bpp(&self, bar: Bar0<'_>, head: u32) -> Option<u32>;
+
     /// Pushes the core channel methods giving head `head` the raster `raster`, driving the display
-    /// `display_id` (an RM display ID) on the output it has. The head keeps its output and the
-    /// windows it shows: only its timings change.
+    /// `display_id` (an RM display ID) on `output`. The head keeps the windows it shows.
     fn push_head_mode(
         &self,
         bar: Bar0<'_>,
         push: &mut PushBuffer<'_>,
         head: u32,
         display_id: u32,
+        output: &HeadOutput,
         raster: &HeadRaster,
+    ) -> Result;
+
+    /// Pushes the core channel methods detaching head `head` from `output`, which then drives no
+    /// display, as for a modeset in NVIDIA's driver. The head keeps its raster.
+    fn push_detach(
+        &self,
+        bar: Bar0<'_>,
+        push: &mut PushBuffer<'_>,
+        head: u32,
+        output: &HeadOutput,
     ) -> Result;
 
     /// Pushes the core channel method letting window `window` fetch lines of any width, as
     /// nouveau does, keeping the rest of its usage bounds: the firmware set them for its mode.
     fn push_window_bounds(&self, bar: Bar0<'_>, push: &mut PushBuffer<'_>, window: u32) -> Result;
 
-    /// Pushes a core channel update without a notifier, which takes effect with the updates of the
-    /// windows in `windows`, a mask, already sent interlocked with it.
-    fn push_core_update(&self, bar: Bar0<'_>, push: &mut PushBuffer<'_>, windows: u32) -> Result;
+    /// Pushes a core channel update, which takes effect with the updates of the windows in
+    /// `windows`, a mask, already sent interlocked with it, and reports its progress in `notifier`
+    /// if any.
+    fn push_core_update(
+        &self,
+        bar: Bar0<'_>,
+        push: &mut PushBuffer<'_>,
+        windows: u32,
+        notifier: Option<CoreNotifier>,
+    ) -> Result;
 
     /// Returns the raster head `head` scans out with, as the core channel has it armed.
     fn armed_raster(&self, bar: Bar0<'_>, head: u32) -> Option<HeadRaster>;

@@ -8,6 +8,7 @@
 //! To drive the display engine itself, Nova takes it over from GSP-RM: see [`DisplayEngine`].
 
 mod channel;
+pub(crate) mod dp;
 mod engine;
 pub(crate) mod hal;
 mod instmem;
@@ -36,7 +37,11 @@ pub(crate) use vblank::VblankHandlerSlot;
 
 use kernel::{
     device,
-    prelude::*, //
+    prelude::*,
+    time::{
+        delay::fsleep,
+        Delta, //
+    }, //
 };
 
 use crate::gsp::{
@@ -50,18 +55,28 @@ use crate::gsp::{
     rm::{
         commands::{
             AllocDisplayCommon,
+            DfpGetInfo,
             DispGetActive,
             DispGetConnectorType,
             DispGetEdid,
             DispGetNumHeads,
+            DpAux,
+            DpCtrl,
+            DpGetCaps,
             DpGetLinkConfig,
             RmAlloc,
             RmControl,
+            RmControlCommand,
             RmFree, //
         },
         device::RmDevice,
     },
-    ConnectorType, DpLinkConfig,
+    ConnectorType,
+    DpAuxParams,
+    DpCtrlParams,
+    DpGpuCaps,
+    DpLinkConfig,
+    DpTraining, //
 };
 
 /// Handle of the display common object, after its class. The caller of an allocation picks the
@@ -215,5 +230,115 @@ impl Display {
         };
 
         read(false).or_else(|_| read(true))
+    }
+}
+
+/// How many times an AUX transfer or a link training is sent while GSP-RM asks to retry it later,
+/// as NVIDIA's driver does.
+const DP_TRIES: usize = 3;
+
+impl Display {
+    /// Sends `cmd` to the display common object, waiting and sending it again as long as RM
+    /// fails it but asks for a retry after the time `retry_ms` returns, up to [`DP_TRIES`] times.
+    /// Returns the reply of the last try, with whether RM failed it.
+    fn send_retrying<T: RmControlCommand<Target = DisplayCommon>>(
+        &self,
+        dev: &device::Device,
+        cmdq: &Cmdq<'_>,
+        cmd: impl Fn() -> Result<T>,
+        retry_ms: impl Fn(&T::Reply) -> Option<u32>,
+    ) -> Result<(Result, T::Reply)> {
+        let mut tries = 0;
+        loop {
+            let (status, reply) =
+                RmControl::new(self.client, self.common, cmd()?).send_with_status(dev, cmdq)?;
+            tries += 1;
+            match (status, retry_ms(&reply)) {
+                (Err(_), Some(ms)) if tries < DP_TRIES => {
+                    dev_dbg!(dev, "display: GSP-RM asks to retry in {} ms\n", ms);
+                    fsleep(Delta::from_millis(ms.into()));
+                }
+                (status, _) => return Ok((status.map_err(Error::from), reply)),
+            }
+        }
+    }
+
+    /// Carries out the AUX transfer `request` at `addr` on the DisplayPort link of `display`,
+    /// writing `data` for write requests or reading `len` bytes for read requests, and returns
+    /// RM's report of it. `request` is coded as the DisplayPort specification does.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn dp_aux(
+        &self,
+        dev: &device::Device,
+        cmdq: &Cmdq<'_>,
+        display: DisplayId,
+        request: u8,
+        addr: u32,
+        data: &[u8],
+        len: usize,
+    ) -> Result<DpAuxParams> {
+        let (status, reply) = self.send_retrying(
+            dev,
+            cmdq,
+            || {
+                Ok(DpAux::new(DpAuxParams::new(
+                    display.0, request, addr, data, len,
+                )?))
+            },
+            DpAuxParams::retry_ms,
+        )?;
+        status.map(|()| reply)
+    }
+
+    /// Has RM train the DisplayPort link of `display` as `training` says, spreading the link's
+    /// spectrum or not as RM's defaults are if `downspread`.
+    ///
+    /// Fails with `EIO` if the training fails.
+    pub(crate) fn dp_train(
+        &self,
+        dev: &device::Device,
+        cmdq: &Cmdq<'_>,
+        display: DisplayId,
+        training: &DpTraining,
+        downspread: bool,
+    ) -> Result {
+        let (status, reply) = self.send_retrying(
+            dev,
+            cmdq,
+            || {
+                Ok(DpCtrl::new(DpCtrlParams::train(
+                    display.0, training, downspread,
+                )))
+            },
+            DpCtrlParams::retry_ms,
+        )?;
+        if status.is_err() || reply.err() != 0 {
+            dev_err!(
+                dev,
+                "display: training {:?} failed: {:?}, errors {:#010x}\n",
+                training,
+                status,
+                reply.err()
+            );
+            return Err(EIO);
+        }
+
+        Ok(())
+    }
+
+    /// Returns what the DisplayPort outputs of the GPU can do.
+    pub(crate) fn dp_gpu_caps(&self, dev: &device::Device, cmdq: &Cmdq<'_>) -> Result<DpGpuCaps> {
+        Ok(RmControl::new(self.client, self.common, DpGetCaps::new()).send(dev, cmdq)?)
+    }
+
+    /// Returns the highest link bandwidth code the board allows the DisplayPort link of
+    /// `display`, if it limits it.
+    pub(crate) fn dp_board_max_link_bw(
+        &self,
+        dev: &device::Device,
+        cmdq: &Cmdq<'_>,
+        display: DisplayId,
+    ) -> Result<Option<u32>> {
+        Ok(RmControl::new(self.client, self.common, DfpGetInfo::new(display.0)).send(dev, cmdq)?)
     }
 }

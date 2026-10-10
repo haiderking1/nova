@@ -35,6 +35,14 @@ pub(crate) enum RmControlMsgFunction {
     DispSpecificGetConnectorData = bindings::NV0073_CTRL_CMD_SPECIFIC_GET_CONNECTOR_DATA,
     /// Get the link configuration of a DisplayPort display.
     DispDpGetLinkConfig = bindings::NV0073_CTRL_CMD_DP_GET_LINK_CONFIG,
+    /// Carry out a transfer on the AUX channel of a DisplayPort display.
+    DispDpAuxchCtrl = bindings::NV0073_CTRL_CMD_DP_AUXCH_CTRL,
+    /// Train the link of a DisplayPort display.
+    DispDpCtrl = bindings::NV0073_CTRL_CMD_DP_CTRL,
+    /// Get what the DisplayPort outputs of the GPU can do.
+    DispDpGetCaps = bindings::NV0073_CTRL_CMD_DP_GET_CAPS,
+    /// Get the configuration of a digital display (DFP) of the board.
+    DispDfpGetInfo = bindings::NV0073_CTRL_CMD_DFP_GET_INFO,
     /// Get the EDID of a display.
     DispSpecificGetEdidV2 = bindings::NV0073_CTRL_CMD_SPECIFIC_GET_EDID_V2,
     /// Get the static configuration of the display engine.
@@ -91,6 +99,10 @@ impl TryFrom<u32> for RmControlMsgFunction {
             }
             bindings::NV0073_CTRL_CMD_SPECIFIC_GET_EDID_V2 => Ok(Self::DispSpecificGetEdidV2),
             bindings::NV0073_CTRL_CMD_DP_GET_LINK_CONFIG => Ok(Self::DispDpGetLinkConfig),
+            bindings::NV0073_CTRL_CMD_DP_AUXCH_CTRL => Ok(Self::DispDpAuxchCtrl),
+            bindings::NV0073_CTRL_CMD_DP_CTRL => Ok(Self::DispDpCtrl),
+            bindings::NV0073_CTRL_CMD_DP_GET_CAPS => Ok(Self::DispDpGetCaps),
+            bindings::NV0073_CTRL_CMD_DFP_GET_INFO => Ok(Self::DispDfpGetInfo),
             bindings::NV2080_CTRL_CMD_INTERNAL_DISPLAY_GET_STATIC_INFO => {
                 Ok(Self::InternalDisplayGetStaticInfo)
             }
@@ -489,12 +501,12 @@ unsafe impl AsBytes for DispGetConnectorDataParams {}
 
 /// Configuration of a DisplayPort link.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct DpLinkConfig {
+pub struct DpLinkConfig {
     /// Number of lanes.
-    pub(crate) lanes: u32,
+    pub lanes: u32,
     /// Rate of each lane, in units of 270 Mb/s (`NV0073_CTRL_CMD_DP_GET_LINK_CONFIG_LINK_BW_*`,
     /// like the DPCD `LINK_BW_SET` register): 0x0a for HBR, 0x14 for HBR2, 0x1e for HBR3.
-    pub(crate) link_bw: u32,
+    pub link_bw: u32,
 }
 
 /// Wrapper for [`bindings::NV0073_CTRL_DP_GET_LINK_CONFIG_PARAMS`].
@@ -527,6 +539,296 @@ unsafe impl FromBytes for DpGetLinkConfigParams {}
 
 // SAFETY: This struct contains no padding.
 unsafe impl AsBytes for DpGetLinkConfigParams {}
+
+/// Returns the link bandwidth code, as in [`DpLinkConfig::link_bw`], of a highest link rate as
+/// RM reports it in `NV0073_CTRL_CMD_DP_GET_CAPS_MAX_LINK_RATE` and
+/// `NV0073_CTRL_DFP_FLAGS_DP_LINK_BW`, whose values are the same, or `None` for no rate.
+fn link_bw_of_max_rate(rate: u32) -> Option<u32> {
+    match rate {
+        bindings::NV0073_CTRL_CMD_DP_GET_CAPS_MAX_LINK_RATE_1_62 => Some(0x06),
+        bindings::NV0073_CTRL_CMD_DP_GET_CAPS_MAX_LINK_RATE_2_70 => Some(0x0a),
+        bindings::NV0073_CTRL_CMD_DP_GET_CAPS_MAX_LINK_RATE_5_40 => Some(0x14),
+        bindings::NV0073_CTRL_CMD_DP_GET_CAPS_MAX_LINK_RATE_8_10 => Some(0x1e),
+        _ => None,
+    }
+}
+
+/// Wrapper for [`bindings::NV0073_CTRL_DFP_GET_INFO_PARAMS`].
+#[repr(transparent)]
+pub(crate) struct DfpGetInfoParams(bindings::NV0073_CTRL_DFP_GET_INFO_PARAMS);
+
+impl DfpGetInfoParams {
+    /// Creates the parameters to query the configuration of the digital display `display_id` on
+    /// subdevice 0.
+    pub(crate) fn new(display_id: u32) -> Self {
+        Self(bindings::NV0073_CTRL_DFP_GET_INFO_PARAMS {
+            displayId: display_id,
+            ..Default::default()
+        })
+    }
+
+    /// Returns the highest link bandwidth code the board allows the display's DisplayPort link,
+    /// or `None` if it doesn't say.
+    pub(crate) fn max_link_bw(&self) -> Option<u32> {
+        // `NV0073_CTRL_DFP_FLAGS_DP_LINK_BW` is bits 19:17.
+        link_bw_of_max_rate(self.0.flags >> 17 & 0x7)
+    }
+}
+
+// SAFETY: This struct only contains integer types for which all bit patterns are valid.
+unsafe impl FromBytes for DfpGetInfoParams {}
+
+// SAFETY: This struct contains no padding.
+unsafe impl AsBytes for DfpGetInfoParams {}
+
+/// What the DisplayPort outputs of the GPU can do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DpGpuCaps {
+    /// Highest link bandwidth code, as in [`DpLinkConfig::link_bw`].
+    pub(crate) max_link_bw: u32,
+    /// Whether the watermarks of the outputs have the higher limits of newer GPUs.
+    pub(crate) increased_watermark_limits: bool,
+    /// Whether the outputs may spread the spectrum of their links.
+    pub(crate) downspread: bool,
+}
+
+/// Wrapper for [`bindings::NV0073_CTRL_CMD_DP_GET_CAPS_PARAMS`].
+#[repr(transparent)]
+pub(crate) struct DpGetCapsParams(bindings::NV0073_CTRL_CMD_DP_GET_CAPS_PARAMS);
+
+impl DpGetCapsParams {
+    /// Creates the parameters to query what the DisplayPort outputs of subdevice 0 can do.
+    pub(crate) fn new() -> Self {
+        Self(bindings::NV0073_CTRL_CMD_DP_GET_CAPS_PARAMS {
+            // Any output, as nouveau asks.
+            sorIndex: !0,
+            ..Default::default()
+        })
+    }
+
+    /// Returns what the outputs can do, or `None` if RM reports no link rate.
+    pub(crate) fn caps(&self) -> Option<DpGpuCaps> {
+        Some(DpGpuCaps {
+            // `NV0073_CTRL_CMD_DP_GET_CAPS_MAX_LINK_RATE` is bits 2:0.
+            max_link_bw: link_bw_of_max_rate(self.0.maxLinkRate & 0x7)?,
+            increased_watermark_limits: self.0.bHasIncreasedWatermarkLimits != 0,
+            downspread: self.0.bSupportDPDownSpread != 0,
+        })
+    }
+}
+
+// SAFETY: This struct only contains integer types for which all bit patterns are valid.
+unsafe impl FromBytes for DpGetCapsParams {}
+
+// SAFETY: The padding of this struct is explicit, as fields.
+unsafe impl AsBytes for DpGetCapsParams {}
+
+/// Highest number of bytes of an AUX transfer.
+pub(crate) const DP_AUX_MAX_LEN: usize = bindings::NV0073_CTRL_DP_AUXCH_MAX_DATA_SIZE as usize;
+
+/// Outcome of an AUX transfer, as RM reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DpAuxReply {
+    /// The sink, or for I2C requests the I2C device, acknowledged the request.
+    Ack,
+    /// The sink refused the request.
+    Nack,
+    /// The sink wasn't ready: the request has to be retried.
+    Defer,
+    /// The I2C device refused the request.
+    I2cNack,
+    /// The I2C device wasn't ready: the request has to be retried.
+    I2cDefer,
+    /// The sink didn't reply.
+    Timeout,
+    /// The request was invalid.
+    Invalid,
+}
+
+/// Wrapper for [`bindings::NV0073_CTRL_DP_AUXCH_CTRL_PARAMS`].
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub(crate) struct DpAuxParams(bindings::NV0073_CTRL_DP_AUXCH_CTRL_PARAMS);
+
+impl DpAuxParams {
+    /// Creates the parameters of an AUX transfer of `display_id` on subdevice 0: the request
+    /// `request` at `addr`, writing `data` for write requests, or reading `len` bytes for read
+    /// requests. A transfer of no bytes is an address-only transfer.
+    ///
+    /// `request` is coded as the DisplayPort specification does, which RM's
+    /// `NV0073_CTRL_DP_AUXCH_CMD` follows: native (bit 3) or I2C, I2C middle-of-transaction (bit
+    /// 2), and write, read or I2C write status update (bits 1:0).
+    ///
+    /// Fails with `EINVAL` if the transfer is longer than [`DP_AUX_MAX_LEN`].
+    pub(crate) fn new(
+        display_id: u32,
+        request: u8,
+        addr: u32,
+        data: &[u8],
+        len: usize,
+    ) -> Result<Self> {
+        if len > DP_AUX_MAX_LEN || data.len() > len {
+            return Err(EINVAL);
+        }
+
+        let mut params = bindings::NV0073_CTRL_DP_AUXCH_CTRL_PARAMS {
+            displayId: display_id,
+            bAddrOnly: u8::from(len == 0),
+            cmd: u32::from(request & 0xf),
+            addr,
+            // The length is sent less one, but for address-only transfers.
+            size: u32::try_from(len.saturating_sub(1))?,
+            ..Default::default()
+        };
+        if len == 0 {
+            // Address-only transfers are sent as writes, without middle-of-transaction for I2C, as
+            // nouveau does (`NV0073_CTRL_DP_AUXCH_CMD_REQ_TYPE_WRITE`, `_I2C_MOT_FALSE`).
+            params.cmd &= !0b111;
+        }
+        params.data[..data.len()].copy_from_slice(data);
+
+        Ok(Self(params))
+    }
+
+    /// Returns the outcome of the transfer.
+    pub(crate) fn reply(&self) -> DpAuxReply {
+        match self.0.replyType {
+            bindings::NV0073_CTRL_DP_AUXCH_REPLYTYPE_ACK => DpAuxReply::Ack,
+            bindings::NV0073_CTRL_DP_AUXCH_REPLYTYPE_NACK => DpAuxReply::Nack,
+            bindings::NV0073_CTRL_DP_AUXCH_REPLYTYPE_DEFER => DpAuxReply::Defer,
+            bindings::NV0073_CTRL_DP_AUXCH_REPLYTYPE_I2CNACK => DpAuxReply::I2cNack,
+            bindings::NV0073_CTRL_DP_AUXCH_REPLYTYPE_I2CDEFER => DpAuxReply::I2cDefer,
+            bindings::NV0073_CTRL_DP_AUXCH_REPLYTYPE_TIMEOUT => DpAuxReply::Timeout,
+            _ => DpAuxReply::Invalid,
+        }
+    }
+
+    /// Returns the bytes transferred, read or written: maybe fewer than requested.
+    pub(crate) fn data(&self) -> &[u8] {
+        let len = num::u32_as_usize(self.0.size).min(DP_AUX_MAX_LEN);
+
+        &self.0.data[..len]
+    }
+
+    /// Returns how long to wait before retrying a transfer that failed, if RM asks for it.
+    pub(crate) fn retry_ms(&self) -> Option<u32> {
+        Some(self.0.retryTimeMs).filter(|&ms| ms != 0)
+    }
+}
+
+// SAFETY: This struct only contains integer types for which all bit patterns are valid.
+unsafe impl FromBytes for DpAuxParams {}
+
+// SAFETY: The padding of this struct is explicit, as fields.
+unsafe impl AsBytes for DpAuxParams {}
+
+/// A training of a DisplayPort link, by RM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DpTraining {
+    /// The configuration to train the link to.
+    pub link: DpLinkConfig,
+    /// What is trained: 0 for the sink, `n` for LTTPR `n`, in non-transparent mode, as numbered
+    /// in the DPCD from 1 for the one closest to the sink (`NV0073_CTRL_DP_DATA_TARGET`). A link
+    /// is trained from the LTTPR closest to the source to the sink.
+    pub target: u32,
+    /// Whether the link uses enhanced framing, which the sink must support.
+    pub enhanced_framing: bool,
+    /// Whether the sink may ask for its drive settings to be adjusted after the training.
+    pub post_lt_adj_req: bool,
+    /// Whether the link has LTTPRs in non-transparent mode, which are trained one by one before
+    /// the sink.
+    pub lttprs: bool,
+}
+
+/// Wrapper for [`bindings::NV0073_CTRL_DP_CTRL_PARAMS`].
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub(crate) struct DpCtrlParams(bindings::NV0073_CTRL_DP_CTRL_PARAMS);
+
+impl DpCtrlParams {
+    /// Creates the parameters to have RM train the link of `display_id` on subdevice 0 as
+    /// `training` says, spreading its spectrum or not as RM's defaults are if `downspread`, or
+    /// without spreading it.
+    pub(crate) fn train(display_id: u32, training: &DpTraining, downspread: bool) -> Self {
+        // Bits of `NV0073_CTRL_DP_CMD`.
+        const SET_LANE_COUNT: u32 = 0;
+        const SET_LINK_BW: u32 = 1;
+        const DISABLE_DOWNSPREAD: u32 = 2;
+        const SET_ENHANCED_FRAMING: u32 = 7;
+        const USE_DOWNSPREAD_SETTING: u32 = 8;
+        const POST_LT_ADJ_REQ_GRANTED: u32 = 10;
+        const TRAIN_PHY_REPEATER: u32 = 13;
+        // Fields of `NV0073_CTRL_DP_DATA`.
+        const DATA_LANE_COUNT_SHIFT: u32 = 0;
+        const DATA_LINK_BW_SHIFT: u32 = 8;
+        const DATA_ENHANCED_FRAMING: u32 = 18;
+        const DATA_TARGET_SHIFT: u32 = 19;
+
+        let flag = |value: bool, bit: u32, set: u32| if value { set << bit } else { 0 };
+
+        let cmd = bindings::NV0073_CTRL_DP_CMD_SET_LANE_COUNT_TRUE << SET_LANE_COUNT
+            | bindings::NV0073_CTRL_DP_CMD_SET_LINK_BW_TRUE << SET_LINK_BW
+            | flag(
+                training.enhanced_framing,
+                SET_ENHANCED_FRAMING,
+                bindings::NV0073_CTRL_DP_CMD_SET_ENHANCED_FRAMING_TRUE,
+            )
+            | flag(
+                training.post_lt_adj_req,
+                POST_LT_ADJ_REQ_GRANTED,
+                bindings::NV0073_CTRL_DP_CMD_POST_LT_ADJ_REQ_GRANTED_YES,
+            )
+            // Each training of a link with non-transparent LTTPRs, the sink's too, says so, like
+            // NVIDIA's driver does.
+            | flag(
+                training.lttprs,
+                TRAIN_PHY_REPEATER,
+                bindings::NV0073_CTRL_DP_CMD_TRAIN_PHY_REPEATER_YES,
+            )
+            // Outputs that can't spread the spectrum are told not to, like NVIDIA's driver does.
+            | flag(
+                !downspread,
+                USE_DOWNSPREAD_SETTING,
+                bindings::NV0073_CTRL_DP_CMD_USE_DOWNSPREAD_SETTING_FORCE,
+            )
+            | flag(
+                !downspread,
+                DISABLE_DOWNSPREAD,
+                bindings::NV0073_CTRL_DP_CMD_DISABLE_DOWNSPREAD_TRUE,
+            );
+        let data = (training.link.lanes & 0x1f) << DATA_LANE_COUNT_SHIFT
+            | (training.link.link_bw & 0xff) << DATA_LINK_BW_SHIFT
+            | flag(
+                training.enhanced_framing,
+                DATA_ENHANCED_FRAMING,
+                bindings::NV0073_CTRL_DP_DATA_SET_ENHANCED_FRAMING_YES,
+            )
+            | (training.target & 0xf) << DATA_TARGET_SHIFT;
+
+        Self(bindings::NV0073_CTRL_DP_CTRL_PARAMS {
+            displayId: display_id,
+            cmd,
+            data,
+            ..Default::default()
+        })
+    }
+
+    /// Returns the errors of the training, `NV0073_CTRL_DP_ERR`: 0 if it succeeded.
+    pub(crate) fn err(&self) -> u32 {
+        self.0.err
+    }
+
+    /// Returns how long to wait before retrying a training that failed, if RM asks for it.
+    pub(crate) fn retry_ms(&self) -> Option<u32> {
+        Some(self.0.retryTimeMs).filter(|&ms| ms != 0)
+    }
+}
+
+// SAFETY: This struct only contains integer types for which all bit patterns are valid.
+unsafe impl FromBytes for DpCtrlParams {}
+
+// SAFETY: This struct contains no padding.
+unsafe impl AsBytes for DpCtrlParams {}
 
 /// Wrapper for [`bindings::NV0073_CTRL_SPECIFIC_GET_EDID_V2_PARAMS`].
 #[repr(transparent)]

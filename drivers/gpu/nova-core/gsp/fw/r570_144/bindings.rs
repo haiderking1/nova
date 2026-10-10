@@ -122,6 +122,7 @@ pub const NVC67D_SET_CONTEXT_DMA_NOTIFIER: u32 = 520;
 pub const NVC67D_SET_NOTIFIER_CONTROL: u32 = 524;
 pub const NVC67D_SET_NOTIFIER_CONTROL_MODE_WRITE: u32 = 0;
 pub const NVC67D_SET_NOTIFIER_CONTROL_NOTIFY_ENABLE: u32 = 1;
+pub const NVC67D_SOR_SET_CONTROL_OWNER_MASK_NONE: u32 = 0;
 pub const NVC67D_SET_INTERLOCK_FLAGS: u32 = 536;
 pub const NVC67D_SET_WINDOW_INTERLOCK_FLAGS: u32 = 540;
 pub const NVC67E_WINDOW_CHANNEL_DMA: u32 = 50814;
@@ -251,6 +252,34 @@ pub const MC_ENGINE_IDX_CE0: u32 = 15;
 pub const MC_ENGINE_IDX_CE16: u32 = 31;
 pub const MC_ENGINE_IDX_GR0: u32 = 84;
 pub const MC_ENGINE_IDX_GR7: u32 = 91;
+pub const NV0073_CTRL_CMD_DFP_GET_INFO: u32 = 7541056;
+pub const NV0073_CTRL_DFP_FLAGS_DP_LINK_BW_1_62GBPS: u32 = 1;
+pub const NV0073_CTRL_DFP_FLAGS_DP_LINK_BW_2_70GBPS: u32 = 2;
+pub const NV0073_CTRL_DFP_FLAGS_DP_LINK_BW_5_40GBPS: u32 = 3;
+pub const NV0073_CTRL_DFP_FLAGS_DP_LINK_BW_8_10GBPS: u32 = 4;
+pub const NV0073_CTRL_CMD_DP_AUXCH_CTRL: u32 = 7541569;
+pub const NV0073_CTRL_DP_AUXCH_MAX_DATA_SIZE: u32 = 16;
+pub const NV0073_CTRL_DP_AUXCH_REPLYTYPE_ACK: u32 = 0;
+pub const NV0073_CTRL_DP_AUXCH_REPLYTYPE_NACK: u32 = 1;
+pub const NV0073_CTRL_DP_AUXCH_REPLYTYPE_DEFER: u32 = 2;
+pub const NV0073_CTRL_DP_AUXCH_REPLYTYPE_TIMEOUT: u32 = 3;
+pub const NV0073_CTRL_DP_AUXCH_REPLYTYPE_I2CNACK: u32 = 4;
+pub const NV0073_CTRL_DP_AUXCH_REPLYTYPE_I2CDEFER: u32 = 8;
+pub const NV0073_CTRL_DP_AUXCH_REPLYTYPE_INVALID_ARGUMENT: u32 = 4294967295;
+pub const NV0073_CTRL_CMD_DP_CTRL: u32 = 7541571;
+pub const NV0073_CTRL_DP_CMD_SET_LANE_COUNT_TRUE: u32 = 1;
+pub const NV0073_CTRL_DP_CMD_SET_LINK_BW_TRUE: u32 = 1;
+pub const NV0073_CTRL_DP_CMD_DISABLE_DOWNSPREAD_TRUE: u32 = 1;
+pub const NV0073_CTRL_DP_CMD_SET_ENHANCED_FRAMING_TRUE: u32 = 1;
+pub const NV0073_CTRL_DP_CMD_USE_DOWNSPREAD_SETTING_FORCE: u32 = 1;
+pub const NV0073_CTRL_DP_CMD_POST_LT_ADJ_REQ_GRANTED_YES: u32 = 1;
+pub const NV0073_CTRL_DP_CMD_TRAIN_PHY_REPEATER_YES: u32 = 1;
+pub const NV0073_CTRL_DP_DATA_SET_ENHANCED_FRAMING_YES: u32 = 1;
+pub const NV0073_CTRL_CMD_DP_GET_CAPS: u32 = 7541609;
+pub const NV0073_CTRL_CMD_DP_GET_CAPS_MAX_LINK_RATE_1_62: u32 = 1;
+pub const NV0073_CTRL_CMD_DP_GET_CAPS_MAX_LINK_RATE_2_70: u32 = 2;
+pub const NV0073_CTRL_CMD_DP_GET_CAPS_MAX_LINK_RATE_5_40: u32 = 3;
+pub const NV0073_CTRL_CMD_DP_GET_CAPS_MAX_LINK_RATE_8_10: u32 = 4;
 pub const NV0073_CTRL_CMD_DP_GET_LINK_CONFIG: u32 = 7541600;
 pub const NV0073_CTRL_CMD_DP_CONFIG_STREAM: u32 = 7541602;
 pub const NV0073_CTRL_CMD_DP_SET_MANUAL_DISPLAYPORT: u32 = 7541605;
@@ -2015,6 +2044,73 @@ pub struct NV0073_CTRL_DP_GET_LINK_CONFIG_PARAMS {
     pub laneCount: u32_,
     pub linkBW: u32_,
     pub dp2LinkBW: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV0073_CTRL_DFP_GET_INFO_PARAMS {
+    pub subDeviceInstance: u32_,
+    pub displayId: u32_,
+    pub flags: u32_,
+    pub UHBRSupportedByDfp: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV0073_CTRL_DP_AUXCH_CTRL_PARAMS {
+    pub subDeviceInstance: u32_,
+    pub displayId: u32_,
+    pub bAddrOnly: u8_,
+    pub __bindgen_padding_0: [u8; 3usize],
+    pub cmd: u32_,
+    pub addr: u32_,
+    pub data: [u8_; 16usize],
+    pub size: u32_,
+    pub replyType: u32_,
+    pub retryTimeMs: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV0073_CTRL_DP_CTRL_PARAMS {
+    pub subDeviceInstance: u32_,
+    pub displayId: u32_,
+    pub cmd: u32_,
+    pub data: u32_,
+    pub err: u32_,
+    pub retryTimeMs: u32_,
+    pub eightLaneDpcdBaseAddr: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV0073_CTRL_CMD_DSC_CAP_PARAMS {
+    pub bDscSupported: u8_,
+    pub __bindgen_padding_0: [u8; 3usize],
+    pub encoderColorFormatMask: u32_,
+    pub lineBufferSizeKB: u32_,
+    pub rateBufferSizeKB: u32_,
+    pub bitsPerPixelPrecision: u32_,
+    pub maxNumHztSlices: u32_,
+    pub lineBufferBitDepth: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV0073_CTRL_CMD_DP_GET_CAPS_PARAMS {
+    pub subDeviceInstance: u32_,
+    pub sorIndex: u32_,
+    pub maxLinkRate: u32_,
+    pub dpVersionsSupported: u32_,
+    pub UHBRSupportedByGpu: u32_,
+    pub minPClkForCompressed: u32_,
+    pub bIsMultistreamSupported: u8_,
+    pub bIsSCEnabled: u8_,
+    pub bHasIncreasedWatermarkLimits: u8_,
+    pub bIsPC2Disabled: u8_,
+    pub isSingleHeadMSTSupported: u8_,
+    pub bFECSupported: u8_,
+    pub bIsTrainPhyRepeater: u8_,
+    pub bOverrideLinkBw: u8_,
+    pub bUseRgFlushSequence: u8_,
+    pub bSupportDPDownSpread: u8_,
+    pub __bindgen_padding_0: [u8; 2usize],
+    pub DSC: NV0073_CTRL_CMD_DSC_CAP_PARAMS,
 }
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone, MaybeZeroable)]

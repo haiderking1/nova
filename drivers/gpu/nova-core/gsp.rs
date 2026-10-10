@@ -28,13 +28,20 @@ mod regs;
 pub(crate) mod rm;
 mod sequencer;
 
-pub use fw::rm::ConnectorType;
+pub use fw::rm::{
+    ConnectorType,
+    DpLinkConfig,
+    DpTraining, //
+};
 pub(crate) use fw::{
     disp, fifo,
     rm::{
         ChannelMemory,
         ContextBufferInfo,
-        DpLinkConfig,
+        DpAuxParams,
+        DpAuxReply,
+        DpCtrlParams,
+        DpGpuCaps,
         EngineInfo,
         GrContextBuffer,
         PromoteEntry,
@@ -43,6 +50,7 @@ pub(crate) use fw::{
         ServerReservedLevel,
         CHANNEL_IDS,
         DISP_PUSHBUFFER_SIZE,
+        DP_AUX_MAX_LEN,
         GR_CONTEXT_BUFFERS,
         GR_UNRESTRICTED_PRIV_ACCESS_MAP, //
         RM_SERVER_VA,

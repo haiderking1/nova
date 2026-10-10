@@ -51,7 +51,9 @@ use super::{
         mode::HeadRaster,
         regs,
     },
+    CoreNotifier,
     DisplayHal,
+    HeadOutput,
     WindowImage, //
 };
 
@@ -245,22 +247,15 @@ impl DisplayHal for Ga102 {
         push: &mut PushBuffer<'_>,
         head: u32,
         display_id: u32,
+        output: &HeadOutput,
         raster: &HeadRaster,
     ) -> Result {
         use core_c67d::*;
 
-        // Like NVIDIA's driver on each head enable (`nvkms-evo.c`): the SORs the head drives keep
-        // their control, sent again, and GSP-RM is told the display the head drives, which it
+        // Like NVIDIA's driver on each head enable (`nvkms-evo.c`): the SOR the head drives gets
+        // its control, sent again, and GSP-RM is told the display the head drives, which it
         // programs the output for in the modeset's supervisor steps.
-        let head_bit = 1u32.checked_shl(head).ok_or(EINVAL)?;
-        for sor in 0..SORS {
-            let method = sor_set_control(sor);
-            if let Some(control) = armed(bar, usize::try_from(method)?) {
-                if control & 0xff & head_bit != 0 {
-                    push.push(bar, method, &[control])?;
-                }
-            }
-        }
+        push.push(bar, sor_set_control(output.sor), &[output.control])?;
         push.push(bar, head_set_display_id(head), &[display_id])?;
 
         let position = |(x, y): (u16, u16)| u32::from(x) | u32::from(y) << 16;
@@ -319,13 +314,78 @@ impl DisplayHal for Ga102 {
         push.push(bar, method, &[bounds | 0x7fff])
     }
 
-    fn push_core_update(&self, bar: Bar0<'_>, push: &mut PushBuffer<'_>, windows: u32) -> Result {
+    fn armed_output(&self, bar: Bar0<'_>, head: u32) -> Option<HeadOutput> {
         use core_c67d::*;
 
-        push.push(bar, SET_CONTEXT_DMA_NOTIFIER, &[0])?;
+        let head_bit = 1u32.checked_shl(head)?;
+        (0..SORS).find_map(|sor| {
+            let control = armed(bar, usize::try_from(sor_set_control(sor)).ok()?)?;
+            // The heads driving the SOR are in bits 7:0.
+            (control & 0xff & head_bit != 0).then_some(HeadOutput { sor, control })
+        })
+    }
+
+    fn armed_output_bpp(&self, bar: Bar0<'_>, head: u32) -> Option<u32> {
+        use core_c67d::*;
+
+        let output = armed(
+            bar,
+            usize::try_from(head_set_control_output_resource(head)).ok()?,
+        )?;
+        output_resource_bpp(output)
+    }
+
+    fn push_detach(
+        &self,
+        bar: Bar0<'_>,
+        push: &mut PushBuffer<'_>,
+        head: u32,
+        output: &HeadOutput,
+    ) -> Result {
+        use core_c67d::*;
+
+        // Like nouveau: the head stops driving the SOR, which is all off if no other head drives
+        // it, and drives no display.
+        let control = output.control & !1u32.checked_shl(head).ok_or(EINVAL)?;
+        let control = if control & 0xff == 0 {
+            SOR_CONTROL_NONE
+        } else {
+            control
+        };
+        push.push(bar, sor_set_control(output.sor), &[control])?;
+        push.push(bar, head_set_display_id(head), &[0])
+    }
+
+    fn push_core_update(
+        &self,
+        bar: Bar0<'_>,
+        push: &mut PushBuffer<'_>,
+        windows: u32,
+        notifier: Option<CoreNotifier>,
+    ) -> Result {
+        use core_c67d::*;
+
+        match notifier {
+            Some(notifier) => {
+                // The offset is in units of 16 bytes, in bits 11:4.
+                push.push(bar, SET_CONTEXT_DMA_NOTIFIER, &[notifier.ctxdma])?;
+                push.push(
+                    bar,
+                    SET_NOTIFIER_CONTROL,
+                    &[NOTIFIER_MODE_WRITE | notifier.offset & 0xff0 | NOTIFIER_NOTIFY],
+                )?;
+            }
+            None => push.push(bar, SET_CONTEXT_DMA_NOTIFIER, &[0])?,
+        }
         push.push(bar, SET_INTERLOCK_FLAGS, &[0])?;
         push.push(bar, SET_WINDOW_INTERLOCK_FLAGS, &[windows])?;
-        push.push(bar, UPDATE, &[UPDATE_RELEASE])
+        push.push(bar, UPDATE, &[UPDATE_RELEASE])?;
+        if notifier.is_some() {
+            // Like nouveau: the following updates don't write the notifier.
+            push.push(bar, SET_NOTIFIER_CONTROL, &[0])?;
+        }
+
+        Ok(())
     }
 
     fn armed_raster(&self, bar: Bar0<'_>, head: u32) -> Option<HeadRaster> {

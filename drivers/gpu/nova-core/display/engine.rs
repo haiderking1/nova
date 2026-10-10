@@ -57,7 +57,9 @@ use super::{
     },
     hal::{
         self,
+        CoreNotifier,
         DisplayHal,
+        HeadOutput,
         WindowImage, //
     },
     instmem::InstMem,
@@ -91,7 +93,9 @@ const NOTIFIER_WORDS: usize = 256 / size_of::<u32>();
 const NOTIFIER_SLOTS: usize = 2;
 /// Number of 32-bit words of a notifier.
 const NOTIFIER_SLOT_WORDS: usize = num::u32_as_usize(notifier::SIZE) / size_of::<u32>();
-static_assert!(NOTIFIER_SLOTS * NOTIFIER_SLOT_WORDS <= NOTIFIER_WORDS);
+/// Notifier slot of the core updates waited for, after those of the window.
+const CORE_NOTIFIER_SLOT: usize = NOTIFIER_SLOTS;
+static_assert!((CORE_NOTIFIER_SLOT + 1) * NOTIFIER_SLOT_WORDS <= NOTIFIER_WORDS);
 /// How long a core update may take to finish: a modeset, which takes a few frames.
 const MODESET_TIMEOUT: Delta = Delta::from_secs(2);
 
@@ -172,6 +176,10 @@ struct Channels<'a> {
     notifier: Coherent<'a, [u32; NOTIFIER_WORDS]>,
     /// Notifier slot of the next update.
     notifier_slot: usize,
+    /// The output head [`HEAD`] drives, as the firmware set it up.
+    output: Option<HeadOutput>,
+    /// Whether head [`HEAD`] was detached from its output, for the next modeset to attach it again.
+    detached: bool,
 }
 
 impl<'a> DisplayEngine<'a> {
@@ -284,7 +292,8 @@ impl<'a> DisplayEngine<'a> {
         let channels = self.channels.as_mut().ok_or(ENODEV)?;
         let raster = HeadRaster::new(mode)?;
         let armed = channels.hal.armed_raster(bar, head).ok_or(EINVAL)?;
-        if armed == raster {
+        // A detached head is attached again even if its raster stays.
+        if armed == raster && !channels.detached {
             return Ok(false);
         }
 
@@ -305,9 +314,84 @@ impl<'a> DisplayEngine<'a> {
         channels.set_mode(bar, head, display_id, &raster, surface)?;
         Ok(true)
     }
+
+    /// Detaches head `head` from the output it drives, and returns once the display engine did,
+    /// GSP-RM's supervisor steps included: the head then drives no display, and the link of the
+    /// output may be trained. The next [`Self::set_mode`] attaches the head again.
+    ///
+    /// Fails with `ENODEV` if the channels couldn't be set up or the head drives no output.
+    pub(crate) fn detach(&mut self, bar: Bar0<'_>, head: u32) -> Result {
+        self.channels.as_mut().ok_or(ENODEV)?.detach(bar, head)
+    }
+
+    /// Returns the bits per pixel head `head` sends its output, as the core channel has it armed.
+    pub(crate) fn output_bpp(&self, bar: Bar0<'_>, head: u32) -> Option<u32> {
+        self.channels.as_ref()?.hal.armed_output_bpp(bar, head)
+    }
 }
 
 impl<'a> Channels<'a> {
+    /// Returns the output head `head` drives, as the firmware set it up.
+    ///
+    /// Fails with `ENODEV` if the head isn't the one Nova drives, or drives no output.
+    fn output_of(&self, head: u32) -> Result<HeadOutput> {
+        if head != HEAD {
+            return Err(ENODEV);
+        }
+        self.output.ok_or(ENODEV)
+    }
+
+    /// Detaches head `head` from its output with a core update, and returns once the update
+    /// finished.
+    fn detach(&mut self, bar: Bar0<'_>, head: u32) -> Result {
+        if self.detached {
+            return Ok(());
+        }
+        let output = self.output_of(head)?;
+        let hal = self.hal;
+        let status_word = CORE_NOTIFIER_SLOT * NOTIFIER_SLOT_WORDS;
+        // CAST: the slots are within the first 256 bytes of the buffer.
+        let offset = (status_word * size_of::<u32>()) as u32;
+
+        let push = &mut self.core_push;
+        hal.push_detach(bar, push, head, &output)?;
+        hal.push_core_update(
+            bar,
+            push,
+            0,
+            Some(CoreNotifier {
+                ctxdma: NOTIFIER_CTXDMA,
+                offset,
+            }),
+        )?;
+        // The status is in bits 31:30 of the notifier's first word, the rest of which the update
+        // writes.
+        io_write!(self.notifier, [try: status_word], notifier::STATUS_NOT_BEGUN << 30);
+        push.kick(bar)?;
+        // From here on the head may be detached, even if the update doesn't finish in time.
+        self.detached = true;
+
+        let notifier = &self.notifier;
+        let read_status = || -> Result<u32> { Ok(io_read!(notifier, [try: status_word])) };
+        read_poll_timeout(
+            || Ok(read_status()? >> 30),
+            |&status| status == notifier::STATUS_FINISHED,
+            Delta::from_micros(100),
+            MODESET_TIMEOUT,
+        )
+        .map(|_| ())
+        .inspect_err(|_| {
+            dev_err!(
+                self.dev,
+                "display: detaching head {} didn't finish, notifier {:x?}, core channel GET {:#x}\n",
+                head,
+                read_status().ok(),
+                self.core_push.get(bar)
+            );
+            log_exception(self.dev, bar, 0);
+        })
+    }
+
     /// Gives head `head`, driving the display `display_id`, the raster `raster` with a core
     /// update, and returns once the display engine uses it: once the core channel has it armed.
     /// With a `surface`, the window shows it from the same frame on, which a change of resolution
@@ -324,6 +408,7 @@ impl<'a> Channels<'a> {
         surface: Option<&Surface>,
     ) -> Result {
         let hal = self.hal;
+        let output = self.output_of(head)?;
 
         // The window update waits for the core update, which waits for it in turn.
         let window = surface
@@ -336,13 +421,15 @@ impl<'a> Channels<'a> {
             // CAST: `WINDOW` is a window index, below 32.
             hal.push_window_bounds(bar, push, WINDOW as u32)?;
         }
-        hal.push_head_mode(bar, push, head, display_id, raster)?;
-        hal.push_core_update(bar, push, windows)?;
+        hal.push_head_mode(bar, push, head, display_id, &output, raster)?;
+        hal.push_core_update(bar, push, windows, None)?;
         push.kick(bar)?;
 
+        // The update is armed once both the raster and the output, attached again after
+        // [`Self::detach`], are.
         read_poll_timeout(
-            || Ok(hal.armed_raster(bar, head)),
-            |armed| armed.as_ref() == Some(raster),
+            || Ok((hal.armed_raster(bar, head), hal.armed_output(bar, head))),
+            |(armed, attached)| armed.as_ref() == Some(raster) && *attached == Some(output),
             Delta::from_micros(100),
             MODESET_TIMEOUT,
         )
@@ -356,6 +443,7 @@ impl<'a> Channels<'a> {
             log_exception(self.dev, bar, 0);
             log_exception(self.dev, bar, WINDOW + 1);
         })?;
+        self.detached = false;
 
         match window {
             Some(status_word) => self.wait_window_update(status_word),
@@ -417,6 +505,8 @@ impl<'a> Channels<'a> {
                 NOTIFIER_CTXDMA,
                 start..end,
             )?;
+            // The core channel's updates use the same buffer, from their own slot.
+            instmem.bind_coherent(mm, client, DmaChannel::Core, NOTIFIER_CTXDMA, start..end)?;
 
             let mut channels = Self {
                 dev,
@@ -428,6 +518,8 @@ impl<'a> Channels<'a> {
                 window_push,
                 notifier,
                 notifier_slot: 0,
+                output: hal.armed_output(bar, HEAD),
+                detached: false,
             };
             channels.check_core(dev, bar)?;
             Ok(channels)

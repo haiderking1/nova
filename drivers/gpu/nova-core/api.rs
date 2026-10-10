@@ -47,7 +47,11 @@ pub use crate::{
         VblankHandler, //
     },
     gpu::Spec,
-    gsp::ConnectorType, //
+    gsp::{
+        ConnectorType,
+        DpLinkConfig,
+        DpTraining, //
+    },
     vm::{
         BufferRef,
         ClientVm,
@@ -185,9 +189,70 @@ impl NovaCoreApi<'_> {
     }
 
     /// Checks that nova-core can show `mode` on the boot display, through its scanout: fails with
-    /// `ERANGE` if the display's link can't carry it, `EINVAL` if its timings are invalid.
+    /// `ERANGE` if the display's link, as trained, can't carry it, `EINVAL` if its timings are
+    /// invalid.
     pub fn check_mode(&self, mode: &ModeTimings) -> Result {
         self.gpu.check_mode(mode)
+    }
+
+    /// Returns the configuration of the boot display's DisplayPort link, as trained.
+    ///
+    /// Fails if the boot display isn't shown through a DisplayPort link.
+    pub fn boot_display_dp_link(&self) -> Result<DpLinkConfig> {
+        self.gpu.boot_display_dp_link()
+    }
+
+    /// Returns the fastest configuration the GPU and the board allow the boot display's
+    /// DisplayPort link; the sink and the LTTPRs on the way may allow less.
+    ///
+    /// Fails with `ENODEV` if the boot display isn't shown through a DisplayPort link nova-core
+    /// can train.
+    pub fn boot_display_dp_max_link(&self) -> Result<DpLinkConfig> {
+        self.gpu.boot_display_dp_max_link()
+    }
+
+    /// Returns whether the DisplayPort link `link` carries `mode` from head `head`, with enhanced
+    /// framing if `enhanced_framing`: whether the link is fast enough, and the head's output and
+    /// the mode's horizontal blanking fit the link's framing.
+    pub fn dp_mode_fits(
+        &self,
+        head: u32,
+        link: &DpLinkConfig,
+        enhanced_framing: bool,
+        mode: &ModeTimings,
+    ) -> bool {
+        self.gpu.dp_mode_fits(head, link, enhanced_framing, mode)
+    }
+
+    /// Carries out an AUX transfer on the boot display's DisplayPort link: the request `request`
+    /// at `addr`, writing `buf` for write requests or reading into it for read requests, at most
+    /// 16 bytes. Returns the reply and the number of bytes transferred, which may be fewer.
+    ///
+    /// The request and the reply are coded as the DisplayPort specification, and DRM's
+    /// `DP_AUX_*` values, do. Fails with `ETIMEDOUT` if the sink doesn't reply.
+    pub fn boot_display_dp_aux(
+        &self,
+        request: u8,
+        addr: u32,
+        buf: &mut [u8],
+    ) -> Result<(u8, usize)> {
+        self.gpu.boot_display_dp_aux(request, addr, buf)
+    }
+
+    /// Detaches head `head` from its output, and returns once the display engine did: the head
+    /// then drives no display, and the output's link may be trained. The next
+    /// [`NovaCoreApi::set_mode()`] attaches the head again.
+    pub fn detach_head(&self, head: u32) -> Result {
+        self.gpu.detach_head(head)
+    }
+
+    /// Trains the boot display's DisplayPort link as `training` says, which the link's sink and
+    /// LTTPRs must support. The head of the display must be detached, see
+    /// [`NovaCoreApi::detach_head()`].
+    ///
+    /// Fails with `EIO` if the training fails.
+    pub fn train_boot_display_dp_link(&self, training: &DpTraining) -> Result {
+        self.gpu.train_boot_display_dp_link(training)
     }
 
     /// Has head `head` scan out `mode`, and returns once it does: whether the head had another

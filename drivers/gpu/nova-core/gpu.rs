@@ -103,11 +103,15 @@ use crate::{
             },
         },
         ConnectorType,
+        DpAuxReply,
+        DpGpuCaps,
         DpLinkConfig,
+        DpTraining,
         EngineInfo,
         Gsp,
         GspBootContext,
-        CHANNEL_IDS, //
+        CHANNEL_IDS,
+        DP_AUX_MAX_LEN, //
     },
     irq::{
         self,
@@ -1088,13 +1092,32 @@ impl<'gpu> Gpu<'gpu> {
             engine.windows()
         );
 
-        // Modes are checked against the link the firmware trained, which Nova keeps.
-        let link = this.boot_output.and_then(|output| {
-            display
-                .dp_link_config(pdev.as_ref(), &gsp_resources.gsp.cmdq, output)
+        // What the GPU and the board allow the DisplayPort link of the boot display, if it's
+        // shown through one: the link is trained again for modes the firmware's doesn't carry.
+        let dp = this.boot_output.and_then(|output| {
+            let cmdq = &gsp_resources.gsp.cmdq;
+            let link = display
+                .dp_link_config(pdev.as_ref(), cmdq, output)
                 .inspect(|link| dev_info!(pdev, "display: boot display DP link: {:?}\n", link))
                 .inspect_err(|e| {
                     dev_dbg!(pdev, "display: no DP link for the boot display: {:?}\n", e)
+                })
+                .ok()?;
+            let caps = display.dp_gpu_caps(pdev.as_ref(), cmdq).and_then(|caps| {
+                let board = display.dp_board_max_link_bw(pdev.as_ref(), cmdq, output)?;
+                Ok(DpGpuCaps {
+                    max_link_bw: board.map_or(caps.max_link_bw, |bw| bw.min(caps.max_link_bw)),
+                    ..caps
+                })
+            });
+            caps.inspect(|caps| dev_info!(pdev, "display: DP output caps: {:?}\n", caps))
+                .inspect_err(|e| {
+                    dev_err!(
+                        pdev,
+                        "display: can't query the DP output, keeping link {:?}: {:?}\n",
+                        link,
+                        e
+                    )
                 })
                 .ok()
         });
@@ -1164,7 +1187,7 @@ impl<'gpu> Gpu<'gpu> {
         *this.display_engine.lock() = Some(DisplayOutput {
             engine,
             scanout,
-            link,
+            dp,
         });
 
         Ok(())
@@ -1354,24 +1377,166 @@ impl<'gpu> Gpu<'gpu> {
     }
 
     /// Checks that the boot display's head can scan out `mode`: that its raster is valid, and
-    /// that the boot display's DisplayPort link, as trained, carries its pixels.
+    /// that the boot display's DisplayPort link, as trained, carries it.
     pub(crate) fn check_mode(&self, mode: &ModeTimings) -> Result {
         HeadRaster::new(mode)?;
 
-        let output = self.display_engine.lock();
-        let output = output.as_ref().ok_or(ENODEV)?;
-        if output.scanout.is_none() {
-            return Err(ENODEV);
-        }
-        if let Some(link) = output.link {
-            // Each lane carries `link_bw` * 270 Mb/s, 8 data bits for every 10 sent: 216 kb/s
-            // of 24-bit pixels per unit of `link_bw` and kHz of pixel clock.
-            let capacity = u64::from(link.lanes) * u64::from(link.link_bw) * 216_000;
-            if u64::from(mode.clock_khz) * 24 > capacity {
+        let head = {
+            let output = self.display_engine.lock();
+            let output = output.as_ref().ok_or(ENODEV)?;
+            output.scanout.as_ref().ok_or(ENODEV)?.mode().head
+        };
+        if let Ok(link) = self.boot_display_dp_link() {
+            // Enhanced framing, if the link has it, needs more of the blanking.
+            if !self.dp_mode_fits(head, &link, true, mode) {
                 return Err(ERANGE);
             }
         }
 
+        Ok(())
+    }
+
+    /// Returns the configuration of the boot display's DisplayPort link, as trained.
+    pub(crate) fn boot_display_dp_link(&self) -> Result<DpLinkConfig> {
+        let (display, output) = self.boot_output()?;
+        let dev = self.gsp_resources.device.as_ref();
+
+        display.dp_link_config(dev, &self.gsp_resources.gsp.cmdq, output)
+    }
+
+    /// Returns the fastest configuration the GPU and the board allow the boot display's
+    /// DisplayPort link.
+    ///
+    /// Fails with `ENODEV` if the boot display isn't shown through a DisplayPort link Nova can
+    /// train.
+    pub(crate) fn boot_display_dp_max_link(&self) -> Result<DpLinkConfig> {
+        let caps = self.dp_caps()?;
+
+        Ok(DpLinkConfig {
+            // NVIDIA's driver doesn't limit the lanes on the GPU's side but to the 4 of
+            // DisplayPort 1.4 (`ConnectorImpl::getMaxLinkConfig()`): the sink's DPCD does.
+            lanes: 4,
+            link_bw: caps.max_link_bw,
+        })
+    }
+
+    /// Returns whether `link` carries `mode` from head `head`, enhanced framing on the link if
+    /// `enhanced_framing`.
+    pub(crate) fn dp_mode_fits(
+        &self,
+        head: u32,
+        link: &DpLinkConfig,
+        enhanced_framing: bool,
+        mode: &ModeTimings,
+    ) -> bool {
+        // Without what the outputs can do, the watermark limits are NVIDIA's defaults.
+        let increased_watermark_limits = self
+            .dp_caps()
+            .is_ok_and(|caps| caps.increased_watermark_limits);
+        let output = self.display_engine.lock();
+        let Some(bpp) = Option::as_ref(&output)
+            .and_then(|output| output.engine.output_bpp(self.gsp_resources.bar, head))
+        else {
+            return false;
+        };
+
+        display::dp::sst_mode_fits(
+            link,
+            &display::dp::SstOutput {
+                bpp,
+                enhanced_framing,
+                increased_watermark_limits,
+            },
+            mode,
+        )
+    }
+
+    /// Returns what the GPU and the board allow the boot display's DisplayPort link.
+    fn dp_caps(&self) -> Result<DpGpuCaps> {
+        self.display_engine
+            .lock()
+            .as_ref()
+            .and_then(|output| output.dp)
+            .ok_or(ENODEV)
+    }
+
+    /// Carries out the AUX transfer `request` at `addr` on the boot display's DisplayPort link,
+    /// writing `buf` for write requests or reading into it for read requests, and returns the
+    /// reply and the number of bytes transferred.
+    ///
+    /// `request` and the reply are coded as the DisplayPort specification does: the request as
+    /// `DP_AUX_*` and the reply as `DP_AUX_NATIVE_REPLY_*` | `DP_AUX_I2C_REPLY_*`. Fails with
+    /// `ETIMEDOUT` if the sink doesn't reply.
+    pub(crate) fn boot_display_dp_aux(
+        &self,
+        request: u8,
+        addr: u32,
+        buf: &mut [u8],
+    ) -> Result<(u8, usize)> {
+        // The request type is in bits 1:0, 1 for reads.
+        const REQUEST_TYPE_READ: u8 = 1;
+
+        let (display, output) = self.boot_output()?;
+        let dev = self.gsp_resources.device.as_ref();
+        let len = buf.len().min(DP_AUX_MAX_LEN);
+        let read = request & 0b11 == REQUEST_TYPE_READ;
+        let data = if read { &[][..] } else { &buf[..len] };
+
+        let reply = display.dp_aux(
+            dev,
+            &self.gsp_resources.gsp.cmdq,
+            output,
+            request,
+            addr,
+            data,
+            len,
+        )?;
+        // RM reports no more than it was asked for, but a reply isn't trusted to.
+        let transferred = &reply.data()[..reply.data().len().min(len)];
+        if read {
+            buf[..transferred.len()].copy_from_slice(transferred);
+        }
+        let code = match reply.reply() {
+            DpAuxReply::Ack => 0x0,
+            DpAuxReply::Nack => 0x1,
+            DpAuxReply::Defer => 0x2,
+            DpAuxReply::I2cNack => 0x1 << 2,
+            DpAuxReply::I2cDefer => 0x2 << 2,
+            DpAuxReply::Timeout => return Err(ETIMEDOUT),
+            DpAuxReply::Invalid => return Err(EIO),
+        };
+
+        Ok((code, transferred.len()))
+    }
+
+    /// Detaches head `head` from its output, and returns once the display engine did: the head
+    /// then drives no display, for the output's link to be trained. The next [`Self::set_mode`]
+    /// attaches it again.
+    pub(crate) fn detach_head(&self, head: u32) -> Result {
+        let mut output = self.display_engine.lock();
+        let output = Option::as_mut(&mut output).ok_or(ENODEV)?;
+
+        output.engine.detach(self.gsp_resources.bar, head)
+    }
+
+    /// Has GSP-RM train the boot display's DisplayPort link as `training` says.
+    ///
+    /// The link must not carry a stream: its head must be detached with [`Self::detach_head`],
+    /// as NVIDIA's driver does, or the output's FIFO would overflow or underflow. Fails with `EIO`
+    /// if the training fails.
+    pub(crate) fn train_boot_display_dp_link(&self, training: &DpTraining) -> Result {
+        let caps = self.dp_caps()?;
+        let (display, output) = self.boot_output()?;
+        let dev = self.gsp_resources.device.as_ref();
+
+        display.dp_train(
+            dev,
+            &self.gsp_resources.gsp.cmdq,
+            output,
+            training,
+            caps.downspread,
+        )?;
+        dev_info!(dev, "display: DP link trained: {:?}\n", training);
         Ok(())
     }
 
@@ -1892,8 +2057,9 @@ struct DisplayOutput<'gpu> {
     engine: DisplayEngine<'gpu>,
     /// Nova's own scanout, if it could be set up.
     scanout: Option<Scanout>,
-    /// The DisplayPort link of the boot display, if it is shown through one.
-    link: Option<DpLinkConfig>,
+    /// What the GPU and the board allow the DisplayPort link of the boot display, if it is shown
+    /// through one.
+    dp: Option<DpGpuCaps>,
 }
 
 #[pinned_drop]
