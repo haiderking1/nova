@@ -44,6 +44,11 @@ use crate::{
 #[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
 use kernel::device;
 
+/// Where a walk of the page tables of BAR1 got: the address of the PTE of a page, and the PFN it
+/// maps, if the PTE maps one.
+#[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
+type PteWalk = (VramAddress, Option<Pfn>);
+
 /// BAR1 user interface for virtual memory mappings.
 ///
 /// Owns the [`Vmm`] for the BAR1 address space.
@@ -152,7 +157,7 @@ impl<'a> BarUser<'a> {
         mm: &mut GpuMm<'_>,
         mapped: &MappedRange,
         page: usize,
-    ) -> Result<(Vfn, Option<(VramAddress, Option<Pfn>)>)> {
+    ) -> Result<(Vfn, Option<PteWalk>)> {
         use crate::mm::pagetable::walk::WalkResult;
 
         let vfn = Vfn::new(mapped.vfn_start.raw() + u64::try_from(page)?);

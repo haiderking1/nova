@@ -172,7 +172,9 @@ impl KmsDriver for NovaDriver {
         // Frames are copied as they are: without nova-core's scanout, into the framebuffer of the
         // boot display, whose pixels must then be XRGB8888 too.
         if display.scanout.is_none() && display.format != XRGB8888_LAYOUT {
-            pr_warn!("nova-drm: boot display's pixels aren't XRGB8888, the only supported format\n");
+            pr_warn!(
+                "nova-drm: boot display's pixels aren't XRGB8888, the only supported format\n"
+            );
             return Ok(());
         }
 
@@ -368,7 +370,10 @@ fn copy_framebuffer(
 
     let whole;
     let rects = if rects.len() > MAX_COPIES {
-        whole = rects.iter().skip(1).fold(rects[0], |all, rect| union(&all, rect));
+        whole = rects
+            .iter()
+            .skip(1)
+            .fold(rects[0], |all, rect| union(&all, rect));
         core::slice::from_ref(&whole)
     } else {
         rects
@@ -392,7 +397,9 @@ fn copy_framebuffer(
         return Ok(());
     }
 
-    object.with_display_source(api, |source| copy(source, u64::from(offset), pitch, &copies))
+    object.with_display_source(api, |source| {
+        copy(source, u64::from(offset), pitch, &copies)
+    })
 }
 
 /// Shows the frame of `new_state` as `present` says: straight from its framebuffer if the display

@@ -194,6 +194,7 @@ impl<M: MmuConfig> PtMapInner<M> {
     /// Install prepared PDEs and write PTEs, then flush TLB.
     ///
     /// Drains `pt_pages` and moves allocations into `page_table_allocs`.
+    #[expect(clippy::too_many_arguments)]
     pub(super) fn install_mappings(
         &self,
         mm: &mut GpuMm<'_>,
@@ -362,6 +363,7 @@ impl PtMap {
     }
 
     /// Install prepared PDEs and write PTEs, then flush TLB.
+    #[expect(clippy::too_many_arguments)]
     pub(in crate::mm) fn install_mappings(
         &self,
         mm: &mut GpuMm<'_>,

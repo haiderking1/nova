@@ -581,7 +581,7 @@ impl<'a> Channel<'a> {
     ) -> Result {
         let control_va = self.control_va()?;
         let count = entries.len() + usize::from(!tail.is_empty());
-        if count >= num::u32_as_usize(GPFIFO_ENTRIES) || tail.len() * size_of::<u32>() > tail_room {
+        if count >= num::u32_as_usize(GPFIFO_ENTRIES) || size_of_val(tail) > tail_room {
             return Err(EINVAL);
         }
         let mut ring = KVec::with_capacity(count, GFP_KERNEL)?;

@@ -271,7 +271,7 @@ impl<'a> ClientChannel<'a> {
     /// Returns the number of entries of the GPFIFO ring that submitting `pushes` push buffers
     /// takes: theirs and the kernel's push buffer's.
     fn ring_entries(pushes: usize) -> Result<u32> {
-        Ok(u32::try_from(pushes)?.checked_add(1).ok_or(EINVAL)?)
+        u32::try_from(pushes)?.checked_add(1).ok_or(EINVAL)
     }
 
     /// Forgets the submissions that are done.

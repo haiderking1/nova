@@ -55,7 +55,6 @@ use crate::{
             PushBuffer, //
         },
         copy::CopyChannel,
-        hal::PitchCopy,
         fence::{
             FenceContexts,
             Timelines,
@@ -65,6 +64,7 @@ use crate::{
             GrContext,
             GraphicsInfo, //
         },
+        hal::PitchCopy,
     },
     display::mode::HeadRaster,
     display::{
@@ -72,8 +72,8 @@ use crate::{
         Display,
         DisplayCopy,
         DisplayEngine,
-        DisplaySource,
         DisplayId,
+        DisplaySource,
         InternalHandles,
         ModeTimings,
         PresentMode,
@@ -1481,7 +1481,8 @@ impl<'gpu> Gpu<'gpu> {
             let fits = |start: u32, len: u32, end: u32| {
                 len > 0 && start.checked_add(len).is_some_and(|last| last <= end)
             };
-            if !fits(rect.dst_x, rect.width, dst.width) || !fits(rect.dst_y, rect.height, dst.height)
+            if !fits(rect.dst_x, rect.width, dst.width)
+                || !fits(rect.dst_y, rect.height, dst.height)
             {
                 return Err(EINVAL);
             }
