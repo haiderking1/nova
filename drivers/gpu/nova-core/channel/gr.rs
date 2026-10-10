@@ -10,6 +10,8 @@
 //!
 //! This follows nouveau's handling of GSP-RM's graphics engine.
 
+use core::ops::Range;
+
 use kernel::{
     device,
     dma::Coherent,
@@ -503,6 +505,21 @@ pub(crate) struct ChannelContext {
     mappings: KVec<MappedRange>,
 }
 
+/// The context buffers of a new channel on the graphics engine that are its own, by
+/// [`GR_CONTEXT_BUFFERS`] entry: `None` for the global ones.
+pub(crate) struct ChannelBuffers(KVec<Option<ContiguousVram>>);
+
+impl ChannelBuffers {
+    /// Returns the VRAM of the buffers that GSP-RM initializes, which must be cleared before.
+    pub(crate) fn to_clear(&self) -> impl Iterator<Item = Range<VramAddress>> + '_ {
+        GR_CONTEXT_BUFFERS
+            .iter()
+            .zip(&self.0)
+            .filter_map(|(buffer, vram)| vram.as_ref().filter(|_| buffer.init))
+            .map(ContiguousVram::range)
+    }
+}
+
 impl ChannelContext {
     /// Unmaps the context buffers from `space`, the address space of their channel, which
     /// GSP-RM must have freed.
@@ -526,9 +543,24 @@ impl GrContext<'_> {
         self.engine
     }
 
-    /// Allocates the per-channel context buffers of a new channel on the graphics engine, and
-    /// maps them and the global ones into `space`, the channel's address space. Returns them, and
-    /// the entries to give GSP-RM with [`promote`].
+    /// Allocates the per-channel context buffers of a new channel on the graphics engine, not
+    /// cleared: those GSP-RM initializes must be with [`ChannelBuffers::to_clear`].
+    fn alloc_channel_buffers(&self, mm: &mut GpuMm<'_>) -> Result<ChannelBuffers> {
+        let mut buffers = KVec::with_capacity(GR_CONTEXT_BUFFERS.len(), GFP_KERNEL)?;
+        for (layout, global) in self.layouts.iter().zip(&self.globals) {
+            let buffer = match global {
+                Some(_) => None,
+                None => Some(layout.alloc(mm, false)?),
+            };
+            buffers.push(buffer, GFP_KERNEL)?;
+        }
+
+        Ok(ChannelBuffers(buffers))
+    }
+
+    /// Maps the per-channel context buffers `buffers` of a new channel on the graphics engine,
+    /// cleared where GSP-RM is to initialize them, and the global ones into `space`, the
+    /// channel's address space. Returns them, and the entries to give GSP-RM with [`promote`].
     ///
     /// `privileged` channels get the unrestricted privileged register access map, like kernel RM
     /// gives kernel channels (`kgrctxGetRegisterAccessMapId()`), the others the restricted one.
@@ -537,6 +569,7 @@ impl GrContext<'_> {
         mm: &mut GpuMm<'_>,
         space: &mut AddressSpace,
         privileged: bool,
+        mut buffers: ChannelBuffers,
     ) -> Result<(ChannelContext, KVec<PromoteEntry>)> {
         let mut context = ChannelContext {
             _buffers: KVec::new(),
@@ -564,7 +597,7 @@ impl GrContext<'_> {
                     // GSP-RM initialized the global buffers with the golden context.
                     Some(global) => (global.map(space, mm, layout.va_alignment, access)?, None),
                     None => {
-                        let vram = layout.alloc(mm, buffer.init)?;
+                        let vram = buffers.0.get_mut(i).and_then(Option::take).ok_or(EINVAL)?;
                         let mapped = space.map_vram_aligned(
                             mm,
                             vram.range(),
@@ -602,21 +635,29 @@ impl GrContext<'_> {
     }
 
     /// Sets up the context of `channel`, which runs in `space` on the graphics engine: allocates
-    /// its context buffers, maps them and the global ones into `space`, and gives them to GSP-RM.
-    /// See [`GrContext::map_channel_context`] for `privileged`.
+    /// its context buffers, has `clear` clear those GSP-RM initializes, maps them and the global
+    /// ones into `space`, and gives them to GSP-RM. See [`GrContext::map_channel_context`] for
+    /// `privileged`.
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn set_up_channel(
         &self,
         dev: &device::Device,
         cmdq: &Cmdq<'_>,
         mm: &mut impl MmAccess,
+        clear: &mut impl FnMut(Range<VramAddress>) -> Result,
         rm: &RmDevice,
         channel: &Channel<'_>,
         space: &mut AddressSpace,
         privileged: bool,
     ) -> Result<ChannelContext> {
-        // The memory manager is only taken for the mappings: not while GSP-RM promotes the context.
+        // The memory manager is only taken for the allocations and the mappings: not while the
+        // buffers are cleared, nor while GSP-RM promotes the context.
+        let buffers = mm.with(|mm| self.alloc_channel_buffers(mm))?;
+        for range in buffers.to_clear() {
+            clear(range)?;
+        }
         let (mut context, entries) =
-            mm.with(|mm| self.map_channel_context(mm, space, privileged))?;
+            mm.with(|mm| self.map_channel_context(mm, space, privileged, buffers))?;
         if let Err(err) = promote(dev, cmdq, rm, channel, &entries) {
             mm.with(|mm| context.unmap(mm, space));
             return Err(err);
@@ -681,9 +722,14 @@ impl<'a> ComputeChannel<'a> {
         context: &GrContext<'_>,
         chid: u32,
     ) -> Result {
-        // A kernel channel: privileged.
+        // Set up before the kernel's copy channel, the buffers are cleared by the CPU. A kernel
+        // channel: privileged.
+        let buffers = context.alloc_channel_buffers(mm)?;
+        for range in buffers.to_clear() {
+            mm.clear_vram(range)?;
+        }
         let (channel_context, entries) =
-            context.map_channel_context(mm, self.channel.own_space()?, true)?;
+            context.map_channel_context(mm, self.channel.own_space()?, true, buffers)?;
         self.context = Some(channel_context);
         promote(dev, cmdq, rm, &self.channel, &entries)?;
 

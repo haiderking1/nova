@@ -13,6 +13,8 @@
 //! a copy engine a copy object, which the client binds to subchannels itself. Channels on the
 //! graphics engine also have an object of the copy engine sharing its runlist.
 
+use core::ops::Range;
+
 use kernel::{
     device,
     dma_buf::Fence,
@@ -37,7 +39,8 @@ use crate::{
     mm::{
         pagetable::Access,
         vmm::MappedRange,
-        MmAccess, //
+        MmAccess,
+        VramAddress, //
     },
     num,
 };
@@ -133,12 +136,13 @@ pub(crate) struct ClientChannel<'a> {
 impl<'a> ClientChannel<'a> {
     /// Allocates channel `chid` on `engine`, under the device of `rm`, in `space`, the client's
     /// address space, with its fences on `fence_context`. `gr` is the context of the graphics
-    /// engine, which channels on it need.
+    /// engine, which channels on it need, and `clear` clears VRAM for their context.
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         dev: &'a device::Device<device::Bound>,
         cmdq: &Cmdq<'_>,
         mm: &mut impl MmAccess,
+        clear: &mut impl FnMut(Range<VramAddress>) -> Result,
         chipset: Chipset,
         rm: &RmDevice,
         gr: Option<&GrContext<'_>>,
@@ -177,7 +181,7 @@ impl<'a> ClientChannel<'a> {
             in_flight: KVec::new(),
         };
 
-        match client.set_up(dev, cmdq, mm, rm, gr, space, copy_index) {
+        match client.set_up(dev, cmdq, mm, clear, rm, gr, space, copy_index) {
             Ok(()) => Ok(client),
             Err(err) => {
                 client.free(dev, cmdq, mm, space);
@@ -192,6 +196,7 @@ impl<'a> ClientChannel<'a> {
         dev: &device::Device,
         cmdq: &Cmdq<'_>,
         mm: &mut impl MmAccess,
+        clear: &mut impl FnMut(Range<VramAddress>) -> Result,
         rm: &RmDevice,
         gr: Option<&GrContext<'_>>,
         space: &mut AddressSpace,
@@ -226,8 +231,16 @@ impl<'a> ClientChannel<'a> {
                 }
 
                 // Not privileged: the restricted register access map.
-                self.context =
-                    Some(gr.set_up_channel(dev, cmdq, mm, rm, &self.channel, space, false)?);
+                self.context = Some(gr.set_up_channel(
+                    dev,
+                    cmdq,
+                    mm,
+                    clear,
+                    rm,
+                    &self.channel,
+                    space,
+                    false,
+                )?);
                 if objects.three_d {
                     hal.alloc_3d(dev, cmdq, &mut self.channel, THREE_D_HANDLE | chid)?;
                 }

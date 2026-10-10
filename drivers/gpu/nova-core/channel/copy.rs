@@ -32,7 +32,10 @@ use super::{
         Channel,
         NewSpace, //
     },
-    hal::PitchCopy,
+    hal::{
+        CopyDst,
+        PitchCopy, //
+    },
     vaspace::Mode, //
 };
 
@@ -123,9 +126,50 @@ impl<'a> CopyChannel<'a> {
         value: u32,
     ) -> Result {
         let mut push = KVec::new();
-        self.channel
-            .hal()
-            .push_fill(&mut push, addr.into_raw(), pitch, width, height, value)?;
+        self.channel.hal().push_fill(
+            &mut push,
+            CopyDst::Virtual(addr.into_raw()),
+            pitch,
+            width,
+            height,
+            value,
+        )?;
+
+        self.channel.run(bar, mm, &push)
+    }
+
+    /// Fills the VRAM of `range`, which must be 4 KiB aligned, with the 32-bit `value`, writing it
+    /// by address, without a mapping. Returns once the fill is done.
+    ///
+    /// Unlike CPU writes through PRAMIN, the fill keeps the memory manager only to start it.
+    pub(crate) fn fill_vram(
+        &mut self,
+        bar: Bar0<'_>,
+        mm: &mut impl MmAccess,
+        range: Range<VramAddress>,
+        value: u32,
+    ) -> Result {
+        /// Bytes of a line of the fill.
+        const LINE: u64 = 4096;
+
+        let size = range.end - range.start;
+        if range.start.into_raw() % LINE != 0 || size % LINE != 0 {
+            return Err(EINVAL);
+        }
+        if size == 0 {
+            return Ok(());
+        }
+
+        let mut push = KVec::new();
+        // CAST: a line is 4 KiB, of 1024 32-bit words.
+        self.channel.hal().push_fill(
+            &mut push,
+            CopyDst::Vram(range.start),
+            LINE as u32,
+            (LINE / 4) as u32,
+            u32::try_from(size / LINE)?,
+            value,
+        )?;
 
         self.channel.run(bar, mm, &push)
     }

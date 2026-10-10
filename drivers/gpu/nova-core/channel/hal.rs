@@ -101,6 +101,15 @@ pub(crate) struct PitchCopy {
     pub(crate) lines: u32,
 }
 
+/// Where the copy engine writes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CopyDst {
+    /// A GPU virtual address of the channel's address space.
+    Virtual(u64),
+    /// A VRAM address, written without a mapping.
+    Vram(VramAddress),
+}
+
 /// Classes of the channels and of the engine objects allocated on them.
 #[derive(Clone, Copy, Debug)]
 pub struct Classes {
@@ -168,11 +177,11 @@ pub(crate) trait ChannelHal: Sync {
     ) -> Result;
 
     /// Appends to `push` the methods filling `height` lines of `width` 32-bit words with `value`,
-    /// the first at GPU virtual address `addr`, the next ones `pitch` bytes apart.
+    /// the first at `dst`, the next ones `pitch` bytes apart.
     fn push_fill(
         &self,
         push: &mut KVec<u32>,
-        addr: u64,
+        dst: CopyDst,
         pitch: u32,
         width: u32,
         height: u32,

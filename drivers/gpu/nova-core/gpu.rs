@@ -1885,11 +1885,19 @@ impl<'gpu> Gpu<'gpu> {
             let (rm, space) = vm.rm_and_space_mut();
             let dev = gsp_resources.device.as_ref();
             let cmdq = &gsp_resources.gsp.cmdq;
+            // The copy engine clears the context, quicker than the CPU through PRAMIN would,
+            // without keeping `mm`. `copy` is locked before `mm`, which isn't held here.
+            let mut clear = |range: Range<VramAddress>| -> Result {
+                let mut copy = self.copy.lock();
+                let copy = Option::as_mut(&mut *copy).ok_or(ENODEV)?;
+                copy.fill_vram(gsp_resources.bar, &mut &self.mm, range, 0)
+            };
             let mut channel = ClientChannel::new(
                 dev,
                 cmdq,
                 // Locked for the channel's memory only: not while GSP-RM sets the channel up.
                 &mut &self.mm,
+                &mut clear,
                 self.spec.chipset,
                 rm,
                 self.gr.as_ref(),

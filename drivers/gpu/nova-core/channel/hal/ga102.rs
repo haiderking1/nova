@@ -45,6 +45,7 @@ use super::{
     super::gpfifo::Channel,
     ChannelHal,
     Classes,
+    CopyDst,
     GpEntry,
     GpfifoAlloc,
     GpfifoParent,
@@ -191,7 +192,7 @@ impl ChannelHal for Ga102 {
     fn push_fill(
         &self,
         push: &mut KVec<u32>,
-        addr: u64,
+        dst: CopyDst,
         pitch: u32,
         width: u32,
         height: u32,
@@ -199,11 +200,31 @@ impl ChannelHal for Ga102 {
     ) -> Result {
         let methods = |method, count| host_c56f::methods(COPY_SUBCHANNEL, method, count);
 
+        push.extend_from_slice(
+            &[methods(host_c56f::SET_OBJECT, 1)?, copy_c7b5::CLASS],
+            GFP_KERNEL,
+        )?;
+        let (addr, launch) = match dst {
+            CopyDst::Virtual(addr) => (addr, copy_c7b5::LAUNCH_FILL),
+            CopyDst::Vram(addr) => {
+                // Like the copies to the display: the destination is VRAM, by address.
+                push.extend_from_slice(
+                    &[
+                        methods(copy_c7b5::SET_DST_PHYS_MODE, 1)?,
+                        copy_c7b5::PHYS_MODE_VRAM,
+                    ],
+                    GFP_KERNEL,
+                )?;
+                (
+                    addr.into_raw(),
+                    copy_c7b5::LAUNCH_FILL | copy_c7b5::LAUNCH_DST_PHYSICAL,
+                )
+            }
+        };
+
         // CAST: the upper and lower halves of addresses are set separately.
         push.extend_from_slice(
             &[
-                methods(host_c56f::SET_OBJECT, 1)?,
-                copy_c7b5::CLASS,
                 methods(copy_c7b5::SET_REMAP_CONST_A, 3)?,
                 value,
                 0,
@@ -217,7 +238,7 @@ impl ChannelHal for Ga102 {
                 width,
                 height,
                 methods(copy_c7b5::LAUNCH_DMA, 1)?,
-                copy_c7b5::LAUNCH_FILL,
+                launch,
             ],
             GFP_KERNEL,
         )?;
