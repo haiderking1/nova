@@ -14,6 +14,10 @@ use kernel::{
         DpcdCaps, //
     },
     prelude::*,
+    time::{
+        delay::fsleep,
+        Delta, //
+    },
 };
 
 use nova_core::api::{
@@ -152,12 +156,18 @@ impl<'a> BootDp<'a> {
     }
 
     /// Readies the link for head `head` to show `mode`: like NVIDIA's driver, has the link run at
-    /// the slowest configuration that carries the mode. If it doesn't yet, or settings of the
-    /// display engine wait for a full modeset, detaches the head and trains the link to it, or to
-    /// the next faster ones if that fails. The next modeset of the head attaches it again.
+    /// the slowest configuration that carries the mode. If it doesn't yet, detaches the head and
+    /// trains the link to it, or to the next faster ones if that fails. If settings of the display
+    /// engine wait for a full modeset, detaches the head too, and trains the link only if the sink
+    /// doesn't have it up anymore. The next modeset of the head attaches it again.
     ///
     /// Fails with `EIO` if no configuration trains, leaving the head detached.
     pub(crate) fn ready_for(&self, api: &NovaCoreApi<'_>, head: u32, mode: &ModeTimings) -> Result {
+        /// Trainings of a configuration before trying the next one.
+        const TRAINING_TRIES: usize = 3;
+        /// Pause before training a configuration again.
+        const TRAINING_RETRY_DELAY: Delta = Delta::from_millis(10);
+
         let enhanced_framing = self.dpcd.enhanced_frame_cap();
         let mut fitting = self
             .configs
@@ -165,31 +175,68 @@ impl<'a> BootDp<'a> {
             .filter(|link| api.dp_mode_fits(head, link, enhanced_framing, mode))
             .peekable();
         let current = api.boot_display_dp_link()?;
-        // Settings of the display engine waiting for a full modeset get one, the link being
-        // trained again as for any other.
-        if fitting.peek() == Some(&&current) && !api.display_modeset_pending() {
+        let kept = current.lanes != 0 && fitting.peek() == Some(&&current);
+        if kept && !api.display_modeset_pending() {
             return Ok(());
         }
 
         // Like NVIDIA's driver, the link isn't trained while it carries a stream.
         api.detach_head(head)?;
-        // Like nouveau, the sink is woken up first, in case it sleeps.
+
+        // A full modeset only: like i915 and nouveau, the link isn't trained if the sink has it up.
+        if kept && self.link_up(&current) {
+            return Ok(());
+        }
+
+        // Like NVIDIA's driver and nouveau, the link is powered down before it's trained again,
+        // and like nouveau, the sink is woken up, in case it sleeps.
+        if current.lanes != 0 {
+            let off = DpLinkConfig {
+                lanes: 0,
+                ..current
+            };
+            if let Err(err) = self.train(api, &off) {
+                pr_warn!("DP: can't power the link down: {:?}\n", err);
+            }
+        }
         if let Err(err) = self
             .aux
             .dpcd_write(dp::dpcd::SET_POWER, &[dp::dpcd::SET_POWER_D0])
         {
             pr_warn!("DP: can't wake the sink up: {:?}\n", err);
         }
+        // Like i915, the sink is given a moment to wake up.
+        fsleep(Delta::from_millis(1));
 
         for link in fitting {
-            match self.train(api, link) {
-                Ok(()) => return Ok(()),
-                Err(err) => pr_warn!("DP: training to {:?} failed: {:?}\n", link, err),
+            for attempt in 1..=TRAINING_TRIES {
+                match self.train(api, link) {
+                    Ok(()) => return Ok(()),
+                    Err(err) => pr_warn!(
+                        "DP: training to {:?} failed, try {}: {:?}\n",
+                        link,
+                        attempt,
+                        err
+                    ),
+                }
+                fsleep(TRAINING_RETRY_DELAY);
             }
         }
 
         pr_err!("DP: no link configuration carrying the mode trains\n");
         Err(EIO)
+    }
+
+    /// Returns whether the sink has the link up in configuration `link`: trained, equalized and
+    /// aligned on its lanes.
+    fn link_up(&self, link: &DpLinkConfig) -> bool {
+        let Ok(lanes) = u8::try_from(link.lanes) else {
+            return false;
+        };
+
+        self.aux
+            .read_link_status()
+            .is_ok_and(|status| status.channel_eq_ok(lanes))
     }
 
     /// Trains the link to `link`: each LTTPR, from the one closest to the source, then the sink,
