@@ -50,6 +50,7 @@ use crate::{
             PushBuffer, //
         },
         copy::CopyChannel,
+        hal::PitchCopy,
         fence::{
             FenceContexts,
             Timelines,
@@ -64,6 +65,7 @@ use crate::{
     display::{
         self,
         Display,
+        DisplayCopy,
         DisplayEngine,
         DisplayId,
         InternalHandles,
@@ -148,6 +150,18 @@ use crate::{
 
 mod hal;
 mod regs;
+
+/// XRGB8888 pixels in VRAM, which the copy engine copies to.
+struct VramPixels {
+    /// Address of the first pixel.
+    addr: VramAddress,
+    /// Distance between the starts of two lines, in bytes.
+    pitch: u32,
+    /// Width in pixels.
+    width: u32,
+    /// Height in pixels.
+    height: u32,
+}
 
 macro_rules! define_chipset {
     ({ $($variant:ident),* $(,)* }) =>
@@ -1254,6 +1268,159 @@ impl<'gpu> Gpu<'gpu> {
         let scanout = output.scanout.as_mut().ok_or(ENODEV)?;
 
         scanout.flip(&mut output.engine, self.gsp_resources.bar, present)
+    }
+
+    /// Copies the `rects` of the XRGB8888 pixels of `buffer`, whose lines are `pitch` bytes apart
+    /// from byte `offset` on, into the back buffer of Nova's own scanout, which shows on screen
+    /// from the next [`Gpu::flip_scanout()`]. The copy engine copies them; returns once it's done.
+    ///
+    /// Fails with `ENODEV` if the scanout or the kernel's copy channel isn't set up, and with
+    /// `EINVAL` if a rectangle isn't within `buffer` or the scanout.
+    pub(crate) fn copy_to_scanout(
+        &self,
+        buffer: BufferRef<'_>,
+        offset: u64,
+        pitch: u32,
+        rects: &[DisplayCopy],
+    ) -> Result {
+        // `display_engine` is locked before `copy` and `mm`.
+        let output = self.display_engine.lock();
+        let back = output
+            .as_ref()
+            .and_then(|output| output.scanout.as_ref())
+            .map(Scanout::back)
+            .ok_or(ENODEV)?;
+        let dst = VramPixels {
+            addr: back.addr,
+            pitch: back.pitch,
+            width: back.width,
+            height: back.height,
+        };
+
+        self.copy_to_vram(buffer, offset, pitch, rects, &dst)
+    }
+
+    /// Like [`Gpu::copy_to_scanout()`], into the framebuffer of the boot display, which shows on
+    /// screen as it is written: its pixels must be XRGB8888.
+    ///
+    /// Fails with `ENODEV` without a boot display.
+    pub(crate) fn copy_to_boot_display(
+        &self,
+        buffer: BufferRef<'_>,
+        offset: u64,
+        pitch: u32,
+        rects: &[DisplayCopy],
+    ) -> Result {
+        let display = self.boot_display.as_ref().ok_or(ENODEV)?;
+        let dst = VramPixels {
+            addr: display.vram.start,
+            pitch: display.stride,
+            width: display.width,
+            height: display.height,
+        };
+
+        self.copy_to_vram(buffer, offset, pitch, rects, &dst)
+    }
+
+    /// Copies the `rects` of `buffer`, laid out as [`Gpu::copy_to_scanout()`] says, into `dst`
+    /// with the copy engine, and returns once the copy is done.
+    fn copy_to_vram(
+        &self,
+        buffer: BufferRef<'_>,
+        offset: u64,
+        pitch: u32,
+        rects: &[DisplayCopy],
+        dst: &VramPixels,
+    ) -> Result {
+        /// Bytes per XRGB8888 pixel.
+        const CPP: u64 = 4;
+
+        let (pfns, memory, buffer_size) = match buffer {
+            BufferRef::Vram(buffer) => (buffer.pfns()?, Memory::Vram, buffer.size()),
+            BufferRef::System(buffer) => {
+                (buffer.dma_pfns()?, Memory::SystemCoherent, buffer.size())
+            }
+        };
+        let buffer_size = num::usize_as_u64(buffer_size);
+        let (pitch, dst_pitch) = (u64::from(pitch), u64::from(dst.pitch));
+
+        // Offsets of the first pixels copied of each rectangle, from the start of `buffer` and of
+        // `dst`, once checked to be within both.
+        let mut offsets = KVec::with_capacity(rects.len(), GFP_KERNEL)?;
+        for rect in rects {
+            let fits = |start: u32, len: u32, end: u32| {
+                len > 0 && start.checked_add(len).is_some_and(|last| last <= end)
+            };
+            if !fits(rect.dst_x, rect.width, dst.width) || !fits(rect.dst_y, rect.height, dst.height)
+            {
+                return Err(EINVAL);
+            }
+
+            let line_bytes = u64::from(rect.width) * CPP;
+            let src = offset
+                .checked_add(u64::from(rect.src_y) * pitch + u64::from(rect.src_x) * CPP)
+                .ok_or(EINVAL)?;
+            let src_end = src
+                .checked_add(u64::from(rect.height - 1) * pitch + line_bytes)
+                .ok_or(EINVAL)?;
+            if u64::from(rect.src_x) * CPP + line_bytes > pitch || src_end > buffer_size {
+                return Err(EINVAL);
+            }
+
+            let dst_offset = u64::from(rect.dst_y) * dst_pitch + u64::from(rect.dst_x) * CPP;
+            offsets.push((src, dst_offset), GFP_KERNEL)?;
+        }
+
+        // The pages `dst` is in, which the copy channel maps whole.
+        let page_size = num::usize_as_u64(PAGE_SIZE);
+        let dst_start = dst.addr.into_raw();
+        let dst_pages = dst_start - dst_start % page_size;
+        let dst_end = (u64::from(dst.height) * dst_pitch)
+            .checked_add(dst_start)
+            .and_then(|end| end.checked_next_multiple_of(page_size))
+            .ok_or(EOVERFLOW)?;
+
+        // `copy` is locked before `mm`.
+        let mut copy = self.copy.lock();
+        let copy = Option::as_mut(&mut *copy).ok_or(ENODEV)?;
+        let mut mm = self.mm.lock();
+
+        let src_mapped = copy.map_pages(&mut mm, &pfns, memory)?;
+        let dst_mapped = match copy.map_vram(
+            &mut mm,
+            VramAddress::from_raw(dst_pages)..VramAddress::from_raw(dst_end),
+        ) {
+            Ok(mapped) => mapped,
+            Err(err) => {
+                let _ = copy.unmap(&mut mm, src_mapped);
+                return Err(err);
+            }
+        };
+
+        let src_va = src_mapped.start().into_raw();
+        let dst_va = dst_mapped.start().into_raw() + (dst_start - dst_pages);
+        let copied = (|| {
+            let mut copies = KVec::with_capacity(rects.len(), GFP_KERNEL)?;
+            for (rect, (src, dst_offset)) in rects.iter().zip(offsets.iter()) {
+                copies.push(
+                    PitchCopy {
+                        src: src_va + src,
+                        src_pitch: u32::try_from(pitch)?,
+                        dst: dst_va + dst_offset,
+                        dst_pitch: dst.pitch,
+                        line_bytes: u32::try_from(u64::from(rect.width) * CPP)?,
+                        lines: rect.height,
+                    },
+                    GFP_KERNEL,
+                )?;
+            }
+
+            copy.copy(self.gsp_resources.bar, &mut mm, &copies)
+        })();
+
+        let dst_unmapped = copy.unmap(&mut mm, dst_mapped);
+        let src_unmapped = copy.unmap(&mut mm, src_mapped);
+        copied.and(dst_unmapped).and(src_unmapped)
     }
 
     /// Enables the vblank interrupt of head `head` if `enable`, or disables it. Doesn't sleep.

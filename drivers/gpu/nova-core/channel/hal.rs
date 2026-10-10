@@ -87,6 +87,18 @@ pub(crate) struct Release {
     pub(crate) payload: u32,
 }
 
+/// A copy of `lines` lines of `line_bytes` bytes, the first from GPU virtual address `src` to
+/// `dst`, the next ones `src_pitch` and `dst_pitch` bytes further.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PitchCopy {
+    pub(crate) src: u64,
+    pub(crate) src_pitch: u32,
+    pub(crate) dst: u64,
+    pub(crate) dst_pitch: u32,
+    pub(crate) line_bytes: u32,
+    pub(crate) lines: u32,
+}
+
 /// Classes of the channels and of the engine objects allocated on them.
 #[derive(Clone, Copy, Debug)]
 pub struct Classes {
@@ -164,6 +176,9 @@ pub(crate) trait ChannelHal: Sync {
         height: u32,
         value: u32,
     ) -> Result;
+
+    /// Appends to `push` the methods making `copy`.
+    fn push_copy(&self, push: &mut KVec<u32>, copy: &PitchCopy) -> Result;
 
     // The graphics engine.
 

@@ -49,6 +49,7 @@ use super::{
     GpfifoAlloc,
     GpfifoParent,
     Grid,
+    PitchCopy,
     Release, //
 };
 
@@ -217,6 +218,33 @@ impl ChannelHal for Ga102 {
                 height,
                 methods(copy_c7b5::LAUNCH_DMA, 1)?,
                 copy_c7b5::LAUNCH_FILL,
+            ],
+            GFP_KERNEL,
+        )?;
+
+        Ok(())
+    }
+
+    fn push_copy(&self, push: &mut KVec<u32>, copy: &PitchCopy) -> Result {
+        let methods = |method, count| host_c56f::methods(COPY_SUBCHANNEL, method, count);
+
+        // CAST: the upper and lower halves of addresses are set separately.
+        push.extend_from_slice(
+            &[
+                methods(host_c56f::SET_OBJECT, 1)?,
+                copy_c7b5::CLASS,
+                methods(copy_c7b5::OFFSET_IN_UPPER, 4)?,
+                (copy.src >> 32) as u32,
+                copy.src as u32,
+                (copy.dst >> 32) as u32,
+                copy.dst as u32,
+                methods(copy_c7b5::PITCH_IN, 4)?,
+                copy.src_pitch,
+                copy.dst_pitch,
+                copy.line_bytes,
+                copy.lines,
+                methods(copy_c7b5::LAUNCH_DMA, 1)?,
+                copy_c7b5::LAUNCH_COPY,
             ],
             GFP_KERNEL,
         )?;

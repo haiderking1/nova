@@ -39,6 +39,7 @@ pub use crate::{
         hal::Classes, //
     },
     display::{
+        DisplayCopy,
         ModeTimings,
         PresentMode,
         ScanoutMode,
@@ -144,6 +145,36 @@ impl NovaCoreApi<'_> {
     /// Fails with `ENODEV` if the scanout isn't set up.
     pub fn flip_scanout(&self, present: PresentMode) -> Result {
         self.gpu.flip_scanout(present)
+    }
+
+    /// Copies the `rects` of the XRGB8888 pixels of `buffer`, whose lines are `pitch` bytes apart
+    /// from byte `offset` on, into the back buffer of Nova's own scanout. The GPU's copy engine
+    /// copies them; returns once it's done.
+    ///
+    /// Fails with `ENODEV` if the scanout isn't set up, and with `EINVAL` if a rectangle isn't
+    /// within `buffer` or the scanout.
+    pub fn copy_to_scanout(
+        &self,
+        buffer: BufferRef<'_>,
+        offset: u64,
+        pitch: u32,
+        rects: &[DisplayCopy],
+    ) -> Result {
+        self.gpu.copy_to_scanout(buffer, offset, pitch, rects)
+    }
+
+    /// Like [`NovaCoreApi::copy_to_scanout()`], into the framebuffer of the boot display, which
+    /// shows on screen as it is written: its pixels must be XRGB8888 (see [`BootDisplayMode`]).
+    ///
+    /// Fails with `ENODEV` without a usable boot display.
+    pub fn copy_to_boot_display(
+        &self,
+        buffer: BufferRef<'_>,
+        offset: u64,
+        pitch: u32,
+        rects: &[DisplayCopy],
+    ) -> Result {
+        self.gpu.copy_to_boot_display(buffer, offset, pitch, rects)
     }
 
     /// Enables the vblank interrupt of head `head` if `enable`, or disables it. Doesn't sleep, so

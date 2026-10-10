@@ -26,7 +26,10 @@ pub(crate) use engine::{
 pub use engine::PresentMode;
 pub use mode::ModeTimings;
 pub(crate) use scanout::Scanout;
-pub use scanout::ScanoutMode;
+pub use scanout::{
+    DisplayCopy,
+    ScanoutMode, //
+};
 pub use vblank::VblankHandler;
 pub(crate) use vblank::VblankHandlerSlot;
 

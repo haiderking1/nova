@@ -143,6 +143,9 @@ pub(crate) mod copy_c7b5 {
 
     /// Starts a copy.
     pub(crate) const LAUNCH_DMA: u32 = bindings::NVC7B5_LAUNCH_DMA;
+    /// Source: bits 48:32 of its GPU virtual address, then bits 31:0 in the next method, followed
+    /// by the destination's, like [`OFFSET_OUT_UPPER`].
+    pub(crate) const OFFSET_IN_UPPER: u32 = bindings::NVC7B5_OFFSET_IN_UPPER;
     /// Destination: bits 48:32 of its GPU virtual address, then bits 31:0 in the next method.
     pub(crate) const OFFSET_OUT_UPPER: u32 = bindings::NVC7B5_OFFSET_OUT_UPPER;
     /// Pitches of the source and the destination in bytes, then the length of a line in elements
@@ -166,6 +169,15 @@ pub(crate) mod copy_c7b5 {
             | bindings::NVC7B5_LAUNCH_DMA_MULTI_LINE_ENABLE_TRUE << 9
             | bindings::NVC7B5_LAUNCH_DMA_REMAP_ENABLE_TRUE << 10
             // Like NVIDIA's drivers on this class.
+            | bindings::NVC7B5_LAUNCH_DMA_DISABLE_PLC_TRUE << 26;
+
+    /// [`LAUNCH_DMA`] copying pitch-linear lines of bytes, with the transfer flushed, like
+    /// [`LAUNCH_FILL`] without remapping.
+    pub(crate) const LAUNCH_COPY: u32 = bindings::NVC7B5_LAUNCH_DMA_DATA_TRANSFER_TYPE_NON_PIPELINED
+            | bindings::NVC7B5_LAUNCH_DMA_FLUSH_ENABLE_TRUE << 2
+            | bindings::NVC7B5_LAUNCH_DMA_SRC_MEMORY_LAYOUT_PITCH << 7
+            | bindings::NVC7B5_LAUNCH_DMA_DST_MEMORY_LAYOUT_PITCH << 8
+            | bindings::NVC7B5_LAUNCH_DMA_MULTI_LINE_ENABLE_TRUE << 9
             | bindings::NVC7B5_LAUNCH_DMA_DISABLE_PLC_TRUE << 26;
 }
 

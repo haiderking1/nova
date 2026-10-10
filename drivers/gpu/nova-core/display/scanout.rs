@@ -53,6 +53,24 @@ pub struct ScanoutMode {
     pub head: u32,
 }
 
+/// A rectangle of `width` by `height` XRGB8888 pixels, copied from `(src_x, src_y)` of a buffer to
+/// `(dst_x, dst_y)` of what the display shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplayCopy {
+    /// Column of the first pixel copied.
+    pub src_x: u32,
+    /// Line of the first pixel copied.
+    pub src_y: u32,
+    /// Column the first pixel is copied to.
+    pub dst_x: u32,
+    /// Line the first pixel is copied to.
+    pub dst_y: u32,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+}
+
 /// Two framebuffers that the window shows in turns.
 ///
 /// The framebuffers must be unmapped with [`Scanout::unmap`].
@@ -144,6 +162,11 @@ impl Scanout {
     /// Returns the size and layout of the framebuffers.
     pub(crate) fn mode(&self) -> ScanoutMode {
         self.mode
+    }
+
+    /// Returns the surface of the back buffer, the framebuffer that isn't shown.
+    pub(crate) fn back(&self) -> &Surface {
+        &self.framebuffers[self.back].surface
     }
 
     /// Writes `data` at `offset` into the back buffer.

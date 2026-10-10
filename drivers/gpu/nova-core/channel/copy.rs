@@ -31,6 +31,7 @@ use super::{
         Channel,
         NewSpace, //
     },
+    hal::PitchCopy,
     vaspace::Mode, //
 };
 
@@ -124,6 +125,22 @@ impl<'a> CopyChannel<'a> {
         self.channel
             .hal()
             .push_fill(&mut push, addr.into_raw(), pitch, width, height, value)?;
+
+        self.channel.run(bar, mm, &push)
+    }
+
+    /// Makes the `copies`, in order, between addresses of the channel's address space. Returns
+    /// once they are done.
+    pub(crate) fn copy(
+        &mut self,
+        bar: Bar0<'_>,
+        mm: &mut GpuMm<'_>,
+        copies: &[PitchCopy],
+    ) -> Result {
+        let mut push = KVec::new();
+        for copy in copies {
+            self.channel.hal().push_copy(&mut push, copy)?;
+        }
 
         self.channel.run(bar, mm, &push)
     }
