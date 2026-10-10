@@ -54,9 +54,14 @@ pub(crate) struct Nova<'bound> {
 
 impl Drop for Nova<'_> {
     fn drop(&mut self) {
-        // nova-core may still hold the vblank handler, which references the CRTC.
         let _ = crate::kms::with_api(&self.drm, |api| {
+            // nova-core may still hold the vblank handler, which references the CRTC.
             api.set_vblank_handler(None);
+            // Framebuffers shown straight from their memory may be freed without nova-core once
+            // the device is unregistered: the last frame stays on screen from nova-core's scanout.
+            if let Err(err) = api.show_frame_from_scanout() {
+                pr_err!("nova-drm: a framebuffer may stay shown: {:?}\n", err);
+            }
             Ok(())
         });
     }

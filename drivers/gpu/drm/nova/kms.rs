@@ -5,10 +5,11 @@
 //! nova-drm drives the display the system firmware set up: one output (primary plane, CRTC,
 //! encoder and connector), on the head and output the firmware lit. The GPU's copy engine copies
 //! frames from the framebuffers, in VRAM or system memory, into the back buffer of nova-core's own
-//! scanout, which is then flipped, so frames show whole. Through that scanout, nova-core sets the
-//! modes of the monitor's EDID that the display's link carries. Without it, frames are copied into
-//! the firmware's framebuffer, which shows on screen as it is drawn, and only the firmware's mode
-//! works.
+//! scanout, which is then flipped, so frames show whole. Framebuffers the display can read as they
+//! are, contiguous in VRAM and covering the whole mode, are shown straight from their memory
+//! instead, with nothing copied. Through that scanout, nova-core sets the modes of the monitor's
+//! EDID that the display's link carries. Without it, frames are copied into the firmware's
+//! framebuffer, which shows on screen as it is drawn, and only the firmware's mode works.
 //!
 //! With nova-core's scanout, the CRTC has vblanks: nova-core passes on the vblank interrupts of the
 //! head showing the scanout. A flip returns once the frame flipped is on screen, so a commit's
@@ -44,6 +45,7 @@ use kernel::{
                 RawCrtcState, //
             },
             encoder,
+            framebuffer::Framebuffer,
             modes::{
                 DisplayMode,
                 ModeStatus, //
@@ -84,6 +86,7 @@ use kernel::{
 };
 
 use nova_core::api::{
+    BufferRef,
     ConnectorType,
     DisplayCopy,
     DisplaySource,
@@ -349,18 +352,16 @@ impl plane::DriverPlane for NovaPlane {
 /// Most rectangles copied for a frame: more are copied as the smallest one containing them.
 const MAX_COPIES: usize = 64;
 
-/// Has `copy` copy the `rects` of the framebuffer of `state`, areas in framebuffer coordinates, to
-/// where the plane shows them, from the memory of the framebuffer's GEM object, as mapped for the
-/// copy engine with `api`.
+/// Has `copy` copy the `rects` of `fb`, areas in framebuffer coordinates, to where a plane showing
+/// area `src` of it at `dst` shows them, from the memory of the framebuffer's GEM object, as mapped
+/// for the copy engine with `api`.
 fn copy_framebuffer(
     api: &NovaCoreApi<'_>,
-    state: &PlaneStateMutator<'_, PlaneState<NovaPlaneState>>,
+    fb: &Framebuffer<NovaDriver>,
+    (src, dst): (Rect, Rect),
     rects: &[Rect],
     copy: impl FnOnce(&DisplaySource, u64, u32, &[DisplayCopy]) -> Result,
 ) -> Result {
-    let Some(fb) = state.framebuffer() else {
-        return Ok(());
-    };
     let object = fb.gem_object(0).ok_or(EINVAL)?;
     let pitch = fb.pitch(0).ok_or(EINVAL)?;
     let offset = fb.offset(0).ok_or(EINVAL)?;
@@ -373,8 +374,6 @@ fn copy_framebuffer(
         rects
     };
 
-    // The plane shows `src` of the framebuffer at `dst`.
-    let (src, dst) = (state.src(), state.dst());
     let mut copies = KVec::with_capacity(rects.len(), GFP_KERNEL)?;
     for rect in rects {
         copies.push(
@@ -396,57 +395,154 @@ fn copy_framebuffer(
     object.with_display_source(api, |source| copy(source, u64::from(offset), pitch, &copies))
 }
 
-/// Copies the frame of `new_state` into the back buffer of nova-core's scanout, and flips it as
-/// `present` says.
+/// Shows the frame of `new_state` as `present` says: straight from its framebuffer if the display
+/// can read it from there, otherwise copied into the back buffer of nova-core's scanout, which is
+/// then flipped.
 ///
-/// The back buffer holds the frame before the one shown: the parts of the framebuffer that changed
-/// since either are copied.
+/// The back buffer holds the frame before the one shown, if that was copied too: the parts of the
+/// framebuffer that changed since either are copied. Otherwise, the whole frame is.
 fn draw_to_scanout(
     drm: &NovaDevice,
     old_state: &PlaneState<NovaPlaneState>,
     new_state: &mut PlaneStateMutator<'_, PlaneState<NovaPlaneState>>,
     present: PresentMode,
 ) -> Result {
-    // Without a framebuffer, the last frame stays on screen.
-    if new_state.framebuffer().is_none() {
-        return Ok(());
-    }
     // Nothing to do if the device is going away.
     let Some(registered) = drm.registration_guard() else {
         return Ok(());
     };
 
+    // Without a framebuffer, the last frame stays on screen: in nova-core's scanout, since the
+    // framebuffer it may be shown from goes away.
+    let Some(fb) = new_state.framebuffer() else {
+        if let Some(src) = old_state.shown_from {
+            registered
+                .registration_data_with(|reg| reg.api.with(|api| api.show_frame_from_scanout()))?;
+            new_state.shown_from = None;
+            // The back buffer holds none of the frame.
+            new_state.damage = Some(src);
+        }
+        return Ok(());
+    };
+    let (src, dst) = (new_state.src(), new_state.dst());
+
+    let shown = registered.registration_data_with(|reg| {
+        reg.api
+            .with(|api| show_framebuffer(&api, fb, (src, dst), present))
+    });
+    let shown = match shown {
+        Ok(shown) => shown,
+        Err(err) => {
+            // The display may have begun showing the framebuffer: neither of the scanout's
+            // framebuffers is taken to hold the frame before.
+            new_state.shown_from = Some(src);
+            return Err(err);
+        }
+    };
+    if shown != old_state.shown_from.is_some() {
+        pr_debug!(
+            "nova-drm: frames {} from now on\n",
+            if shown {
+                "show straight from their framebuffers"
+            } else {
+                "are copied to the scanout"
+            }
+        );
+    }
+    if shown {
+        new_state.shown_from = Some(src);
+        new_state.damage = None;
+        return Ok(());
+    }
+
     let mut rects = KVec::new();
     let mut damage = None;
-    for rect in new_state.damage(old_state) {
-        damage = Some(damage.map_or(rect, |damage| union(&damage, &rect)));
-        rects.push(rect, GFP_KERNEL)?;
-    }
-    // What changed in the frame before, which the back buffer misses unless copied again.
-    let previous = old_state
-        .damage
-        .and_then(|rect| intersection(&rect, &new_state.src()));
-    if let Some(previous) = previous {
-        if !rects
-            .iter()
-            .any(|rect| intersection(&previous, rect) == Some(previous))
-        {
-            rects.push(previous, GFP_KERNEL)?;
+    if old_state.shown_from.is_some() {
+        // The back buffer holds none of the frames before.
+        rects.push(src, GFP_KERNEL)?;
+        damage = Some(src);
+    } else {
+        for rect in new_state.damage(old_state) {
+            damage = Some(damage.map_or(rect, |damage| union(&damage, &rect)));
+            rects.push(rect, GFP_KERNEL)?;
+        }
+        // What changed in the frame before, which the back buffer misses unless copied again.
+        let previous = old_state.damage.and_then(|rect| intersection(&rect, &src));
+        if let Some(previous) = previous {
+            if !rects
+                .iter()
+                .any(|rect| intersection(&previous, rect) == Some(previous))
+            {
+                rects.push(previous, GFP_KERNEL)?;
+            }
         }
     }
 
     registered.registration_data_with(|reg| {
-        reg.api.with(|api| {
-            copy_framebuffer(&api, new_state, &rects, |source, offset, pitch, copies| {
-                api.copy_to_scanout(source, offset, pitch, copies)
-            })?;
-
-            api.flip_scanout(present)
-        })
+        reg.api
+            .with(|api| copy_and_flip(&api, fb, (src, dst), &rects, present))
     })?;
 
+    new_state.shown_from = None;
     new_state.damage = damage;
     Ok(())
+}
+
+/// Copies the `rects` of `fb`, shown at `area`, into the back buffer of nova-core's scanout, and
+/// flips it as `present` says.
+fn copy_and_flip(
+    api: &NovaCoreApi<'_>,
+    fb: &Framebuffer<NovaDriver>,
+    area: (Rect, Rect),
+    rects: &[Rect],
+    present: PresentMode,
+) -> Result {
+    copy_framebuffer(api, fb, area, rects, |source, offset, pitch, copies| {
+        api.copy_to_scanout(source, offset, pitch, copies)
+    })?;
+
+    api.flip_scanout(present)
+}
+
+/// Shows area `src` of `fb` as `present` says, straight from the framebuffer's memory, if the
+/// display can read it from there: the area covers the whole of nova-core's scanout, at `dst`, and
+/// is in VRAM nova-core can show. Returns whether it did.
+fn show_framebuffer(
+    api: &NovaCoreApi<'_>,
+    fb: &Framebuffer<NovaDriver>,
+    (src, dst): (Rect, Rect),
+    present: PresentMode,
+) -> Result<bool> {
+    /// Bytes per pixel of the plane's formats.
+    const CPP: u64 = 4;
+
+    let Some(mode) = api.scanout_mode() else {
+        return Ok(false);
+    };
+    let whole = Rect {
+        x1: 0,
+        y1: 0,
+        x2: i32::try_from(mode.width)?,
+        y2: i32::try_from(mode.height)?,
+    };
+    if dst != whole || src.x2 - src.x1 != whole.x2 || src.y2 - src.y1 != whole.y2 {
+        return Ok(false);
+    }
+    let object = fb.gem_object(0).ok_or(EINVAL)?;
+    let Ok(BufferRef::Vram(buffer)) = object.buffer() else {
+        return Ok(false);
+    };
+    let pitch = fb.pitch(0).ok_or(EINVAL)?;
+    let offset = u64::from(fb.offset(0).ok_or(EINVAL)?)
+        + u64::try_from(src.y1)? * u64::from(pitch)
+        + u64::try_from(src.x1)? * CPP;
+
+    match api.show_buffer(buffer, offset, pitch, present) {
+        Ok(()) => Ok(true),
+        // The framebuffer isn't laid out as the display reads it.
+        Err(EINVAL) => Ok(false),
+        Err(err) => Err(err),
+    }
 }
 
 /// Returns the smallest rectangle containing `a` and `b`.
@@ -477,6 +573,9 @@ fn copy_to_boot_display(
     old_state: &PlaneState<NovaPlaneState>,
     new_state: &PlaneStateMutator<'_, PlaneState<NovaPlaneState>>,
 ) -> Result {
+    let Some(fb) = new_state.framebuffer() else {
+        return Ok(());
+    };
     // Nothing to do if the device is going away.
     let Some(registered) = drm.registration_guard() else {
         return Ok(());
@@ -489,19 +588,24 @@ fn copy_to_boot_display(
 
     registered.registration_data_with(|reg| {
         reg.api.with(|api| {
-            copy_framebuffer(&api, new_state, &rects, |source, offset, pitch, copies| {
+            let area = (new_state.src(), new_state.dst());
+            copy_framebuffer(&api, fb, area, &rects, |source, offset, pitch, copies| {
                 api.copy_to_boot_display(source, offset, pitch, copies)
             })
         })
     })
 }
 
-/// State of the boot display's plane, whose framebuffer the GPU copies to the display.
+/// State of the boot display's plane, whose framebuffer the display shows, from the framebuffer
+/// itself or copied by the GPU.
 #[derive(Clone, Default)]
 pub(crate) struct NovaPlaneState {
     /// Smallest rectangle containing what changed in the framebuffer in the frame of this state,
     /// in framebuffer coordinates, if anything did and it was drawn into nova-core's scanout.
     damage: Option<Rect>,
+    /// The area of the framebuffer shown straight from it, if the frame of this state is shown
+    /// that way rather than copied into nova-core's scanout.
+    shown_from: Option<Rect>,
 }
 
 impl DriverPlaneState for NovaPlaneState {
