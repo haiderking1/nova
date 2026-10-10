@@ -6,6 +6,7 @@
 
 use crate::{
     drm::{
+        gem::IntoGEMObject,
         Device,
         kms::{
             DeviceContext,
@@ -85,6 +86,50 @@ impl<T: KmsDriver, C: DeviceContext> Framebuffer<T, C> {
     pub(super) unsafe fn from_raw<'a>(ptr: *const bindings::drm_framebuffer) -> &'a Self {
         // SAFETY: Our data layout is identical to drm_framebuffer
         unsafe { &*ptr.cast() }
+    }
+
+    /// Returns the number of color planes of the framebuffer's format.
+    fn plane_count(&self) -> usize {
+        // SAFETY: `format` is set when the framebuffer is initialized, and points to static data.
+        let format = unsafe { &*(*self.0.get()).format };
+
+        usize::from(format.num_planes)
+    }
+
+    /// Returns the distance between the starts of two lines of color plane `index`, in bytes, or
+    /// [`None`] if the framebuffer's format has no such plane.
+    pub fn pitch(&self, index: usize) -> Option<u32> {
+        // SAFETY: `pitches` is set when the framebuffer is initialized, and never changes.
+        let pitches = unsafe { &(*self.0.get()).pitches };
+
+        pitches.get(index).filter(|_| index < self.plane_count()).copied()
+    }
+
+    /// Returns the offset of color plane `index` in its GEM object, in bytes, or [`None`] if the
+    /// framebuffer's format has no such plane.
+    pub fn offset(&self, index: usize) -> Option<u32> {
+        // SAFETY: `offsets` is set when the framebuffer is initialized, and never changes.
+        let offsets = unsafe { &(*self.0.get()).offsets };
+
+        offsets.get(index).filter(|_| index < self.plane_count()).copied()
+    }
+
+    /// Returns the GEM object holding color plane `index`, or [`None`] if the framebuffer's format
+    /// has no such plane.
+    pub fn gem_object(&self, index: usize) -> Option<&T::Object> {
+        // SAFETY: `obj` is set when the framebuffer is initialized, and holds a reference to each
+        // object for as long as the framebuffer lives.
+        let objects = unsafe { &(*self.0.get()).obj };
+        let obj = *objects.get(index).filter(|_| index < self.plane_count())?;
+        if obj.is_null() {
+            return None;
+        }
+
+        // SAFETY:
+        // - Framebuffers are created from the handles of files of `T`, whose objects are all
+        //   `T::Object`s: `obj` is embedded within a `T::Object`.
+        // - The framebuffer holds a reference to `obj`, so it lives as long as `self`.
+        Some(unsafe { <T::Object as IntoGEMObject>::from_raw(obj) })
     }
 }
 
