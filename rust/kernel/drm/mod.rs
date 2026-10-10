@@ -3,6 +3,7 @@
 //! DRM subsystem abstractions.
 
 pub mod device;
+pub mod dp;
 pub mod driver;
 pub mod edid;
 pub mod file;

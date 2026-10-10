@@ -5,6 +5,7 @@
 #include "vblank.c"
 #endif
 
+#include "dp.c"
 #include "gem.c"
 #include "gpuvm.c"
 #include "syncobj.c"

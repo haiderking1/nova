@@ -219,6 +219,14 @@ config DRM_GPUVM
 	  GPU-VM representation providing helpers to manage a GPUs virtual
 	  address space
 
+config RUST_DRM_DISPLAY_DP_HELPER
+	bool
+	depends on DRM
+	select DRM_DISPLAY_HELPER
+	select DRM_DISPLAY_DP_HELPER
+	help
+	  Choose this if you need the DisplayPort helpers in Rust
+
 config RUST_DRM_GPUVM
 	bool
 	depends on DRM
