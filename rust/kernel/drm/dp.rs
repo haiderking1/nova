@@ -99,6 +99,8 @@ pub fn link_rate_to_bw_code(rate: u32) -> u8 {
 const RECEIVER_CAP_SIZE: usize = bindings::DP_RECEIVER_CAP_SIZE as usize;
 /// Size of the common capabilities of the LTTPRs.
 const LTTPR_COMMON_CAP_SIZE: usize = bindings::DP_LTTPR_COMMON_CAP_SIZE as usize;
+/// Size of the status of a link: lanes and alignment.
+const LINK_STATUS_SIZE: usize = bindings::DP_LINK_STATUS_SIZE as usize;
 
 /// The receiver capabilities of a sink: the start of its DPCD, as read by [`Aux::read_dpcd_caps`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,6 +156,27 @@ impl DpcdCaps {
     fn lane_count_flag(&self, flag: u32) -> bool {
         // CAST: the flags fit in 8 bits.
         self.0[bindings::DP_MAX_LANE_COUNT as usize] & flag as u8 != 0
+    }
+}
+
+/// The status of a link, as the sink reports it: whether clock recovery and channel equalization
+/// are done on its lanes, and whether these are aligned. Read by [`Aux::read_link_status`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkStatus([u8; LINK_STATUS_SIZE]);
+
+impl LinkStatus {
+    /// Returns whether clock recovery is done on the first `lanes` lanes
+    /// (`drm_dp_clock_recovery_ok()`).
+    pub fn clock_recovery_ok(&self, lanes: u8) -> bool {
+        // SAFETY: `self.0` is an array of the size the function reads.
+        unsafe { bindings::drm_dp_clock_recovery_ok(self.0.as_ptr(), lanes.into()) }
+    }
+
+    /// Returns whether the first `lanes` lanes are trained, equalized and aligned: whether the
+    /// link carries data (`drm_dp_channel_eq_ok()`).
+    pub fn channel_eq_ok(&self, lanes: u8) -> bool {
+        // SAFETY: `self.0` is an array of the size the function reads.
+        unsafe { bindings::drm_dp_channel_eq_ok(self.0.as_ptr(), lanes.into()) }
     }
 }
 
@@ -380,6 +403,19 @@ impl<T: AuxTransfer> Aux<T> {
         })?;
 
         Ok(LttprCaps(caps))
+    }
+
+    /// Reads the status of the link from the sink (`drm_dp_dpcd_read_link_status()`).
+    pub fn read_link_status(&self) -> Result<LinkStatus> {
+        let mut status = [0; LINK_STATUS_SIZE];
+
+        // SAFETY: `self.as_raw()` is an initialized `drm_dp_aux` by the type invariants, and
+        // `status` is an array of the size the function writes.
+        to_result(unsafe {
+            bindings::drm_dp_dpcd_read_link_status(self.as_raw(), status.as_mut_ptr())
+        })?;
+
+        Ok(LinkStatus(status))
     }
 
     /// Puts the `count` LTTPRs of the link in non-transparent mode, in which each of them is
