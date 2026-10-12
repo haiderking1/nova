@@ -167,6 +167,14 @@ struct TimestampInfo(uapi::drm_nova_info_timestamp);
 // SAFETY: `TimestampInfo` has no interior mutability, and there are no uninitialized bytes.
 unsafe impl AsBytes for TimestampInfo {}
 
+/// Information on the video decoder engines returned to userspace.
+#[repr(transparent)]
+struct VideoDecoderInfo(uapi::drm_nova_info_video_decoder);
+
+// SAFETY: `VideoDecoderInfo` has no interior mutability, and there are no uninitialized bytes: its
+// fields leave no padding.
+unsafe impl AsBytes for VideoDecoderInfo {}
+
 /// Information on the GPU virtual address spaces returned to userspace.
 #[repr(transparent)]
 struct VmInfo(uapi::drm_nova_info_vm);
@@ -461,6 +469,7 @@ impl File {
                 })
             }
             (uapi::DRM_NOVA_ENGINE_COPY, 0) => ChannelEngine::Copy,
+            (uapi::DRM_NOVA_ENGINE_VIDEO_DECODER, 0) => ChannelEngine::VideoDecoder,
             _ => return Err(EINVAL),
         };
 
@@ -617,6 +626,16 @@ impl File {
                     timestamp: reg_data.api.with(|api| api.timestamp()),
                 }),
             )?,
+            uapi::DRM_NOVA_INFO_VIDEO_DECODER => {
+                let decoder = reg_data.api.with(|api| api.video_decoder_info())?;
+                write_info(
+                    info,
+                    VideoDecoderInfo(uapi::drm_nova_info_video_decoder {
+                        class_video_decoder: decoder.class,
+                        pad: 0,
+                    }),
+                )?
+            }
             _ => return Err(EINVAL),
         }
 

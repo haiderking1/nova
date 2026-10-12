@@ -534,7 +534,8 @@ TEST_F(nova, vm_keeps_objects)
 
 /*
  * Push buffer methods, from NVIDIA's class headers: clc56f.h (host), clc7b5.h
- * (copy), clc797.h (3D) and cla140.h (inline-to-memory), as Mesa ships them.
+ * (copy), clc797.h (3D), cla140.h (inline-to-memory) and clc7b0.h (video
+ * decoder), as Mesa ships them.
  */
 #define NVC56F_SET_OBJECT			0x0000
 #define NVC56F_SEM_ADDR_LO			0x005c
@@ -546,6 +547,8 @@ TEST_F(nova, vm_keeps_objects)
 #define NVA140_LINE_LENGTH_IN			0x0180
 #define NVA140_LAUNCH_DMA			0x01b0
 #define NVA140_LOAD_INLINE_DATA			0x01b4
+#define NVC7B0_SEMAPHORE_A			0x0240
+#define NVC7B0_SEMAPHORE_D			0x0304
 
 /*
  * NVC56F_SEM_EXECUTE: wait for a 32-bit semaphore to hold the payload, letting
@@ -564,6 +567,11 @@ TEST_F(nova, vm_keeps_objects)
  * pipeline is done.
  */
 #define REPORT_RELEASE		(0x0 | 0xf << 12 | 1 << 28)
+/*
+ * NVC7B0_SEMAPHORE_D: release a one-word payload, flushed, without waking up
+ * the host.
+ */
+#define DECODER_RELEASE		(0x0 | 0x0 << 8 | 0x0 << 16 | 0x0 << 21)
 /* NVA140_LAUNCH_DMA: a flushed write of pitch-linear lines. */
 #define LAUNCH_INLINE		(0x1 | 0x1 << 4)
 
@@ -585,6 +593,7 @@ static __u32 mthd_noninc(__u32 subc, __u32 method, __u32 count)
 #define SUBC_M2MF	2
 #define SUBC_2D		3
 #define SUBC_COPY	4
+#define SUBC_VIDEO	4
 
 /* Addresses the tests map at. */
 #define PUSH_VA		(1ull << 30)
@@ -1265,7 +1274,7 @@ TEST_F(nova, exec_invalid)
 	EXPECT_EQ(-EINVAL, nova_channel_create(self->fd, DRM_NOVA_ENGINE_COPY));
 	ASSERT_EQ(0, nova_vm_init(self->fd, KERNEL_START, KERNEL_SIZE));
 	EXPECT_EQ(-EINVAL, nova_channel_create(self->fd, 0));
-	EXPECT_EQ(-EINVAL, nova_channel_create(self->fd, 3));
+	EXPECT_EQ(-EINVAL, nova_channel_create(self->fd, 4));
 	/* Graphics channels have objects, copy channels their copy object. */
 	EXPECT_EQ(-EINVAL, nova_channel_create_classes(self->fd, DRM_NOVA_ENGINE_GRAPHICS, 0));
 	EXPECT_EQ(-EINVAL, nova_channel_create_classes(self->fd, DRM_NOVA_ENGINE_GRAPHICS, 1 << 7));
@@ -1295,7 +1304,72 @@ TEST_F(nova, exec_channels_left)
 	for (int i = 0; i < 4; i++) {
 		ASSERT_LE(0, nova_channel_create(self->fd, DRM_NOVA_ENGINE_GRAPHICS));
 		ASSERT_LE(0, nova_channel_create(self->fd, DRM_NOVA_ENGINE_COPY));
+		ASSERT_LE(0, nova_channel_create(self->fd, DRM_NOVA_ENGINE_VIDEO_DECODER));
 	}
+}
+
+TEST_F(nova, info_video_decoder)
+{
+	struct drm_nova_info_video_decoder dec = {};
+
+	ASSERT_EQ(sizeof(dec), nova_info(self->fd, DRM_NOVA_INFO_VIDEO_DECODER, &dec,
+					 sizeof(dec)));
+	TH_LOG("video decoder class %#x", dec.class_video_decoder);
+	EXPECT_NE(0, dec.class_video_decoder);
+	EXPECT_EQ(0, dec.pad);
+}
+
+/*
+ * The video decoder runs work of its own channels: it releases semaphores
+ * at the addresses userspace mapped, many times over the channel's life.
+ */
+TEST_F(nova, exec_video_decoder)
+{
+	struct drm_nova_info_video_decoder dec = {};
+	struct drm_nova_exec_push exec;
+	struct mapped_bo push, dst;
+	int channel;
+
+	ASSERT_EQ(sizeof(dec), nova_info(self->fd, DRM_NOVA_INFO_VIDEO_DECODER, &dec,
+					 sizeof(dec)));
+	ASSERT_EQ(0, nova_vm_init(self->fd, KERNEL_START, KERNEL_SIZE));
+	mapped_bo_create(_metadata, self->fd, &push, 4096, 0, PUSH_VA);
+	mapped_bo_create(_metadata, self->fd, &dst, 4096, 0, DST_VA);
+	channel = nova_channel_create(self->fd, DRM_NOVA_ENGINE_VIDEO_DECODER);
+	ASSERT_LE(0, channel);
+
+	for (__u32 i = 1; i <= 64; i++) {
+		__u32 *p = push.map;
+		__u64 va = DST_VA + (i % 1024) * 4;
+
+		*p++ = mthd(SUBC_VIDEO, NVC56F_SET_OBJECT, 1);
+		*p++ = dec.class_video_decoder;
+		/* Address upper and lower, payload, then the release. */
+		*p++ = mthd(SUBC_VIDEO, NVC7B0_SEMAPHORE_A, 3);
+		*p++ = va >> 32;
+		*p++ = va;
+		*p++ = 0xdec00000 | i;
+		*p++ = mthd(SUBC_VIDEO, NVC7B0_SEMAPHORE_D, 1);
+		*p++ = DECODER_RELEASE;
+		exec = (struct drm_nova_exec_push){
+			.va = PUSH_VA,
+			.range = (p - push.map) * 4,
+		};
+		ASSERT_EQ(0, nova_exec_wait(self->fd, channel, &exec, 1));
+		ASSERT_EQ(0xdec00000 | i, dst.map[i % 1024]);
+	}
+
+	EXPECT_EQ(0, nova_channel_destroy(self->fd, channel));
+	mapped_bo_destroy(self->fd, &push);
+	mapped_bo_destroy(self->fd, &dst);
+}
+
+/* Video decoder channels take no classes. */
+TEST_F(nova, exec_video_decoder_invalid)
+{
+	ASSERT_EQ(0, nova_vm_init(self->fd, KERNEL_START, KERNEL_SIZE));
+	EXPECT_EQ(-EINVAL, nova_channel_create_classes(self->fd, DRM_NOVA_ENGINE_VIDEO_DECODER,
+						       DRM_NOVA_CLASS_3D));
 }
 
 TEST_HARNESS_MAIN
