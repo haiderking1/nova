@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 
+use core::ops::RangeInclusive;
+
 use kernel::{
     prelude::*,
     transmute::{
@@ -82,6 +84,8 @@ pub(crate) enum RmControlMsgFunction {
     GpuGetFermiTpcInfo = bindings::NV2080_CTRL_CMD_GPU_GET_FERMI_TPC_INFO,
     /// Get the static information of the graphics engines.
     InternalStaticKgrGetInfo = bindings::NV2080_CTRL_CMD_INTERNAL_STATIC_KGR_GET_INFO,
+    /// Get the falcon engines GSP-RM constructed, and the sizes of their channels' contexts.
+    GpuGetConstructedFalconInfo = bindings::NV2080_CTRL_CMD_GPU_GET_CONSTRUCTED_FALCON_INFO,
 }
 
 // TODO[FPRI]: This is a temporary solution to be replaced with the corresponding derive macros
@@ -141,6 +145,9 @@ impl TryFrom<u32> for RmControlMsgFunction {
             bindings::NV2080_CTRL_CMD_GPU_GET_FERMI_TPC_INFO => Ok(Self::GpuGetFermiTpcInfo),
             bindings::NV2080_CTRL_CMD_INTERNAL_STATIC_KGR_GET_INFO => {
                 Ok(Self::InternalStaticKgrGetInfo)
+            }
+            bindings::NV2080_CTRL_CMD_GPU_GET_CONSTRUCTED_FALCON_INFO => {
+                Ok(Self::GpuGetConstructedFalconInfo)
             }
             _ => Err(EINVAL),
         }
@@ -228,6 +235,9 @@ pub(crate) enum RmObjectClass {
     ChannelGpfifoAmpere = bindings::AMPERE_CHANNEL_GPFIFO_A,
     /// A copy engine object of GA10x GPUs, child of a channel.
     CopyEngineAmpereB = bindings::AMPERE_DMA_COPY_B,
+    /// A video decoder object of GA10x GPUs, child of a channel on a video decoder engine
+    /// (NVDEC).
+    VideoDecoderAmpere = bindings::NVC7B0_VIDEO_DECODER,
     /// A 3D object of GA10x GPUs (but GA100), child of a channel on the graphics engine.
     ThreeDAmpereB = bindings::AMPERE_B,
     /// A compute object of GA10x GPUs (but GA100), child of a channel on the graphics engine.
@@ -1096,6 +1106,72 @@ impl CopyEngineAllocParams {
 // SAFETY: This struct only contains integer types, without padding.
 unsafe impl AsBytes for CopyEngineAllocParams {}
 
+/// Wrapper for [`bindings::NV_BSP_ALLOCATION_PARAMETERS`].
+#[repr(transparent)]
+pub(crate) struct VideoDecoderAllocParams(bindings::NV_BSP_ALLOCATION_PARAMETERS);
+
+impl VideoDecoderAllocParams {
+    /// Creates the parameters to allocate an object of video decoder engine `index`.
+    pub(crate) fn new(index: u32) -> Self {
+        Self(bindings::NV_BSP_ALLOCATION_PARAMETERS {
+            size: num::usize_into_u32::<{ size_of::<bindings::NV_BSP_ALLOCATION_PARAMETERS>() }>(),
+            prohibitMultipleInstances: 0,
+            engineInstance: index,
+        })
+    }
+}
+
+// SAFETY: This struct only contains integer types, without padding.
+unsafe impl AsBytes for VideoDecoderAllocParams {}
+
+/// Parameters of `NV2080_CTRL_CMD_GPU_GET_CONSTRUCTED_FALCON_INFO`: the engines run by a falcon
+/// that GSP-RM constructed, such as the video decoders, with the size of the context their
+/// channels need.
+#[repr(transparent)]
+pub(crate) struct ConstructedFalconInfoParams(
+    bindings::NV2080_CTRL_GPU_GET_CONSTRUCTED_FALCON_INFO_PARAMS,
+);
+
+impl ConstructedFalconInfoParams {
+    /// Creates the parameters, all filled in by GSP-RM.
+    pub(crate) fn new() -> Self {
+        Self(Default::default())
+    }
+
+    /// Returns the size of the context of the channels on each engine.
+    pub(crate) fn context_sizes(&self) -> Result<KVec<FalconContextSize>> {
+        let count = usize::try_from(self.0.numConstructedFalcons).unwrap_or(0);
+
+        let mut sizes = KVec::new();
+        for falcon in self.0.constructedFalconsTable.iter().take(count) {
+            sizes.push(
+                FalconContextSize {
+                    descriptor: falcon.engDesc,
+                    size: falcon.ctxBufferSize,
+                },
+                GFP_KERNEL,
+            )?;
+        }
+
+        Ok(sizes)
+    }
+}
+
+/// The size of the context of the channels on an engine run by a falcon.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FalconContextSize {
+    /// The engine, by its [`EngineInfo::descriptor`].
+    pub(crate) descriptor: u32,
+    /// Size in bytes.
+    pub(crate) size: u32,
+}
+
+// SAFETY: This struct only contains integer types for which all bit patterns are valid.
+unsafe impl FromBytes for ConstructedFalconInfoParams {}
+
+// SAFETY: This struct only contains integer types, without padding.
+unsafe impl AsBytes for ConstructedFalconInfoParams {}
+
 /// Wrapper for [`bindings::NVA06F_CTRL_BIND_PARAMS`].
 #[repr(transparent)]
 pub(crate) struct GpfifoBindParams(bindings::NVA06F_CTRL_BIND_PARAMS);
@@ -1167,12 +1243,22 @@ pub(crate) struct EngineInfo {
     pub(crate) engine_type: u32,
     /// The runlist the engine is on, which schedules the channels running on it.
     pub(crate) runlist: u32,
+    /// The engine descriptor GSP-RM names the engine with, such as in
+    /// [`ConstructedFalconInfoParams`].
+    pub(crate) descriptor: u32,
 }
 
 impl EngineInfo {
     /// Returns whether the engine is the graphics engine.
     pub(crate) fn is_graphics(&self) -> bool {
         self.engine_type == bindings::NV2080_ENGINE_TYPE_GRAPHICS
+    }
+
+    /// Returns the index of the engine if it's a video decoder engine (NVDEC).
+    pub(crate) fn video_decoder_index(&self) -> Option<u32> {
+        (bindings::NV2080_ENGINE_TYPE_NVDEC0..=bindings::NV2080_ENGINE_TYPE_NVDEC7)
+            .contains(&self.engine_type)
+            .then(|| self.engine_type - bindings::NV2080_ENGINE_TYPE_NVDEC0)
     }
 
     /// Returns the index of the engine if it's one of the first 10 copy engines, whose engine
@@ -1201,7 +1287,31 @@ impl DeviceInfoTableParams {
         })
     }
 
-    /// Returns the engines of the entries returned.
+    /// Returns the engine of type `rm_engine_type`, an `RM_ENGINE_TYPE` as the table names
+    /// engines, as an `NV2080_ENGINE_TYPE`, as channels and their contexts name them. `None` for
+    /// the engines nova-core doesn't run channels on.
+    ///
+    /// The two numberings only agree up to the copy engines (`RM_ENGINE_TYPE_NVDEC0` is 0x1d,
+    /// `NV2080_ENGINE_TYPE_NVDEC0` 0x13), like nouveau translates them
+    /// (`r535_fifo_xlat_rm_engine_type()`).
+    fn nv2080_engine_type(rm_engine_type: u32) -> Option<u32> {
+        const GRAPHICS: u32 = bindings::RM_ENGINE_TYPE_RM_ENGINE_TYPE_GR0;
+        const COPY: RangeInclusive<u32> = bindings::RM_ENGINE_TYPE_RM_ENGINE_TYPE_COPY0
+            ..=bindings::RM_ENGINE_TYPE_RM_ENGINE_TYPE_COPY9;
+        const VIDEO_DECODER: RangeInclusive<u32> = bindings::RM_ENGINE_TYPE_RM_ENGINE_TYPE_NVDEC0
+            ..=bindings::RM_ENGINE_TYPE_RM_ENGINE_TYPE_NVDEC7;
+
+        match rm_engine_type {
+            GRAPHICS => Some(bindings::NV2080_ENGINE_TYPE_GRAPHICS),
+            t if COPY.contains(&t) => Some(bindings::NV2080_ENGINE_TYPE_COPY0 + t - COPY.start()),
+            t if VIDEO_DECODER.contains(&t) => {
+                Some(bindings::NV2080_ENGINE_TYPE_NVDEC0 + t - VIDEO_DECODER.start())
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns the engines of the entries returned that nova-core runs channels on.
     pub(crate) fn engines(&self) -> impl Iterator<Item = EngineInfo> + '_ {
         let count = usize::try_from(self.0.numEntries).unwrap_or(0);
 
@@ -1211,8 +1321,11 @@ impl DeviceInfoTableParams {
             };
 
             Some(EngineInfo {
-                engine_type: data(bindings::ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_RM_ENGINE_TYPE)?,
+                engine_type: Self::nv2080_engine_type(data(
+                    bindings::ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_RM_ENGINE_TYPE,
+                )?)?,
                 runlist: data(bindings::ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_RUNLIST)?,
+                descriptor: data(bindings::ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_ENG_DESC)?,
             })
         })
     }
@@ -1238,8 +1351,8 @@ pub(crate) struct KernelIntrVectors {
     /// The display engine's stall vector, on which the CPU services its interrupts, such as
     /// those of head timing.
     pub(crate) display: Option<u32>,
-    /// The notification (non-stall) vectors of the graphics and copy engines, without duplicates,
-    /// which channels on them raise with `NON_STALL_INTERRUPT`.
+    /// The notification (non-stall) vectors of the graphics, copy and video decoder engines,
+    /// without duplicates, which channels on them raise with `NON_STALL_INTERRUPT`.
     pub(crate) notifications: KVec<u32>,
 }
 
@@ -1266,6 +1379,8 @@ impl IntrKernelTableParams {
             let engine = u32::from(entry.engineIdx);
             (bindings::MC_ENGINE_IDX_GR0..=bindings::MC_ENGINE_IDX_GR7).contains(&engine)
                 || (bindings::MC_ENGINE_IDX_CE0..=bindings::MC_ENGINE_IDX_CE16).contains(&engine)
+                || (bindings::MC_ENGINE_IDX_NVDEC0..=bindings::MC_ENGINE_IDX_NVDEC7)
+                    .contains(&engine)
         }) {
             let vector = entry.vectorNonStall;
             if vector != NV_INTR_VECTOR_INVALID && !notifications.contains(&vector) {
@@ -1822,6 +1937,30 @@ impl PromoteCtxParams {
             engineType: bindings::NV2080_ENGINE_TYPE_GRAPHICS,
             hChanClient: client,
             hObject: channel,
+            ..Default::default()
+        })
+    }
+
+    /// Creates the parameters to give GSP-RM the context of channel `chid`, `channel` of
+    /// `client`, on an engine run by a falcon such as a video decoder: the `size` bytes mapped at
+    /// `gpu_va` in the channel's address space. `engine_type` is the engine's `NV2080_ENGINE_TYPE`.
+    pub(crate) fn falcon(
+        engine_type: u32,
+        client: u32,
+        channel: u32,
+        chid: u32,
+        gpu_va: u64,
+        size: u64,
+    ) -> Self {
+        // As nouveau gives them (`r535_flcn_bind()`): the buffer as a whole, without entries.
+        Self(bindings::NV2080_CTRL_GPU_PROMOTE_CTX_PARAMS {
+            engineType: engine_type,
+            hClient: client,
+            ChID: chid,
+            hChanClient: client,
+            hObject: channel,
+            virtAddress: gpu_va,
+            size,
             ..Default::default()
         })
     }

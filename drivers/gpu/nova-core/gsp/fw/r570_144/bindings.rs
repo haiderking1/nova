@@ -54,6 +54,8 @@ pub const NV2080_CTRL_GPU_INITIALIZE_CTX_APERTURE_COH_SYS: u32 = 1;
 pub const NV2080_CTRL_GPU_INITIALIZE_CTX_GPU_CACHEABLE_NO: u32 = 1;
 pub const NV2080_CTRL_CMD_GPU_GET_FERMI_GPC_INFO: u32 = 545259831;
 pub const NV2080_CTRL_CMD_GPU_GET_FERMI_TPC_INFO: u32 = 545259832;
+pub const NV2080_CTRL_GPU_MAX_CONSTRUCTED_FALCONS: u32 = 64;
+pub const NV2080_CTRL_CMD_GPU_GET_CONSTRUCTED_FALCON_INFO: u32 = 545259952;
 pub const NV2080_CTRL_CMD_FIFO_GET_DEVICE_INFO_TABLE: u32 = 545263890;
 pub const NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_MAX_ENTRIES: u32 = 32;
 pub const NV0073_CTRL_CMD_SYSTEM_GET_NUM_HEADS: u32 = 7536898;
@@ -71,6 +73,8 @@ pub const NV2080_NOCAT_JOURNAL_REC_TYPE_ASSERT: u32 = 5;
 pub const NV2080_ENGINE_TYPE_GRAPHICS: u32 = 1;
 pub const NV2080_ENGINE_TYPE_COPY0: u32 = 9;
 pub const NV2080_ENGINE_TYPE_COPY9: u32 = 18;
+pub const NV2080_ENGINE_TYPE_NVDEC0: u32 = 19;
+pub const NV2080_ENGINE_TYPE_NVDEC7: u32 = 26;
 pub const NV20_SUBDEVICE_0: u32 = 8320;
 pub const NV01_ROOT: u32 = 0;
 pub const NV_VASPACE_ALLOCATION_INDEX_GPU_NEW: u32 = 0;
@@ -210,6 +214,7 @@ pub const NVC56F_GP_ENTRY1_LEVEL_MAIN: u32 = 0;
 pub const NVC56F_GP_ENTRY1_SYNC_WAIT: u32 = 1;
 pub const NVC56F_DMA_SEC_OP_INC_METHOD: u32 = 1;
 pub const AMPERE_DMA_COPY_B: u32 = 51125;
+pub const NVC7B0_VIDEO_DECODER: u32 = 51120;
 pub const NVC7B5_SET_SEMAPHORE_A: u32 = 576;
 pub const NVC7B5_SET_SEMAPHORE_B: u32 = 580;
 pub const NVC7B5_SET_SEMAPHORE_PAYLOAD: u32 = 584;
@@ -250,6 +255,8 @@ pub const NVC7C0_SET_REPORT_SEMAPHORE_D_STRUCTURE_SIZE_ONE_WORD: u32 = 1;
 pub const MC_ENGINE_IDX_DISP: u32 = 2;
 pub const MC_ENGINE_IDX_CE0: u32 = 15;
 pub const MC_ENGINE_IDX_CE16: u32 = 31;
+pub const MC_ENGINE_IDX_NVDEC0: u32 = 65;
+pub const MC_ENGINE_IDX_NVDEC7: u32 = 72;
 pub const MC_ENGINE_IDX_GR0: u32 = 84;
 pub const MC_ENGINE_IDX_GR7: u32 = 91;
 pub const NV5070_CTRL_CMD_SET_MEMPOOL_WAR_FOR_BLIT_TEARING: u32 = 1349517593;
@@ -810,6 +817,30 @@ pub struct NV2080_CTRL_GPU_GET_FERMI_GPC_INFO_PARAMS {
 pub struct NV2080_CTRL_GPU_GET_FERMI_TPC_INFO_PARAMS {
     pub gpcId: u32_,
     pub tpcMask: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV2080_CTRL_GPU_CONSTRUCTED_FALCON_INFO {
+    pub engDesc: u32_,
+    pub ctxAttr: u32_,
+    pub ctxBufferSize: u32_,
+    pub addrSpaceList: u32_,
+    pub registerBase: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone, MaybeZeroable)]
+pub struct NV2080_CTRL_GPU_GET_CONSTRUCTED_FALCON_INFO_PARAMS {
+    pub numConstructedFalcons: u32_,
+    pub constructedFalconsTable: [NV2080_CTRL_GPU_CONSTRUCTED_FALCON_INFO; 64usize],
+}
+impl Default for NV2080_CTRL_GPU_GET_CONSTRUCTED_FALCON_INFO_PARAMS {
+    fn default() -> Self {
+        let mut s = ::core::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::core::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone, MaybeZeroable)]
@@ -2010,6 +2041,13 @@ pub struct NVC0B5_ALLOCATION_PARAMETERS {
     pub version: u32_,
     pub engineType: u32_,
 }
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV_BSP_ALLOCATION_PARAMETERS {
+    pub size: u32_,
+    pub prohibitMultipleInstances: u32_,
+    pub engineInstance: u32_,
+}
 pub const ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_ENG_DESC: ENGINE_INFO_TYPE = 0;
 pub const ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_FIFO_TAG: ENGINE_INFO_TYPE = 1;
 pub const ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_RM_ENGINE_TYPE: ENGINE_INFO_TYPE = 2;
@@ -2030,6 +2068,12 @@ pub const ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_INVALID: ENGINE_INFO_TYPE = 15;
 pub const ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_ENGINE_DATA_ARRAY_SIZE: ENGINE_INFO_TYPE = 15;
 pub const ENGINE_INFO_TYPE_ENGINE_INFO_TYPE_PBDMA_ID: ENGINE_INFO_TYPE = 16;
 pub type ENGINE_INFO_TYPE = ffi::c_uint;
+pub const RM_ENGINE_TYPE_RM_ENGINE_TYPE_GR0: RM_ENGINE_TYPE = 1;
+pub const RM_ENGINE_TYPE_RM_ENGINE_TYPE_COPY0: RM_ENGINE_TYPE = 9;
+pub const RM_ENGINE_TYPE_RM_ENGINE_TYPE_COPY9: RM_ENGINE_TYPE = 18;
+pub const RM_ENGINE_TYPE_RM_ENGINE_TYPE_NVDEC0: RM_ENGINE_TYPE = 29;
+pub const RM_ENGINE_TYPE_RM_ENGINE_TYPE_NVDEC7: RM_ENGINE_TYPE = 36;
+pub type RM_ENGINE_TYPE = ffi::c_uint;
 pub const GMMU_APERTURE_GMMU_APERTURE_INVALID: GMMU_APERTURE = 0;
 pub const GMMU_APERTURE_GMMU_APERTURE_VIDEO: GMMU_APERTURE = 1;
 pub const GMMU_APERTURE_GMMU_APERTURE_PEER: GMMU_APERTURE = 2;

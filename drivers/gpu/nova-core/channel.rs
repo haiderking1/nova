@@ -14,6 +14,7 @@ pub(crate) mod gpfifo;
 pub(crate) mod gr;
 pub(crate) mod hal;
 pub(crate) mod vaspace;
+pub(crate) mod video;
 
 // IDs of Nova's channels. GSP-RM keeps channel ID 0 for itself.
 

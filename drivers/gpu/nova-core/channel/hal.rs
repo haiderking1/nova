@@ -126,6 +126,8 @@ pub struct Classes {
     pub inline_to_memory: u32,
     /// The compute engine, on channels on the graphics engine.
     pub compute: u32,
+    /// The video decoder engines (NVDEC).
+    pub video_decoder: u32,
 }
 
 pub(crate) trait ChannelHal: Sync {
@@ -168,6 +170,19 @@ pub(crate) trait ChannelHal: Sync {
 
     /// Allocates the object `handle` of copy engine `index` on `channel`, which runs on it.
     fn alloc_copy(
+        &self,
+        dev: &device::Device,
+        cmdq: &Cmdq<'_>,
+        channel: &mut Channel<'_>,
+        handle: u32,
+        index: u32,
+    ) -> Result;
+
+    // The video decoder engines.
+
+    /// Allocates the object `handle` of video decoder engine `index` on `channel`, which runs on
+    /// it.
+    fn alloc_video_decoder(
         &self,
         dev: &device::Device,
         cmdq: &Cmdq<'_>,

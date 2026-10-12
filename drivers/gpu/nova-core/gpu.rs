@@ -65,6 +65,7 @@ use crate::{
             GraphicsInfo, //
         },
         hal::PitchCopy,
+        video::VideoDecoderInfo,
     },
     display::mode::HeadRaster,
     display::{
@@ -1792,6 +1793,26 @@ impl<'gpu> Gpu<'gpu> {
     /// Fails with `ENODEV` if the graphics engine isn't set up.
     pub(crate) fn graphics_info(&self) -> Result<GraphicsInfo> {
         self.gr.as_ref().map(|gr| *gr.info()).ok_or(ENODEV)
+    }
+
+    /// Returns what userspace drivers need to know of the video decoder engines (NVDEC).
+    ///
+    /// Fails with `ENODEV` if the GPU has none, and with `ENOTSUPP` if nova-core doesn't support
+    /// the channels of its family.
+    pub(crate) fn video_decoder_info(&self) -> Result<VideoDecoderInfo> {
+        let gsp_resources = &self.gsp_resources;
+        let rm = self.rm.as_ref().ok_or(ENODEV)?;
+        let hal = channel::hal::channel_hal(self.spec.chipset).ok_or(ENOTSUPP)?;
+
+        channel::video::find_engine(&channel::engines(
+            gsp_resources.device.as_ref(),
+            &gsp_resources.gsp.cmdq,
+            rm,
+        )?)?;
+
+        Ok(VideoDecoderInfo {
+            class: hal.classes().video_decoder,
+        })
     }
 
     /// Allocates a buffer of at least `size` bytes of VRAM, zeroed by the copy engine, with a

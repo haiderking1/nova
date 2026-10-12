@@ -36,7 +36,8 @@ pub use crate::{
     },
     channel::{
         gr::GraphicsInfo,
-        hal::Classes, //
+        hal::Classes,
+        video::VideoDecoderInfo, //
     },
     display::{
         DisplayCopy,
@@ -335,6 +336,13 @@ impl NovaCoreApi<'_> {
     /// Fails with `ENODEV` if the graphics engine isn't set up.
     pub fn graphics_info(&self) -> Result<GraphicsInfo> {
         self.gpu.graphics_info()
+    }
+
+    /// Returns what userspace drivers need to know of the video decoder engines (NVDEC).
+    ///
+    /// Fails with `ENODEV` if the GPU has none.
+    pub fn video_decoder_info(&self) -> Result<VideoDecoderInfo> {
+        self.gpu.video_decoder_info()
     }
 
     /// Allocates a buffer of at least `size` bytes of VRAM, zeroed, with a window in BAR1 for the

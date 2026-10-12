@@ -109,6 +109,12 @@ pub(crate) struct Channel;
 /// channel.
 pub(crate) struct CopyEngine;
 
+/// Marker type for the GSP-RM handle of a video decoder object.
+///
+/// A video decoder object, a child of a channel on a video decoder engine (NVDEC), makes the
+/// decoder's methods available on the channel.
+pub(crate) struct VideoDecoder;
+
 /// Marker type for the GSP-RM handle of an object of a class of the graphics engine.
 ///
 /// Such an object, a child of a channel on the graphics engine, makes the class's methods available

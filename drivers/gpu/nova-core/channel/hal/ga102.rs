@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
 
 //! Channels of GA10x GPUs (but GA100): GPFIFO channels of class `AMPERE_CHANNEL_GPFIFO_A`, copy
-//! engines of class `AMPERE_DMA_COPY_B`, and a graphics engine of classes `AMPERE_B` and
-//! `AMPERE_COMPUTE_B`, running SM 8.6 shaders.
+//! engines of class `AMPERE_DMA_COPY_B`, a graphics engine of classes `AMPERE_B` and
+//! `AMPERE_COMPUTE_B`, running SM 8.6 shaders, and video decoder engines of class
+//! `NVC7B0_VIDEO_DECODER`.
 
 use kernel::{
     device,
@@ -34,6 +35,7 @@ use crate::{
             AllocInlineToMemoryKeplerB,
             AllocThreeDAmpereB,
             AllocTwoDFermiA,
+            AllocVideoDecoderAmpere,
             RmAlloc, //
         },
         EngineInfo, RmObjectClass,
@@ -75,6 +77,7 @@ impl ChannelHal for Ga102 {
             three_d: RmObjectClass::ThreeDAmpereB.into(),
             inline_to_memory: RmObjectClass::InlineToMemoryKeplerB.into(),
             compute: RmObjectClass::ComputeAmpereB.into(),
+            video_decoder: RmObjectClass::VideoDecoderAmpere.into(),
         }
     }
 
@@ -186,6 +189,19 @@ impl ChannelHal for Ga102 {
     ) -> Result {
         channel
             .alloc_object(dev, cmdq, handle, AllocCopyEngineAmpereB::new(index))
+            .map(|_| ())
+    }
+
+    fn alloc_video_decoder(
+        &self,
+        dev: &device::Device,
+        cmdq: &Cmdq<'_>,
+        channel: &mut Channel<'_>,
+        handle: u32,
+        index: u32,
+    ) -> Result {
+        channel
+            .alloc_object(dev, cmdq, handle, AllocVideoDecoderAmpere::new(index))
             .map(|_| ())
     }
 

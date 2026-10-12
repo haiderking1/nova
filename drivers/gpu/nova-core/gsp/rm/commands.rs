@@ -39,7 +39,8 @@ use crate::{
             GraphicsObject,
             Handle,
             Subdevice,
-            VaSpace, //
+            VaSpace,
+            VideoDecoder, //
         },
         fw::{
             rm::*,
@@ -763,6 +764,27 @@ impl RmAllocCommand for AllocCopyEngineAmpereB {
     }
 }
 
+/// Allocation of an object of a GA10x video decoder engine (NVDEC) on a channel bound to it.
+pub(crate) struct AllocVideoDecoderAmpere(VideoDecoderAllocParams);
+
+impl AllocVideoDecoderAmpere {
+    /// Creates the command for video decoder engine `index`.
+    pub(crate) fn new(index: u32) -> Self {
+        Self(VideoDecoderAllocParams::new(index))
+    }
+}
+
+impl RmAllocCommand for AllocVideoDecoderAmpere {
+    const CLASS: RmObjectClass = RmObjectClass::VideoDecoderAmpere;
+    type Parent = Channel;
+    type Object = VideoDecoder;
+    type Params = VideoDecoderAllocParams;
+
+    fn params(&self) -> &Self::Params {
+        &self.0
+    }
+}
+
 /// RM control command making a page directory in VRAM the root of the page tables of an address
 /// space whose page tables the client owns, sent to the address space's device.
 pub(crate) struct DmaSetPageDirectory(SetPageDirectoryParams);
@@ -1122,8 +1144,8 @@ rm_control!(
     }
 );
 
-/// RM control command giving the graphics context buffers of a channel to GSP-RM, sent to the
-/// subdevice of the channel's client.
+/// RM control command giving the context buffers of a channel to GSP-RM, sent to the subdevice of
+/// the channel's client.
 pub(crate) struct GpuPromoteCtx(PromoteCtxParams);
 
 impl GpuPromoteCtx {
@@ -1132,6 +1154,27 @@ impl GpuPromoteCtx {
         Self(PromoteCtxParams::graphics(
             client.as_raw(),
             channel.as_raw(),
+        ))
+    }
+
+    /// Creates the command giving GSP-RM the context of `channel` of `client`, channel `chid`, on
+    /// the falcon engine of type `engine_type`, such as a video decoder: `size` bytes mapped at
+    /// `gpu_va` in the channel's address space.
+    pub(crate) fn falcon(
+        engine_type: u32,
+        client: Handle<Client>,
+        channel: Handle<Channel>,
+        chid: u32,
+        gpu_va: u64,
+        size: u64,
+    ) -> Self {
+        Self(PromoteCtxParams::falcon(
+            engine_type,
+            client.as_raw(),
+            channel.as_raw(),
+            chid,
+            gpu_va,
+            size,
         ))
     }
 
@@ -1231,6 +1274,26 @@ rm_control!(
     TpcInfoParams,
     u32,
     |p| p.tpc_mask()
+);
+
+/// RM control command querying the engines run by a falcon that GSP-RM constructed, such as the
+/// video decoders, and the size of their channels' contexts, sent to a subdevice.
+pub(crate) struct GpuGetConstructedFalconInfo(ConstructedFalconInfoParams);
+
+impl GpuGetConstructedFalconInfo {
+    /// Creates the command.
+    pub(crate) fn new() -> Self {
+        Self(ConstructedFalconInfoParams::new())
+    }
+}
+
+rm_control!(
+    GpuGetConstructedFalconInfo,
+    Subdevice,
+    GpuGetConstructedFalconInfo,
+    ConstructedFalconInfoParams,
+    KVec<FalconContextSize>,
+    |p| p.context_sizes()?
 );
 
 /// RM control command querying the static information of the graphics engines, sent to GSP-RM's
