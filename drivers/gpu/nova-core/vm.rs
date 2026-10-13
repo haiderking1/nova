@@ -167,7 +167,15 @@ impl ClientVm {
             runs.pages().sub(pages).ok_or(EINVAL)?,
             memory,
             access,
-        )
+        )?;
+        pr_debug!(
+            "address space {}: mapped {:#x}..{:#x}\n",
+            self.id,
+            addr,
+            addr + size
+        );
+
+        Ok(())
     }
 
     /// Tears down the `size` bytes mapped from the virtual address `addr`, which must be page
@@ -179,7 +187,15 @@ impl ClientVm {
         }
 
         self.space
-            .unmap_at(mm, addr, usize::try_from(size / page_size)?)
+            .unmap_at(mm, addr, usize::try_from(size / page_size)?)?;
+        pr_debug!(
+            "address space {}: unmapped {:#x}..{:#x}\n",
+            self.id,
+            addr,
+            addr + size
+        );
+
+        Ok(())
     }
 
     /// Releases the address space from GSP-RM, then its RM client, and frees its page tables.
