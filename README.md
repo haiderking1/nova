@@ -1,4 +1,4 @@
-# nova, soka's fork
+# nova, haider's fork
 
 An experimental fork of **nova**, the Rust kernel driver for NVIDIA GPUs
 (`nova-core` + `nova-drm`, from
