@@ -30,9 +30,11 @@ pub use crate::{
     },
     channel::client::{
         ChannelEngine,
+        GpuWait,
         GraphicsObjects,
         PushBuffer,
-        PUSH_MAX, //
+        PUSH_MAX,
+        WAITS_MAX, //
     },
     channel::{
         gr::GraphicsInfo,
@@ -47,7 +49,10 @@ pub use crate::{
         ScanoutMode,
         VblankHandler, //
     },
-    gpu::Spec,
+    gpu::{
+        FenceWait,
+        Spec, //
+    },
     gsp::{
         ConnectorType,
         DpLinkConfig,
@@ -408,13 +413,28 @@ impl NovaCoreApi<'_> {
     }
 
     /// Has the channel `chid` run the push buffers `pushes`, in order, after the work submitted
-    /// before, and returns the fence that signals once they are done.
+    /// before and once the fences of `waits` signaled, and returns the fence that signals once
+    /// they are done.
     ///
-    /// Waits for room on the channel, as the work submitted before completes. Fails with
-    /// `ETIMEDOUT` if that work makes no progress in time, and with `ENODEV` once the channel runs
-    /// no more work, such as after that.
-    pub fn channel_exec(&self, chid: u32, pushes: &[PushBuffer]) -> Result<ARef<Fence>> {
-        self.gpu.channel_exec(chid, pushes)
+    /// The channel waits for `waits`, at most [`WAITS_MAX`], on the GPU: they come from
+    /// [`NovaCoreApi::channel_wait`]. Waits for room on the channel, as the work submitted before
+    /// completes. Fails with `ETIMEDOUT` if that work makes no progress in time, and with
+    /// `ENODEV` once the channel runs no more work, such as after that.
+    pub fn channel_exec(
+        &self,
+        chid: u32,
+        waits: &[GpuWait],
+        pushes: &[PushBuffer],
+    ) -> Result<ARef<Fence>> {
+        self.gpu.channel_exec(chid, waits, pushes)
+    }
+
+    /// Returns how the channel `chid`, which runs in `vm`, waits for `fence` before running a
+    /// submission: on the GPU, rather than the CPU, if `fence` is of another channel's work. A
+    /// fence in a container, such as a timeline point, is waited for as its fences are, see
+    /// [`Fence::for_each_unwrapped`].
+    pub fn channel_wait(&self, vm: &mut ClientVm, chid: u32, fence: &Fence) -> Result<FenceWait> {
+        self.gpu.channel_wait(vm, chid, fence)
     }
 
     /// Returns the fence of the last work submitted to the channel `chid` that is not done yet, if

@@ -129,11 +129,25 @@ pub(super) const GPFIFO_ENTRIES: u32 = 1024;
 /// Offset of the semaphore the channel releases.
 const SEMAPHORE: usize = GPFIFO + num::u32_as_usize(GPFIFO_ENTRIES) * size_of::<GpEntry>();
 static_assert!(SEMAPHORE + size_of::<u32>() <= CONTROL_SIZE);
-/// Size of a slot of the push buffer, which [`Channel::submit_queued`] writes the tail of a
-/// submission to, while earlier ones may still run from other slots.
-pub(super) const TAIL_SLOT_SIZE: usize = 0x100;
+/// Size of a slot of the push buffer, which [`Channel::submit_queued`] writes the head and the
+/// tail of a submission to, while earlier ones may still run from other slots.
+pub(super) const TAIL_SLOT_SIZE: usize = 0x200;
 /// Number of slots of the push buffer.
 pub(super) const TAIL_SLOTS: usize = PUSH_BUFFER_SIZE / TAIL_SLOT_SIZE;
+/// Size of the head of a slot, which comes first in it, the tail taking the rest.
+pub(super) const HEAD_SIZE: usize = 0x100;
+static_assert!(HEAD_SIZE < TAIL_SLOT_SIZE);
+
+/// Where a submission's own methods go in the kernel's push buffer: those run before the push
+/// buffers submitted, and those after.
+struct Methods<'a> {
+    head: &'a [u32],
+    head_offset: usize,
+    tail: &'a [u32],
+    tail_offset: usize,
+    /// The room for the tail, in bytes.
+    tail_room: usize,
+}
 
 /// How long work may take: much longer than any fill of a framebuffer.
 const TIMEOUT: Delta = Delta::from_secs(1);
@@ -564,7 +578,18 @@ impl<'a> Channel<'a> {
             return Err(EINVAL);
         }
 
-        self.submit_at(bar, mm, entries, tail, PUSH_BUFFER, PUSH_BUFFER_SIZE)
+        self.submit_at(
+            bar,
+            mm,
+            entries,
+            Methods {
+                head: &[],
+                head_offset: PUSH_BUFFER,
+                tail,
+                tail_offset: PUSH_BUFFER,
+                tail_room: PUSH_BUFFER_SIZE,
+            },
+        )
     }
 
     /// Has the channel run the push buffers of `entries`, then the methods of `tail`, from slot
@@ -577,50 +602,63 @@ impl<'a> Channel<'a> {
         &mut self,
         bar: Bar0<'_>,
         mm: &mut impl MmAccess,
+        head: &[u32],
         entries: &[GpEntry],
         tail: &[u32],
         slot: usize,
     ) -> Result {
-        if slot >= TAIL_SLOTS {
+        if slot >= TAIL_SLOTS || size_of_val(head) > HEAD_SIZE {
             return Err(EINVAL);
         }
 
+        let slot_offset = PUSH_BUFFER + slot * TAIL_SLOT_SIZE;
         self.submit_at(
             bar,
             mm,
             entries,
-            tail,
-            PUSH_BUFFER + slot * TAIL_SLOT_SIZE,
-            TAIL_SLOT_SIZE,
+            Methods {
+                head,
+                head_offset: slot_offset,
+                tail,
+                tail_offset: slot_offset + HEAD_SIZE,
+                tail_room: TAIL_SLOT_SIZE - HEAD_SIZE,
+            },
         )
     }
 
-    /// Does [`Channel::submit`] with the tail at offset `tail_offset` of the control memory, in
-    /// `tail_room` bytes.
+    /// Has the channel run the methods of `methods.head`, the push buffers of `entries`, then the
+    /// methods of `methods.tail`, writing the methods to the kernel's push buffer where `methods`
+    /// says, and returns without waiting for them.
     fn submit_at(
         &mut self,
         bar: Bar0<'_>,
         mm: &mut impl MmAccess,
         entries: &[GpEntry],
-        tail: &[u32],
-        tail_offset: usize,
-        tail_room: usize,
+        methods: Methods<'_>,
     ) -> Result {
         let control_va = self.control_va()?;
-        let count = entries.len() + usize::from(!tail.is_empty());
+        let Methods {
+            head,
+            head_offset,
+            tail,
+            tail_offset,
+            tail_room,
+        } = methods;
+        let count = usize::from(!head.is_empty()) + entries.len() + usize::from(!tail.is_empty());
         if count >= num::u32_as_usize(GPFIFO_ENTRIES) || size_of_val(tail) > tail_room {
             return Err(EINVAL);
         }
         let mut ring = KVec::with_capacity(count, GFP_KERNEL)?;
+        if !head.is_empty() {
+            ring.push(
+                self.write_methods(control_va, head_offset, head)?,
+                GFP_KERNEL,
+            )?;
+        }
         ring.extend_from_slice(entries, GFP_KERNEL)?;
         if !tail.is_empty() {
-            self.write_control(tail_offset, tail.as_bytes())?;
             ring.push(
-                self.hal.gp_entry(
-                    control_va + num::usize_as_u64(tail_offset),
-                    u32::try_from(tail.len())?,
-                    false,
-                )?,
+                self.write_methods(control_va, tail_offset, tail)?,
                 GFP_KERNEL,
             )?;
         }
@@ -639,6 +677,17 @@ impl<'a> Channel<'a> {
 
         // PRAMIN and the doorbell are both in BAR0: the channel sees `GPPut` when told to look.
         self.hal.ring_doorbell(bar, &self.engine, self.chid)
+    }
+
+    /// Writes `methods` at `offset` of the control memory, whose GPU virtual address is
+    /// `control_va`, and returns the GPFIFO entry running them.
+    fn write_methods(&self, control_va: u64, offset: usize, methods: &[u32]) -> Result<GpEntry> {
+        self.write_control(offset, methods.as_bytes())?;
+        self.hal.gp_entry(
+            control_va + num::usize_as_u64(offset),
+            u32::try_from(methods.len())?,
+            false,
+        )
     }
 
     /// Writes `bytes` at `offset` of the control memory.

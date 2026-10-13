@@ -82,6 +82,34 @@ pub(crate) mod host_c56f {
         ])
     }
 
+    /// Returns the methods holding the methods after them until the 32-bit semaphore at GPU
+    /// virtual address `addr`, 4-byte aligned, reaches `payload`, counting up and wrapping
+    /// around: until its value minus `payload` is non-negative as a signed 32-bit number. The
+    /// channel gives its timeslice to the other channels meanwhile.
+    pub(crate) fn semaphore_acquire(addr: u64, payload: u32) -> Result<[u32; 6]> {
+        // `NVC56F_SEM_ADDR_LO_OFFSET` is bits 31:2, `NVC56F_SEM_ADDR_HI_OFFSET` bits 7:0.
+        if addr % 4 != 0 || addr >> 40 != 0 {
+            return Err(EINVAL);
+        }
+
+        // CAST: the low 32 bits and the 8 bits above are set separately, checked above to be all
+        // there is.
+        Ok([
+            // Any subchannel runs the channel's own methods.
+            methods(0, bindings::NVC56F_SEM_ADDR_LO, 5)?,
+            addr as u32,
+            (addr >> 32) as u32,
+            payload,
+            // `NVC56F_SEM_PAYLOAD_HI`, unused by 32-bit semaphores.
+            0,
+            // `NVC56F_SEM_EXECUTE`: operation in bits 2:0, `ACQUIRE_SWITCH_TSG` bit 12,
+            // `PAYLOAD_SIZE` bit 24.
+            bindings::NVC56F_SEM_EXECUTE_OPERATION_ACQ_CIRC_GEQ
+                | bindings::NVC56F_SEM_EXECUTE_ACQUIRE_SWITCH_TSG_EN << 12
+                | bindings::NVC56F_SEM_EXECUTE_PAYLOAD_SIZE_32BIT << 24,
+        ])
+    }
+
     /// Returns the methods raising the non-stall interrupt of the channel's engine, on the
     /// vector GSP-RM programmed for it, once the methods before are processed.
     pub(crate) fn non_stall_interrupt() -> Result<[u32; 2]> {
@@ -181,11 +209,11 @@ pub(crate) mod copy_c7b5 {
     /// [`LAUNCH_DMA`] copying pitch-linear lines of bytes, with the transfer flushed, like
     /// [`LAUNCH_FILL`] without remapping.
     pub(crate) const LAUNCH_COPY: u32 = bindings::NVC7B5_LAUNCH_DMA_DATA_TRANSFER_TYPE_NON_PIPELINED
-            | bindings::NVC7B5_LAUNCH_DMA_FLUSH_ENABLE_TRUE << 2
-            | bindings::NVC7B5_LAUNCH_DMA_SRC_MEMORY_LAYOUT_PITCH << 7
-            | bindings::NVC7B5_LAUNCH_DMA_DST_MEMORY_LAYOUT_PITCH << 8
-            | bindings::NVC7B5_LAUNCH_DMA_MULTI_LINE_ENABLE_TRUE << 9
-            | bindings::NVC7B5_LAUNCH_DMA_DISABLE_PLC_TRUE << 26;
+        | bindings::NVC7B5_LAUNCH_DMA_FLUSH_ENABLE_TRUE << 2
+        | bindings::NVC7B5_LAUNCH_DMA_SRC_MEMORY_LAYOUT_PITCH << 7
+        | bindings::NVC7B5_LAUNCH_DMA_DST_MEMORY_LAYOUT_PITCH << 8
+        | bindings::NVC7B5_LAUNCH_DMA_MULTI_LINE_ENABLE_TRUE << 9
+        | bindings::NVC7B5_LAUNCH_DMA_DISABLE_PLC_TRUE << 26;
 }
 
 /// Methods of the GA10x compute class (`AMPERE_COMPUTE_B`, `clc7c0.h`), and its work descriptors.

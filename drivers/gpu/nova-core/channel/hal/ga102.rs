@@ -45,6 +45,7 @@ use crate::{
 
 use super::{
     super::gpfifo::Channel,
+    Acquire,
     ChannelHal,
     Classes,
     CopyDst,
@@ -154,6 +155,15 @@ impl ChannelHal for Ga102 {
         push.extend_from_slice(&host_c56f::wait_idle_and_flush()?, GFP_KERNEL)?;
         push.extend_from_slice(
             &host_c56f::semaphore_release(release.addr, release.payload)?,
+            GFP_KERNEL,
+        )?;
+
+        Ok(())
+    }
+
+    fn push_acquire(&self, push: &mut KVec<u32>, acquire: Acquire) -> Result {
+        push.extend_from_slice(
+            &host_c56f::semaphore_acquire(acquire.addr, acquire.payload)?,
             GFP_KERNEL,
         )?;
 

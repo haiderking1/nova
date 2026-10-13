@@ -7,9 +7,12 @@ use crate::driver::{
 };
 use nova_core::api::{
     ChannelEngine,
+    FenceWait,
+    GpuWait,
     GraphicsObjects,
     PushBuffer,
-    PUSH_MAX, //
+    PUSH_MAX,
+    WAITS_MAX, //
 };
 
 use crate::{
@@ -551,11 +554,16 @@ impl File {
 
         // Everything that may fail but waiting and the submission is done first, so that once the
         // work is submitted, its fence can be given to every synchronization object to signal.
+        // The fences waited for are those in the timeline points and other containers given.
         let mut waits = KVVec::with_capacity(usize::try_from(req.wait_count)?, GFP_KERNEL)?;
         for sync in read_syncs(req.wait_ptr, req.wait_count)?.iter() {
-            waits.push(
-                SyncObj::find_fence(file, sync.0.handle, sync.point()?)?,
-                GFP_KERNEL,
+            SyncObj::find_fence(file, sync.0.handle, sync.point()?)?.for_each_unwrapped(
+                |fence| {
+                    if !fence.is_signaled() {
+                        waits.push(ARef::from(fence), GFP_KERNEL)?;
+                    }
+                    Ok(())
+                },
             )?;
         }
         let mut signals = KVVec::with_capacity(usize::try_from(req.sig_count)?, GFP_KERNEL)?;
@@ -573,21 +581,47 @@ impl File {
             )?;
         }
 
-        // TODO: have the channel wait for them, rather than the submitter, once there is a
-        // scheduler to hold the work until they signal.
-        for fence in waits.iter() {
+        // The channel waits on the GPU for the fences of other channels' work, without holding
+        // up the submitter, and the submitter for the others.
+        let mut gpu_waits: KVVec<GpuWait> = KVVec::with_capacity(WAITS_MAX, GFP_KERNEL)?;
+        let mut cpu_waits = KVVec::new();
+        {
+            let inner = file.inner();
+            let mut vm = inner.vm.lock();
+            let vm = Option::as_mut(&mut *vm).ok_or(ENOENT)?;
+            reg_data.api.with(|api| -> Result {
+                for fence in waits.drain_all() {
+                    match vm.channel_wait(&api, req.channel, &fence)? {
+                        FenceWait::None => {}
+                        FenceWait::Gpu(wait) => {
+                            if gpu_waits.iter_mut().any(|other| other.merge(&wait)) {
+                                continue;
+                            }
+                            if gpu_waits.push_within_capacity(wait).is_err() {
+                                cpu_waits.push(fence, GFP_KERNEL)?;
+                            }
+                        }
+                        FenceWait::Cpu => cpu_waits.push(fence, GFP_KERNEL)?,
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        for fence in cpu_waits.iter() {
             fence.wait(true)?;
             fence.status()?;
         }
 
-        // Without push buffers, the objects to signal get the fence of the work submitted before.
+        // Without push buffers, the objects to signal get the fence of the work submitted before,
+        // once the fences waited for on the GPU signaled too: then without waiting for them, the
+        // submitter got nothing to run.
         let fence = reg_data.api.with(|api| {
-            if pushes.is_empty() {
+            if pushes.is_empty() && gpu_waits.is_empty() {
                 Ok(api
                     .channel_last_fence(req.channel)?
                     .unwrap_or_else(Fence::stub))
             } else {
-                api.channel_exec(req.channel, &pushes)
+                api.channel_exec(req.channel, &gpu_waits, &pushes)
             }
         })?;
         for signal in signals.drain_all() {

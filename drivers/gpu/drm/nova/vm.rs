@@ -10,6 +10,7 @@
 use core::ops::Range;
 
 use kernel::{
+    dma_buf::Fence,
     drm::gem::BaseObject,
     drm::gpuvm::{
         DriverGpuVm,
@@ -32,6 +33,7 @@ use nova_core::api::{
     BufferRef,
     ChannelEngine,
     ClientVm,
+    FenceWait,
     NovaCoreApi,
     VA_SIZE, //
 };
@@ -354,5 +356,16 @@ impl Vm {
     /// Returns whether the channel `chid` runs in the address space.
     pub(crate) fn has_channel(&self, chid: u32) -> bool {
         self.channels.contains(&chid)
+    }
+
+    /// Returns how the channel `chid`, running in the address space, waits for `fence` before
+    /// running a submission, see [`NovaCoreApi::channel_wait`].
+    pub(crate) fn channel_wait(
+        &mut self,
+        api: &NovaCoreApi<'_>,
+        chid: u32,
+        fence: &Fence,
+    ) -> Result<FenceWait> {
+        api.channel_wait(self.gpuvm.data().vm()?, chid, fence)
     }
 }

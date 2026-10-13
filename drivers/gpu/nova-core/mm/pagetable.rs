@@ -121,6 +121,13 @@ impl Access {
         privileged: false,
         kind: kind::PITCH,
     };
+
+    /// Read access, for everyone, to pitch-linear memory.
+    pub(crate) const READ_ONLY: Self = Self {
+        writable: false,
+        privileged: false,
+        kind: kind::PITCH,
+    };
 }
 
 /// PTE kinds: how the memory a PTE maps is laid out, such as pitch-linear, block-linear, or as

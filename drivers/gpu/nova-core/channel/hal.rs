@@ -88,6 +88,15 @@ pub(crate) struct Release {
     pub(crate) payload: u32,
 }
 
+/// A semaphore acquire: the methods after it held until the 32-bit word at GPU virtual address
+/// `addr`, 4-byte aligned, reaches `payload`, as released by a channel counting up (and wrapping
+/// around).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Acquire {
+    pub(crate) addr: u64,
+    pub(crate) payload: u32,
+}
+
 /// A copy of `lines` lines of `line_bytes` bytes, the first from GPU virtual address `src` to VRAM
 /// address `dst`, which the copy engine writes without a mapping, the next ones `src_pitch` and
 /// `dst_pitch` bytes further.
@@ -158,6 +167,10 @@ pub(crate) trait ChannelHal: Sync {
 
     /// Appends to `push` the methods doing `release` once the channel's engine is idle.
     fn push_release(&self, push: &mut KVec<u32>, release: Release) -> Result;
+
+    /// Appends to `push` the methods doing `acquire`, during which the channel lets the other
+    /// channels run.
+    fn push_acquire(&self, push: &mut KVec<u32>, acquire: Acquire) -> Result;
 
     /// Appends to `push` the methods raising the non-stall interrupt of the channel's engine, once
     /// the methods before are processed: after a release, to tell the CPU it happened.

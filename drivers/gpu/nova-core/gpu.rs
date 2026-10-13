@@ -58,11 +58,13 @@ use crate::{
         client::{
             ChannelEngine,
             ClientChannel,
+            GpuWait,
             PushBuffer, //
         },
         copy::CopyChannel,
         fence::{
             FenceContexts,
+            Timeline,
             Timelines,
             Watchdog, //
         },
@@ -70,7 +72,10 @@ use crate::{
             GrContext,
             GraphicsInfo, //
         },
-        hal::PitchCopy,
+        hal::{
+            Acquire,
+            PitchCopy, //
+        },
         video::VideoDecoderInfo,
     },
     display::mode::HeadRaster,
@@ -144,8 +149,14 @@ use crate::{
     },
     mm::{
         bar_user::BarUser,
-        pagetable::MmuVersion,
-        vmm::Memory,
+        pagetable::{
+            Access,
+            MmuVersion, //
+        },
+        vmm::{
+            MappedRange,
+            Memory, //
+        },
         GpuMm,
         Pfn,
         VramAddress,
@@ -505,6 +516,27 @@ impl<'a> GspSubtree<'a> {
 /// A channel of a client, until it is freed.
 type ClientChannelRef<'gpu> = Arc<Mutex<Option<ClientChannel<'gpu>>>>;
 
+/// How a client channel waits for a fence before running a submission, see
+/// [`Gpu::channel_wait`].
+pub enum FenceWait {
+    /// It needn't wait: the fence signaled, or is of the channel's own earlier work.
+    None,
+    /// On the GPU, for another client channel's work.
+    Gpu(GpuWait),
+    /// The CPU waits before submitting: the fence isn't one of a channel's work on the GPU.
+    Cpu,
+}
+
+/// The semaphore of a client channel's timeline, mapped read-only into the address space of
+/// another client, whose channels wait for its fences on the GPU, see [`Gpu::channel_wait`].
+struct PeerSemaphore<'a> {
+    /// The ID of the address space, see [`ClientVm::id`].
+    vm: usize,
+    /// Kept for as long as its semaphore is mapped.
+    timeline: Arc<Timeline<'a>>,
+    mapped: MappedRange,
+}
+
 /// Structure holding the resources required to operate the GPU.
 #[pin_data(PinnedDrop)]
 pub(crate) struct Gpu<'gpu> {
@@ -568,6 +600,11 @@ pub(crate) struct Gpu<'gpu> {
     /// Locked before a channel's lock, which is locked before `mm`.
     #[pin]
     client_channels: Mutex<KVec<Option<ClientChannelRef<'gpu>>>>,
+    /// The semaphores of client channels mapped into the address spaces of other clients.
+    ///
+    /// Locked before `mm`.
+    #[pin]
+    peer_semaphores: Mutex<KVec<PeerSemaphore<'gpu>>>,
     /// GPU memory manager owning memory management resources.
     ///
     /// Must be kept declared *before* `gsp_resources`, so that its components are dropped while
@@ -928,6 +965,8 @@ impl<'gpu> Gpu<'gpu> {
                 },
                 "nova_client_channels"
             ),
+
+            peer_semaphores <- new_mutex!(KVec::new(), "nova_peer_semaphores"),
 
             // Create GPU memory manager owning memory management resources.
             mm <- new_mutex!({
@@ -2098,6 +2137,18 @@ impl<'gpu> Gpu<'gpu> {
     pub(crate) fn free_vm(&self, vm: ClientVm) {
         let gsp_resources = &self.gsp_resources;
         let id = vm.id();
+        // The semaphores mapped into the address space go with it, and its page tables, below.
+        {
+            let mut peers = self.peer_semaphores.lock();
+            let mut i = 0;
+            while i < peers.len() {
+                if peers[i].vm != id {
+                    i += 1;
+                } else if let Ok(peer) = peers.remove(i) {
+                    peer.mapped.forget();
+                }
+            }
+        }
         let _ = vm
             .free(gsp_resources.device.as_ref(), &gsp_resources.gsp.cmdq)
             .inspect_err(|e| pr_err!("failed to free a client's address space: {:?}\n", e));
@@ -2221,21 +2272,118 @@ impl<'gpu> Gpu<'gpu> {
     /// Waits for the channel to have room, as the work submitted before completes. Fails with
     /// `ETIMEDOUT` if it makes no progress in time, and with `ENODEV` once the channel runs no
     /// more work.
-    pub(crate) fn channel_exec(&self, chid: u32, pushes: &[PushBuffer]) -> Result<ARef<Fence>> {
-        let channel = self
-            .client_channels
-            .lock()
-            .get(num::u32_as_usize(chid))
-            .ok_or(EINVAL)?
-            .clone()
-            .ok_or(ENOENT)?;
+    pub(crate) fn channel_exec(
+        &self,
+        chid: u32,
+        waits: &[GpuWait],
+        pushes: &[PushBuffer],
+    ) -> Result<ARef<Fence>> {
+        let channel = self.client_channel(chid)?;
 
         let mut channel = channel.lock();
         let channel = Option::as_mut(&mut *channel).ok_or(ENOENT)?;
         // Without `mm` locked: other channels' work goes on meanwhile.
-        channel.wait_for_room(pushes.len())?;
+        channel.wait_for_room(pushes.len(), waits.len())?;
 
-        channel.submit(self.gsp_resources.bar, &mut &self.mm, pushes)
+        channel.submit(self.gsp_resources.bar, &mut &self.mm, waits, pushes)
+    }
+
+    /// Returns the channel `chid` of a client.
+    fn client_channel(&self, chid: u32) -> Result<ClientChannelRef<'gpu>> {
+        self.client_channels
+            .lock()
+            .get(num::u32_as_usize(chid))
+            .ok_or(EINVAL)?
+            .clone()
+            .ok_or(ENOENT)
+    }
+
+    /// Returns how the channel `chid`, which runs in `vm`, waits for `fence` before running a
+    /// submission: not at all if `fence` signaled or is of the channel's own earlier work, on the
+    /// GPU if it is of another client channel's work, and on the CPU otherwise.
+    ///
+    /// A wait on the GPU acquires the semaphore of the other channel, which gets mapped
+    /// read-only into `vm` the first time: other clients can't write it.
+    pub(crate) fn channel_wait(
+        &self,
+        vm: &mut ClientVm,
+        chid: u32,
+        fence: &Fence,
+    ) -> Result<FenceWait> {
+        if fence.is_signaled() {
+            return Ok(FenceWait::None);
+        }
+        let Some((fence_chid, point)) = self.fence_contexts_ref.find(fence) else {
+            return Ok(FenceWait::Cpu);
+        };
+        if fence_chid == chid {
+            // Work on a channel runs in order.
+            return Ok(FenceWait::None);
+        }
+
+        // The timeline of the channel the ID is given to now: not the fence's if its channel
+        // went away meanwhile, its fence then signaling soon, which the CPU waits for.
+        let timeline = match self.client_channel(fence_chid) {
+            Ok(channel) => Option::as_ref(&*channel.lock()).map(|c| c.timeline().clone()),
+            Err(_) => None,
+        };
+        let Some(timeline) = timeline.filter(|t| t.instance() == point.instance) else {
+            return Ok(FenceWait::Cpu);
+        };
+
+        let addr = self.peer_semaphore(vm, &timeline)?;
+        Ok(FenceWait::Gpu(GpuWait(Acquire {
+            addr,
+            payload: point.sequence,
+        })))
+    }
+
+    /// Returns the GPU virtual address of the semaphore of `timeline` in `vm`, mapping it
+    /// read-only the first time, see [`Gpu::channel_wait`].
+    fn peer_semaphore(&self, vm: &mut ClientVm, timeline: &Arc<Timeline<'gpu>>) -> Result<u64> {
+        let id = vm.id();
+        let mut peers = self.peer_semaphores.lock();
+        if let Some(peer) = peers
+            .iter()
+            .find(|peer| peer.vm == id && Arc::ptr_eq(&peer.timeline, timeline))
+        {
+            return Ok(peer.mapped.start().into_raw());
+        }
+
+        // The semaphores of the channels that run no more work are no longer waited for: they
+        // got the value of their last submission, see `Timeline::fail`.
+        let mut mm = self.mm.lock();
+        let mut i = 0;
+        while i < peers.len() {
+            if peers[i].vm != id || !peers[i].timeline.failed() {
+                i += 1;
+            } else if let Ok(peer) = peers.remove(i) {
+                vm.space_mut()
+                    .unmap(&mut mm, peer.mapped)
+                    .inspect_err(|e| pr_err!("can't unmap a channel's semaphore: {:?}\n", e))?;
+            }
+        }
+
+        let semaphore = timeline.semaphore();
+        let start = semaphore.dma_address();
+        let end = start + num::usize_as_u64(semaphore.size());
+        peers.reserve(1, GFP_KERNEL)?;
+        let mapped = vm.space_mut().map_sysmem_aligned(
+            &mut mm,
+            start..end,
+            num::usize_as_u64(PAGE_SIZE),
+            Access::READ_ONLY,
+        )?;
+        let addr = mapped.start().into_raw();
+        peers
+            .push_within_capacity(PeerSemaphore {
+                vm: id,
+                timeline: timeline.clone(),
+                mapped,
+            })
+            .map_err(|_| ENOMEM)?;
+
+        Ok(addr)
     }
 
     /// Returns the GPU's timer, a count of nanoseconds that work on the GPU timestamps with.
@@ -2257,13 +2405,7 @@ impl<'gpu> Gpu<'gpu> {
     ///
     /// Fails with `ENODEV` once the channel runs no more work.
     pub(crate) fn channel_last_fence(&self, chid: u32) -> Result<Option<ARef<Fence>>> {
-        let channel = self
-            .client_channels
-            .lock()
-            .get(num::u32_as_usize(chid))
-            .ok_or(EINVAL)?
-            .clone()
-            .ok_or(ENOENT)?;
+        let channel = self.client_channel(chid)?;
         let channel = channel.lock();
 
         Option::as_ref(&*channel).ok_or(ENOENT)?.timeline().last()

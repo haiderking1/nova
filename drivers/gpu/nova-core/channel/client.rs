@@ -64,6 +64,7 @@ use super::{
         GrContext, //
     },
     hal::{
+        Acquire,
         GpEntry,
         Release, //
     },
@@ -110,6 +111,31 @@ pub enum ChannelEngine {
 /// Number of push buffers a client's channel runs at once: those of the GPFIFO ring but the
 /// kernel's push buffer and the one entry a full ring keeps free.
 pub const PUSH_MAX: u32 = GPFIFO_ENTRIES - 2;
+
+/// The most fences a submission waits for on the GPU, see [`ClientChannel::submit`]: their
+/// semaphore acquires, 6 words each, fill the head of a slot of the kernel's push buffer.
+pub const WAITS_MAX: usize = 8;
+
+/// A fence of another channel's work, which a channel waits for on the GPU, before running the
+/// push buffers of a submission: its semaphore, mapped in the channel's address space.
+#[derive(Clone, Copy, Debug)]
+pub struct GpuWait(pub(crate) Acquire);
+
+impl GpuWait {
+    /// Folds `other` into `self` if both are waits for the same channel's work: the wait for
+    /// the later of the two waits for both. Returns whether it did.
+    pub fn merge(&mut self, other: &GpuWait) -> bool {
+        if self.0.addr != other.0.addr {
+            return false;
+        }
+        // Sequence numbers wrap: `other` is later when at most 2^31 after.
+        if other.0.payload.wrapping_sub(self.0.payload) < 1 << 31 {
+            self.0.payload = other.0.payload;
+        }
+
+        true
+    }
+}
 
 /// A push buffer of a client.
 #[derive(Clone, Copy, Debug)]
@@ -307,8 +333,10 @@ impl<'a> ClientChannel<'a> {
 
     /// Returns the number of entries of the GPFIFO ring that submitting `pushes` push buffers
     /// takes: theirs and the kernel's push buffer's.
-    fn ring_entries(pushes: usize) -> Result<u32> {
-        u32::try_from(pushes)?.checked_add(1).ok_or(EINVAL)
+    fn ring_entries(pushes: usize, waits: usize) -> Result<u32> {
+        // The tail, and the head with the waits.
+        let own = 1 + u32::from(waits != 0);
+        u32::try_from(pushes)?.checked_add(own).ok_or(EINVAL)
     }
 
     /// Forgets the submissions that are done.
@@ -328,13 +356,13 @@ impl<'a> ClientChannel<'a> {
         used + entries < GPFIFO_ENTRIES && self.in_flight.len() < TAIL_SLOTS
     }
 
-    /// Waits until the channel has room to submit `pushes` push buffers, as the work submitted
-    /// before completes.
+    /// Waits until the channel has room to submit `pushes` push buffers waiting for `waits`
+    /// fences, as the work submitted before completes.
     ///
     /// Fails with `ETIMEDOUT` if the work submitted before makes no progress in time: the channel
     /// then runs no more work. Fails with `EINVAL` if no ring could take that many.
-    pub(crate) fn wait_for_room(&mut self, pushes: usize) -> Result {
-        let entries = Self::ring_entries(pushes)?;
+    pub(crate) fn wait_for_room(&mut self, pushes: usize, waits: usize) -> Result {
+        let entries = Self::ring_entries(pushes, waits)?;
         if entries >= GPFIFO_ENTRIES {
             return Err(EINVAL);
         }
@@ -378,21 +406,33 @@ impl<'a> ClientChannel<'a> {
         }
     }
 
-    /// Has the channel run the push buffers `pushes`, in order, after the work submitted before,
-    /// and returns the fence that signals once they are done.
+    /// Has the channel run the push buffers `pushes`, in order, after the work submitted before
+    /// and once the fences `waits` signaled, and returns the fence that signals once they are
+    /// done.
     ///
-    /// The channel must have room, see [`ClientChannel::wait_for_room`]: fails with `EBUSY`
-    /// otherwise. Fails with `ENODEV` once the channel runs no more work.
+    /// The channel waits for `waits`, at most [`WAITS_MAX`], on the GPU: it acquires their
+    /// semaphores before fetching the push buffers. The channel must have room, see
+    /// [`ClientChannel::wait_for_room`]: fails with `EBUSY` otherwise. Fails with `ENODEV` once
+    /// the channel runs no more work.
     pub(crate) fn submit(
         &mut self,
         bar: Bar0<'_>,
         mm: &mut impl MmAccess,
+        waits: &[GpuWait],
         pushes: &[PushBuffer],
     ) -> Result<ARef<Fence>> {
         let hal = self.channel.hal();
-        let ring_entries = Self::ring_entries(pushes.len())?;
+        if waits.len() > WAITS_MAX {
+            return Err(EINVAL);
+        }
+        let ring_entries = Self::ring_entries(pushes.len(), waits.len())?;
         if !self.has_room(ring_entries) {
             return Err(EBUSY);
+        }
+
+        let mut head = KVec::new();
+        for GpuWait(acquire) in waits {
+            hal.push_acquire(&mut head, *acquire)?;
         }
 
         let mut entries: KVec<GpEntry> = KVec::with_capacity(pushes.len(), GFP_KERNEL)?;
@@ -418,7 +458,10 @@ impl<'a> ClientChannel<'a> {
         let fence = self.timeline.add(sequence)?;
         // The slot was last used by the submission `TAIL_SLOTS` before, done since there is room.
         let slot = num::u32_as_usize(sequence) % TAIL_SLOTS;
-        if let Err(err) = self.channel.submit_queued(bar, mm, &entries, &tail, slot) {
+        if let Err(err) = self
+            .channel
+            .submit_queued(bar, mm, &head, &entries, &tail, slot)
+        {
             self.timeline.cancel(sequence, err);
             return Err(err);
         }

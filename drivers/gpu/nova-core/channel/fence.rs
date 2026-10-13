@@ -11,6 +11,11 @@
 //! Each channel ID has a fence context of its own, created on first use and kept until the GPU
 //! goes away: a fence context must outlive the fences on it, which can outlive their channel, and
 //! fences of the channels that later get the same ID come after them on the same timeline.
+//!
+//! A fence of a channel can be waited for by other channels on the GPU, rather than by the CPU:
+//! they acquire the semaphore its submission releases, see [`FenceContexts::find`]. When a
+//! channel runs no more work, its semaphore is set to its last submission's sequence number, so
+//! that those channels don't wait for work that will never be done.
 
 use core::pin::Pin;
 
@@ -30,6 +35,10 @@ use kernel::{
     str::CString,
     sync::{
         aref::ARef,
+        atomic::{
+            Atomic,
+            Relaxed, //
+        },
         Arc,
         SetOnce,
         SpinLockIrq, //
@@ -52,12 +61,25 @@ use kernel::{
 
 use crate::num;
 
-/// The fences of channels, which carry no data of their own.
+/// The fences of channels, each carrying the point of its submission on its channel's timeline.
 pub(crate) struct ChannelFences;
 
 impl FenceContextOps for ChannelFences {
-    type FenceDataType = ();
+    type FenceDataType = ChannelPoint;
 }
+
+/// The point of a submission on the timeline of its channel.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ChannelPoint {
+    /// The timeline, see [`Timeline::instance`]: channels that get the same ID later have
+    /// timelines of their own, on the same fence context.
+    pub(crate) instance: u64,
+    /// The value the submission releases the timeline's semaphore with.
+    pub(crate) sequence: u32,
+}
+
+/// The number of the next timeline created, see [`Timeline::instance`].
+static NEXT_INSTANCE: Atomic<u64> = Atomic::new(0);
 
 /// The fence context of a channel ID.
 pub(crate) type ChannelFenceContext = FenceContext<ChannelFences>;
@@ -95,6 +117,16 @@ impl FenceContexts {
 
         Ok(slot.as_ref().ok_or(EINVAL)?)
     }
+
+    /// Returns the channel ID and the point of the submission that `fence` is the fence of, if it
+    /// is the fence of a channel's submission, and `None` otherwise: such as for the fences of
+    /// other devices.
+    pub(crate) fn find(&self, fence: &Fence) -> Option<(u32, ChannelPoint)> {
+        self.contexts.iter().enumerate().find_map(|(chid, slot)| {
+            let point = slot.as_ref()?.fence_data(fence)?;
+            Some((u32::try_from(chid).ok()?, point))
+        })
+    }
 }
 
 /// The fences of a channel's submissions, pending in order, and whether it still runs work.
@@ -124,6 +156,9 @@ impl Pending<'_> {
 pub(crate) struct Timeline<'a> {
     /// The ID of the channel, for logging.
     chid: u32,
+    /// The number of the timeline, unique among those of the GPU's channels: told apart from the
+    /// timelines of the channels that had or get the same ID.
+    instance: u64,
     context: &'a ChannelFenceContext,
     /// The page whose first 4 bytes are the semaphore, which the GPU writes coherently with the
     /// CPU's caches.
@@ -143,6 +178,7 @@ impl<'a> Timeline<'a> {
         Arc::pin_init(
             try_pin_init!(Self {
                 chid,
+                instance: NEXT_INSTANCE.fetch_add(1, Relaxed),
                 context,
                 semaphore: Coherent::<u8>::zeroed_slice(dev, PAGE_SIZE, GFP_KERNEL)?,
                 pending <- new_spinlock_irq!(
@@ -163,6 +199,11 @@ impl<'a> Timeline<'a> {
         &self.semaphore
     }
 
+    /// Returns the number of the timeline, which the fences on it carry, see [`ChannelPoint`].
+    pub(crate) fn instance(&self) -> u64 {
+        self.instance
+    }
+
     /// Returns the value the semaphore holds.
     pub(crate) fn completed(&self) -> u32 {
         // SAFETY: The semaphore is the first 4 bytes of the page `semaphore` owns, which the GPU
@@ -176,7 +217,13 @@ impl<'a> Timeline<'a> {
     /// Fails with `ENODEV` once the channel runs no more work.
     pub(crate) fn add(&self, sequence: u32) -> Result<ARef<Fence>> {
         // Allocated with the lock not held.
-        let fence = self.context.new_fence_allocation(())?.new_fence();
+        let fence = self
+            .context
+            .new_fence_allocation(ChannelPoint {
+                instance: self.instance,
+                sequence,
+            })?
+            .new_fence();
         let consumer = ARef::from(fence.as_fence());
 
         let mut pending = self.pending.lock();
@@ -259,7 +306,28 @@ impl<'a> Timeline<'a> {
 
     /// Has the fences pending, and those added later, signal `err`: the channel runs no more work.
     pub(crate) fn fail(&self, err: Error) {
-        self.pending.lock().fail(err);
+        self.fail_locked(&mut self.pending.lock(), err);
+    }
+
+    /// Does [`Timeline::fail`] with the fences pending locked.
+    ///
+    /// The channels waiting on the GPU for the fences pending wait no more: the semaphore gets
+    /// the value of the last, which the channel's work won't release anymore.
+    fn fail_locked(&self, pending: &mut Pending<'a>, err: Error) {
+        if let Some(&(last, _)) = pending.fences.last() {
+            // Sequence numbers wrap: the value is moved only forward.
+            if last.wrapping_sub(self.completed()) < 1 << 31 {
+                // SAFETY: The semaphore is the first 4 bytes of the page `semaphore` owns, which
+                // the GPU accesses coherently with the CPU's caches.
+                unsafe {
+                    self.semaphore
+                        .as_mut_ptr()
+                        .cast::<u32>()
+                        .write_volatile(last)
+                };
+            }
+        }
+        pending.fail(err);
     }
 
     /// Has the fences pending signal `-ETIMEDOUT`, and the channel run no more work, if the
@@ -279,7 +347,7 @@ impl<'a> Timeline<'a> {
                 if now - since < timeout {
                     return false;
                 }
-                pending.fail(ETIMEDOUT);
+                self.fail_locked(&mut pending, ETIMEDOUT);
                 true
             }
             _ => {
