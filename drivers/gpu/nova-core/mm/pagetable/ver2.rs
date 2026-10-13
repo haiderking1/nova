@@ -11,7 +11,8 @@
 
 use kernel::{
     bitfield,
-    num::Bounded, //
+    num::Bounded,
+    prelude::*, //
 };
 
 use pin_init::Zeroable;
@@ -159,6 +160,13 @@ impl PteOps for Pte {
             _ => self.frame_number_sys(),
         }
     }
+
+    fn with_pfn(self, pfn: Pfn) -> Self {
+        match self.aperture() {
+            AperturePte::VideoMemory => self.with_frame_number_vid(pfn),
+            _ => self.with_frame_number_sys(pfn),
+        }
+    }
 }
 
 // Page Directory Entry (PDE) for MMU v2 - 64-bit entry at levels 0-2.
@@ -238,13 +246,6 @@ pub(in crate::mm) struct DualPde {
     pub(super) small: Pde,
 }
 
-impl DualPde {
-    /// Check if the big page table pointer is valid.
-    fn has_big(&self) -> bool {
-        PdeOps::is_valid(&self.big)
-    }
-}
-
 impl DualPdeOps for DualPde {
     fn from_raw(big: u64, small: u64) -> Self {
         Self {
@@ -260,12 +261,41 @@ impl DualPdeOps for DualPde {
         }
     }
 
+    fn with_small(self, table_pfn: Pfn) -> Self {
+        Self {
+            small: PdeOps::new(AperturePde::VideoMemory, table_pfn),
+            ..self
+        }
+    }
+
+    fn with_big(self, table: VramAddress) -> Result<Self> {
+        // The big half holds the table address shifted by 8 at bits 32:4
+        // (`NV_MMU_VER2_DUAL_PDE_ADDRESS_BIG_VID`, `_ADDRESS_BIG_SHIFT`): for a 4 KiB aligned
+        // table, the bits of a PDE's frame number (shifted by 12 at bits 32:8).
+        if table.into_raw() & 0xfff != 0 {
+            return Err(EINVAL);
+        }
+        Ok(Self {
+            big: PdeOps::new(AperturePde::VideoMemory, Pfn::from(table)),
+            ..self
+        })
+    }
+
     fn has_small(&self) -> bool {
         PdeOps::is_valid(&self.small)
     }
 
+    fn has_big(&self) -> bool {
+        PdeOps::is_valid(&self.big)
+    }
+
     fn small_vram_address(&self) -> VramAddress {
         PdeOps::table_vram_address(&self.small)
+    }
+
+    fn big_vram_address(&self) -> VramAddress {
+        // See `with_big()`: big page tables are 4 KiB aligned.
+        PdeOps::table_vram_address(&self.big)
     }
 
     fn big_raw_u64(&self) -> u64 {

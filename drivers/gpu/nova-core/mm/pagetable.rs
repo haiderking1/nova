@@ -16,7 +16,8 @@ pub(super) mod walk;
 use kernel::{
     io::Io,
     num::Bounded,
-    prelude::*, //
+    prelude::*,
+    sizes::SZ_64K, //
 };
 
 use crate::{
@@ -25,9 +26,17 @@ use crate::{
         pramin,
         Pfn,
         VirtualAddress,
-        VramAddress, //
+        VramAddress,
+        PAGE_SIZE, //
     },
 };
+
+/// Size of the big pages of nova's address spaces, which their instance blocks are set up for
+/// (`NV_VASPACE_ALLOCATION_PARAMETERS::bigPageSize`), and their big page tables map.
+pub(crate) const BIG_PAGE_SIZE: usize = SZ_64K;
+
+/// Number of [`PAGE_SIZE`] pages in a big page.
+pub(super) const PAGES_PER_BIG_PAGE: usize = BIG_PAGE_SIZE / PAGE_SIZE;
 
 /// Extracts the page table index at a given level from a virtual address.
 pub(super) trait VaLevelIndex {
@@ -151,9 +160,9 @@ pub(crate) mod kind {
     pub(crate) fn uncompressed(kind: u8) -> Option<u8> {
         Some(match kind {
             PITCH => PITCH,
-            GENERIC_MEMORY | GENERIC_MEMORY_COMPRESSIBLE | GENERIC_MEMORY_COMPRESSIBLE_DISABLE_PLC => {
-                GENERIC_MEMORY
-            }
+            GENERIC_MEMORY
+            | GENERIC_MEMORY_COMPRESSIBLE
+            | GENERIC_MEMORY_COMPRESSIBLE_DISABLE_PLC => GENERIC_MEMORY,
             S8 | S8_COMPRESSIBLE_DISABLE_PLC => S8,
             Z16 | Z16_COMPRESSIBLE_DISABLE_PLC => Z16,
             S8Z24 | S8Z24_COMPRESSIBLE_DISABLE_PLC => S8Z24,
@@ -229,6 +238,10 @@ pub(super) trait PteOps: Copy + core::fmt::Debug + Into<u64> {
     /// Get the physical frame number.
     fn frame_number(&self) -> Pfn;
 
+    /// Returns this valid `PTE` mapping `pfn` instead, in the same aperture and with the same
+    /// access: e.g. one of the pages of a big page it maps.
+    fn with_pfn(self, pfn: Pfn) -> Self;
+
     /// Read a `PTE` from VRAM.
     fn read(pramin: &mut pramin::Pramin<'_>, addr: VramAddress) -> Result<Self> {
         let val = pramin.window_at::<u64>(addr)?.view().read_val();
@@ -294,11 +307,24 @@ pub(super) trait DualPdeOps: Copy + core::fmt::Debug {
     /// Create a `DualPde` with only the small page table pointer set.
     fn new_small(table_pfn: Pfn) -> Self;
 
+    /// Returns this `DualPde` with its small page table pointer set to the table at `table_pfn`.
+    fn with_small(self, table_pfn: Pfn) -> Self;
+
+    /// Returns this `DualPde` with its big page table pointer set to the table at `table`, in
+    /// VRAM and 4 KiB aligned.
+    fn with_big(self, table: VramAddress) -> Result<Self>;
+
     /// Check if the small page table pointer is valid.
     fn has_small(&self) -> bool;
 
+    /// Check if the big page table pointer is valid.
+    fn has_big(&self) -> bool;
+
     /// Get the small page table VRAM address.
     fn small_vram_address(&self) -> VramAddress;
+
+    /// Get the big page table VRAM address.
+    fn big_vram_address(&self) -> VramAddress;
 
     /// Get the raw `u64` value of the big PDE.
     fn big_raw_u64(&self) -> u64;
@@ -343,6 +369,10 @@ pub(super) trait MmuConfig: 'static {
     /// Dual PDE level (128-bit entries) for this MMU version.
     const DUAL_PDE_LEVEL: PageTableLevel;
 
+    /// Whether the address spaces of this MMU version are given big page tables of
+    /// [`BIG_PAGE_SIZE`] pages, the size nova sets for its address spaces, under their dual PDEs.
+    const BIG_PAGES: bool;
+
     /// Get the number of entries per page table page for a given level.
     fn entries_per_page(level: PageTableLevel) -> usize;
 
@@ -368,10 +398,13 @@ pub(super) trait MmuConfig: 'static {
     fn pt_pages_upper_bound(num_virt_pages: usize) -> usize {
         let mut total = 0;
 
-        // PTE pages at the leaf level.
+        // PTE pages at the leaf level, and as many big page tables beside them.
         let pte_epp = Self::entries_per_page(Self::PTE_LEVEL);
         let mut pages_at_level = num_virt_pages.div_ceil(pte_epp);
         total += pages_at_level;
+        if Self::BIG_PAGES {
+            total += pages_at_level;
+        }
 
         // Walk PDE levels bottom-up (reverse of PDE_LEVELS).
         for &level in Self::PDE_LEVELS.iter().rev() {
@@ -398,6 +431,7 @@ impl MmuConfig for MmuV2 {
     const PDE_LEVELS: &'static [PageTableLevel] = ver2::PDE_LEVELS;
     const PTE_LEVEL: PageTableLevel = ver2::PTE_LEVEL;
     const DUAL_PDE_LEVEL: PageTableLevel = ver2::DUAL_PDE_LEVEL;
+    const BIG_PAGES: bool = true;
 
     fn entries_per_page(level: PageTableLevel) -> usize {
         // TODO: Calculate these values from the bitfield dynamically
@@ -436,6 +470,8 @@ impl MmuConfig for MmuV3 {
     const PDE_LEVELS: &'static [PageTableLevel] = ver3::PDE_LEVELS;
     const PTE_LEVEL: PageTableLevel = ver3::PTE_LEVEL;
     const DUAL_PDE_LEVEL: PageTableLevel = ver3::DUAL_PDE_LEVEL;
+    // Not yet tried on Hopper or later.
+    const BIG_PAGES: bool = false;
 
     fn entries_per_page(level: PageTableLevel) -> usize {
         match level {

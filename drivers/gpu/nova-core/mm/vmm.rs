@@ -183,11 +183,14 @@ pub(crate) struct Vmm {
 impl Vmm {
     /// Create a new [`Vmm`] for the given Page Directory Base address.
     ///
-    /// The [`Vmm`] will manage a virtual address space of `va_size` bytes.
+    /// The [`Vmm`] will manage a virtual address space of `va_size` bytes. If `big_pages`, the
+    /// address space is set up for [`super::BIG_PAGE_SIZE`] big pages, and VRAM is mapped with
+    /// them where it can be: virtually and physically aligned and contiguous.
     pub(crate) fn new(
         pdb_addr: VramAddress,
         mmu_version: MmuVersion,
         va_size: u64,
+        big_pages: bool,
     ) -> Result<Self> {
         let page_size: u64 = PAGE_SIZE.into_safe_cast();
         let va_pages: usize = (va_size / page_size).into_safe_cast();
@@ -196,7 +199,7 @@ impl Vmm {
         Ok(Self {
             pdb_addr,
             pt_walk: PtWalk::new(pdb_addr, mmu_version),
-            pt_map: PtMap::new(pdb_addr, mmu_version),
+            pt_map: PtMap::new(pdb_addr, mmu_version, big_pages),
             page_table_allocs: KVec::new(),
             virt_alloc,
             va_pages,

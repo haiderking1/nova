@@ -47,6 +47,7 @@ use kernel::{
         AllocatedBlocks,
         GpuBuddy,
         GpuBuddyAllocFlag,
+        GpuBuddyAllocFlags,
         GpuBuddyAllocMode,
         GpuBuddyParams, //
     },
@@ -65,7 +66,10 @@ use kernel::{
 };
 
 use crate::{
-    driver::Bar0,
+    driver::{
+        Bar0,
+        Bar1, //
+    },
     gpu::Chipset,
     num::{
         self,
@@ -73,6 +77,7 @@ use crate::{
     },
 };
 
+pub(crate) use pagetable::BIG_PAGE_SIZE;
 pub(crate) use tlb::Tlb;
 
 pub(crate) mod bar_user;
@@ -93,6 +98,23 @@ pub(crate) struct GpuMm<'gpu> {
     buddy: GpuBuddy,
     pramin: pramin::Pramin<'gpu>,
     tlb: Pin<KBox<Tlb<'gpu>>>,
+    /// VRAM page tables are allocated from first, see [`PageTablePool`].
+    pt_pool: Option<PageTablePool>,
+}
+
+/// VRAM mapped in BAR1, write-combined, which page tables are allocated from first, so that the CPU
+/// writes them through BAR1: mapping or unmapping a buffer then streams its PTEs out, where through
+/// the PRAMIN window, uncached, each costs about a microsecond (some 3 ms for a 12 MiB buffer).
+/// Page tables are allocated from the rest of VRAM once it is full.
+struct PageTablePool {
+    /// Allocator of the pool's VRAM.
+    buddy: GpuBuddy,
+    /// Its BAR1 mapping, which [`GpuMm::take_page_table_pool()`] gives back to be unmapped.
+    mapped: Option<vmm::MappedRange>,
+    /// Whether writes through BAR1 were seen to land in VRAM: the pool is only used if so.
+    usable: bool,
+    /// The pool's VRAM.
+    _vram: ContiguousVram,
 }
 
 /// Access to the GPU memory manager for code that needs it only now and then, between which it
@@ -134,7 +156,107 @@ impl<'gpu> GpuMm<'gpu> {
             buddy: GpuBuddy::new(buddy_params)?,
             pramin: pramin::Pramin::new(bar, chipset, vram_region)?,
             tlb: KBox::pin_init(Tlb::new(bar), GFP_KERNEL)?,
+            pt_pool: None,
         })
+    }
+
+    /// Has page tables allocated from `vram` first, which `mapped` maps in BAR1 from its offset
+    /// `bar1_offset`, and accessed through BAR1: see [`PageTablePool`].
+    pub(crate) fn set_page_table_pool(
+        &mut self,
+        vram: ContiguousVram,
+        mapped: vmm::MappedRange,
+        bar1: Bar1<'gpu>,
+        bar1_offset: usize,
+    ) -> Result {
+        let range = vram.range();
+        let buddy = GpuBuddy::new(GpuBuddyParams {
+            base_offset: range.start.into_raw(),
+            size: range.end - range.start,
+            chunk_size: Alignment::new::<SZ_4K>(),
+        })?;
+        let check_addr = range.start;
+        self.pramin.set_wc_region(Some(pramin::WcRegion {
+            bar1,
+            vram: range,
+            bar1_offset,
+        }));
+
+        // Page tables written through BAR1 have to be what the GPU reads: check that writes
+        // through it land in VRAM as the PRAMIN window sees it, before using it.
+        let pattern = [
+            0x0123_4567_89ab_cdef_u64,
+            0xfedc_ba98_7654_3210,
+            0,
+            u64::MAX,
+        ];
+        let checked = self.pramin.write_u64s(check_addr, &pattern).and_then(|()| {
+            let wc = self.pramin.set_wc_region(None);
+            let mut read = [0u64; 4];
+            let result = (|| {
+                for (i, value) in read.iter_mut().enumerate() {
+                    let addr = check_addr
+                        .checked_add(u64::try_from(8 * i)?)
+                        .ok_or(EINVAL)?;
+                    *value = self.pramin.window_at::<u64>(addr)?.view().read_val();
+                }
+                Ok(())
+            })();
+            self.pramin.set_wc_region(wc);
+            result.and_then(|()| if read == pattern { Ok(()) } else { Err(EIO) })
+        });
+        if checked.is_err() {
+            self.pramin.set_wc_region(None);
+        }
+
+        // Kept even if unusable, for its mapping to be given back.
+        self.pt_pool = Some(PageTablePool {
+            buddy,
+            mapped: Some(mapped),
+            usable: checked.is_ok(),
+            _vram: vram,
+        });
+
+        checked
+    }
+
+    /// Stops accessing the page table pool through BAR1, and gives back its BAR1 mapping, to be
+    /// unmapped. Its page tables stay, and are accessed through the PRAMIN window from then on.
+    pub(crate) fn take_page_table_pool(&mut self) -> Option<vmm::MappedRange> {
+        self.pramin.set_wc_region(None);
+        self.pt_pool.as_mut().and_then(|pool| pool.mapped.take())
+    }
+
+    /// Allocates `size` bytes of VRAM for page tables, aligned to `align`: from the page table
+    /// pool if it has room, from the rest of VRAM otherwise.
+    pub(super) fn alloc_page_table(
+        &self,
+        size: usize,
+        align: Alignment,
+    ) -> Result<Pin<KBox<AllocatedBlocks>>> {
+        let alloc = |buddy: &GpuBuddy| {
+            KBox::pin_init(
+                buddy.alloc_blocks(
+                    GpuBuddyAllocMode::Simple,
+                    size.into_safe_cast(),
+                    align,
+                    GpuBuddyAllocFlags::default(),
+                ),
+                GFP_KERNEL,
+            )
+        };
+
+        // Only while the pool is accessed through BAR1: its page tables are slower otherwise.
+        if let Some(pool) = self
+            .pt_pool
+            .as_ref()
+            .filter(|pool| pool.usable && pool.mapped.is_some())
+        {
+            if let Ok(blocks) = alloc(&pool.buddy) {
+                return Ok(blocks);
+            }
+        }
+        alloc(&self.buddy)
     }
 
     /// Access the [`GpuBuddy`] allocator.

@@ -46,7 +46,8 @@ use super::{
     MmuVersion,
     PageTableLevel,
     PdeOps,
-    PteOps, //
+    PteOps,
+    PAGES_PER_BIG_PAGE, //
 };
 use crate::{
     mm::{
@@ -128,6 +129,60 @@ impl<M: MmuConfig> PtWalkInner<M> {
             WalkPdeResult::Complete { pte_table } => Some(pte_table),
             WalkPdeResult::Missing { .. } => None,
         })
+    }
+
+    /// Returns the address of the dual PDE of `vfn`, if the page directories leading to it are
+    /// installed or `resolve_prepared` (as for [`Self::walk_pde_levels()`]) gives them.
+    pub(super) fn dual_pde_addr(
+        &self,
+        pramin: &mut pramin::Pramin<'_>,
+        vfn: Vfn,
+        resolve_prepared: impl Fn(VramAddress) -> Option<VramAddress>,
+    ) -> Result<Option<VramAddress>> {
+        let va = VirtualAddress::from(vfn);
+        let mut table = self.pdb_addr;
+
+        for &level in M::PDE_LEVELS {
+            let addr = Self::entry_addr(table, level, M::level_index(va, level.as_index()));
+            if level == M::DUAL_PDE_LEVEL {
+                return Ok(Some(addr));
+            }
+            let pde = M::Pde::read(pramin, addr)?;
+            table = if pde.is_valid_vram() {
+                pde.table_vram_address()
+            } else if let Some(prepared) = resolve_prepared(addr) {
+                prepared
+            } else {
+                return Ok(None);
+            };
+        }
+
+        Ok(None)
+    }
+
+    /// Returns the big page table `vfn` is in, if one is installed.
+    pub(super) fn big_table(
+        &self,
+        pramin: &mut pramin::Pramin<'_>,
+        vfn: Vfn,
+    ) -> Result<Option<VramAddress>> {
+        if !M::BIG_PAGES {
+            return Ok(None);
+        }
+        let Some(addr) = self.dual_pde_addr(pramin, vfn, |_| None)? else {
+            return Ok(None);
+        };
+        let dpde = M::DualPde::read(pramin, addr)?;
+        Ok(dpde.has_big().then(|| dpde.big_vram_address()))
+    }
+
+    /// Returns the address of the PTE of the big page `vfn` is in, in `big_table`, the big page
+    /// table it is in.
+    pub(super) fn big_pte_addr(big_table: VramAddress, vfn: Vfn) -> VramAddress {
+        // A big page table covers what a PTE-level table does.
+        let small_index = M::level_index(VirtualAddress::from(vfn), M::PTE_LEVEL.as_index());
+        let pages_per_big: u64 = PAGES_PER_BIG_PAGE.into_safe_cast();
+        Self::entry_addr(big_table, M::PTE_LEVEL, small_index / pages_per_big)
     }
 
     /// Create a new page table walker.
@@ -232,6 +287,19 @@ impl<M: MmuConfig> PtWalkInner<M> {
         pramin: &mut pramin::Pramin<'_>,
         vfn: Vfn,
     ) -> Result<WalkResult> {
+        // A valid big PTE maps the page whatever the small page table has.
+        if let Some(big_table) = self.big_table(pramin, vfn)? {
+            let pte_addr = Self::big_pte_addr(big_table, vfn);
+            let pte = M::Pte::read(pramin, pte_addr)?;
+            if pte.is_valid() {
+                let pages_per_big: u64 = PAGES_PER_BIG_PAGE.into_safe_cast();
+                return Ok(WalkResult::Mapped {
+                    pte_addr,
+                    pfn: Pfn::new(pte.frame_number().raw() + vfn.raw() % pages_per_big),
+                });
+            }
+        }
+
         match self.walk_pde_levels(pramin, vfn, |_| None)? {
             WalkPdeResult::Complete { pte_table } => {
                 Self::read_pte_at_level(pramin, vfn, pte_table)

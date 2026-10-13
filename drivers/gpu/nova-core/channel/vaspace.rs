@@ -151,7 +151,8 @@ impl AddressSpace {
             Ok(pdb)
         })?;
         let pdb_addr = pdb.range().start;
-        let vmm = Vmm::new(pdb_addr, mmu_version, VA_SIZE)?;
+        // GSP-RM sets the address space up for big pages: see `VaSpaceAllocParams`.
+        let vmm = Vmm::new(pdb_addr, mmu_version, VA_SIZE, true)?;
         match &layout {
             VaLayout::Kernel => vmm.reserve(0..VA_START)?,
             // Nova's mappings stay in the client's kernel range.

@@ -22,7 +22,9 @@ use kernel::{
     ptr::Alignment,
     sizes::{
         SizeConstants,
-        SZ_4K, //
+        SZ_1M,
+        SZ_4K,
+        SZ_64K, //
     },
     sync::{
         aref::ARef,
@@ -1040,6 +1042,32 @@ impl<'gpu> Gpu<'gpu> {
         )?);
 
         Ok(())
+    }
+
+    /// Allocates the VRAM page tables are allocated from first, and maps it in BAR1, so that the
+    /// CPU writes page tables through BAR1, write-combined: see
+    /// [`GpuMm::set_page_table_pool()`].
+    ///
+    /// Must be done before address spaces are created for clients.
+    pub(crate) fn init_page_table_pool(self: Pin<&mut Self>) -> Result {
+        /// Enough for the page tables of some 32 GiB mapped in 4 KiB pages.
+        const PAGE_TABLE_POOL_SIZE: usize = 64 * SZ_1M;
+
+        let this = self.as_ref().get_ref();
+        let mut mm = this.mm.lock();
+
+        let vram = mm.alloc_contiguous(PAGE_TABLE_POOL_SIZE, Alignment::new::<SZ_64K>())?;
+        let mapped = this.bar_user.map_vram(&mut mm, vram.range())?;
+        let bar1_offset = usize::try_from(mapped.start().into_raw());
+        match bar1_offset {
+            Ok(bar1_offset) => {
+                mm.set_page_table_pool(vram, mapped, this.bar_user.bar1(), bar1_offset)
+            }
+            Err(err) => {
+                let _ = this.bar_user.unmap(&mut mm, mapped);
+                Err(err.into())
+            }
+        }
     }
 
     /// Sets up the kernel's channel on a copy engine, which clears new VRAM buffers.
@@ -2335,6 +2363,16 @@ impl PinnedDrop for Gpu<'_> {
 
         if let Some(mut copy) = copy {
             copy.free(dev, &gsp_resources.gsp.cmdq, &mut mm);
+        }
+
+        // The page table pool's page tables are accessed through the PRAMIN window from then on.
+        if let Some(mapped) = mm.take_page_table_pool() {
+            let _ = this
+                .bar_user
+                .as_ref()
+                .get_ref()
+                .unmap(&mut mm, mapped)
+                .inspect_err(|e| dev_err!(dev, "failed to unmap the page table pool: {:?}\n", e));
         }
 
         // The channels of clients left, whose address spaces go away with the GPU.

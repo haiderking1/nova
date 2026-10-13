@@ -145,6 +145,12 @@ impl pci::Driver for NovaCoreDriver {
                 #[cfg(CONFIG_NOVA_CORE_SELFTESTS)]
                 gpu.as_mut().run_selftests(pdev);
 
+                // Not fatal: page tables are written through PRAMIN without it, slowly. Before
+                // any client creates an address space.
+                if let Err(err) = gpu.as_mut().init_page_table_pool() {
+                    dev_warn!(pdev, "can't set up the page table pool: {:?}\n", err);
+                }
+
                 // Not fatal: only work on the graphics engine needs it. First, as it must be done
                 // before any other channel is allocated.
                 if let Err(err) = gpu.as_mut().init_graphics() {

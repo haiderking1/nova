@@ -69,11 +69,16 @@ impl<'a> BarUser<'a> {
     ) -> impl PinInit<Self, Error> + 'a {
         try_pin_init!(Self {
             vmm <- new_mutex!(
-                Vmm::new(pdb_addr, chipset.mmu_version(), va_size)?,
+                Vmm::new(pdb_addr, chipset.mmu_version(), va_size, false)?,
                 "bar_user_vmm",
             ),
             bar1,
         })
+    }
+
+    /// Returns BAR1, which mappings are accessed through.
+    pub(crate) fn bar1(&self) -> Bar1<'a> {
+        self.bar1
     }
 
     /// Map physical pages to a contiguous BAR1 virtual range.

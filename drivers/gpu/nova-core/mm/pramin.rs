@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-//! Utilities for accessing VRAM through the PRAMIN window.
+//! Utilities for accessing VRAM through the PRAMIN window, or, for VRAM mapped write-combined in
+//! BAR1, through BAR1.
 
 use core::ops::Range;
 
@@ -11,6 +12,7 @@ use kernel::{
         register,
         register::OffsetLoc,
         Io,
+        IoBase,
         Mmio, //
     },
     prelude::*,
@@ -22,11 +24,17 @@ use kernel::{
         SZ_1M,
         SZ_64K, //
     },
+    sync::barrier::{
+        mb,
+        Write, //
+    },
+    transmute::AsBytes,
 };
 
 use crate::{
     driver::{
         Bar0,
+        Bar1,
         NovaRegisters, //
     },
     gpu::Chipset,
@@ -54,10 +62,23 @@ register! {
     PRAMIN: PraminWindow @ 0x700000;
 }
 
+/// VRAM mapped in BAR1, which the CPU accesses through BAR1 rather than through the PRAMIN window.
+///
+/// BAR1 is write-combined: writes through it stream to the GPU, where writes through the PRAMIN
+/// window, uncached, go one by one, each of them costing about a microsecond.
+pub(super) struct WcRegion<'gpu> {
+    pub(super) bar1: Bar1<'gpu>,
+    /// The VRAM mapped.
+    pub(super) vram: Range<VramAddress>,
+    /// Offset in BAR1 of the start of `vram`, which follows it there.
+    pub(super) bar1_offset: usize,
+}
+
 /// Owner of the PRAMIN window state.
 ///
 /// [`Pramin::window_at()`] repositions the window as needed and returns a typed MMIO view into
-/// it, holding the manager borrowed for the lifetime of the view.
+/// it, holding the manager borrowed for the lifetime of the view. VRAM of the [`WcRegion`], if
+/// any, is accessed through BAR1 instead.
 pub(super) struct Pramin<'gpu> {
     bar: Bar0<'gpu>,
     hal: &'static dyn MmHal,
@@ -67,6 +88,8 @@ pub(super) struct Pramin<'gpu> {
     vram_range: Range<VramAddress>,
     /// Cached window position.
     window_range: Range<VramAddress>,
+    /// VRAM accessed through BAR1.
+    wc: Option<WcRegion<'gpu>>,
 }
 
 /// Typed view of VRAM through the PRAMIN window.
@@ -79,6 +102,8 @@ where
     T: FromBytes + IntoBytes,
 {
     view: Mmio<'a, T>,
+    /// Whether `view` is in BAR1, write-combined.
+    wc: bool,
 }
 
 impl<T> PraminAccess<'_, T>
@@ -96,6 +121,10 @@ where
     T: FromBytes + IntoBytes,
 {
     fn drop(&mut self) {
+        // Write-combined writes are buffered in the CPU until flushed.
+        if self.wc {
+            mb(Write);
+        }
         // Insert an ordering point after previous writes through this window.
         self.view.cast::<u8>().read_val();
     }
@@ -123,7 +152,25 @@ impl<'gpu> Pramin<'gpu> {
             window,
             vram_range,
             window_range,
+            wc: None,
         })
+    }
+
+    /// Has the VRAM of `wc` accessed through BAR1 from now on, or, with `None`, none, returning
+    /// the region accessed so before.
+    pub(super) fn set_wc_region(&mut self, wc: Option<WcRegion<'gpu>>) -> Option<WcRegion<'gpu>> {
+        core::mem::replace(&mut self.wc, wc)
+    }
+
+    /// Returns the BAR1 offset of the `len` bytes at `addr`, if they are in the [`WcRegion`].
+    fn wc_offset(&self, addr: VramAddress, len: usize) -> Option<usize> {
+        let wc = self.wc.as_ref()?;
+        let end = addr.checked_add(len.into_safe_cast())?;
+        if !(wc.vram.contains(&addr) && end <= wc.vram.end) {
+            return None;
+        }
+        let offset: usize = (addr - wc.vram.start).into_safe_cast();
+        wc.bar1_offset.checked_add(offset)
     }
 
     /// Returns the VRAM range a window based at `base` exposes.
@@ -163,6 +210,21 @@ impl<'gpu> Pramin<'gpu> {
     /// with a single ordering point after the last: reading back through the window is uncached,
     /// and costs far more than the writes.
     pub(super) fn write_u64s(&mut self, vram_addr: VramAddress, values: &[u64]) -> Result {
+        let bytes = AsBytes::as_bytes(values);
+        if let (Some(offset), Some(wc)) = (self.wc_offset(vram_addr, bytes.len()), &self.wc) {
+            if bytes.is_empty() {
+                return Ok(());
+            }
+            let end = offset.checked_add(bytes.len()).ok_or(EINVAL)?;
+            let bar1 = wc.bar1.as_view().as_bytes();
+            io_project!(bar1, [try: offset..end]).copy_from_slice(bytes);
+            // Flush the writes out of the CPU, then the ordering point.
+            mb(Write);
+            let view: Mmio<'_, u8> = io_project!(wc.bar1.as_view(), try: OffsetLoc::new(offset));
+            view.read_val();
+            return Ok(());
+        }
+
         let mut addr = vram_addr;
         for &value in values {
             let offset = self.window_offset(addr, size_of::<u64>())?;
@@ -194,10 +256,15 @@ impl<'gpu> Pramin<'gpu> {
     where
         T: FromBytes + IntoBytes,
     {
+        if let (Some(offset), Some(wc)) = (self.wc_offset(vram_addr, size_of::<T>()), &self.wc) {
+            let view = io_project!(wc.bar1.as_view(), try: OffsetLoc::new(offset));
+            return Ok(PraminAccess { view, wc: true });
+        }
+
         let offset = self.window_offset(vram_addr, size_of::<T>())?;
         let view = io_project!(self.window, try: OffsetLoc::new(offset));
 
-        Ok(PraminAccess { view })
+        Ok(PraminAccess { view, wc: false })
     }
 }
 

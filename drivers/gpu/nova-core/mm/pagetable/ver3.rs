@@ -247,6 +247,10 @@ impl PteOps for Pte {
     fn frame_number(&self) -> Pfn {
         Pte::frame_number(*self)
     }
+
+    fn with_pfn(self, pfn: Pfn) -> Self {
+        self.with_frame_number(pfn)
+    }
 }
 
 bitfield! {
@@ -335,7 +339,7 @@ impl DualPdeBig {
         if table_addr.into_raw() & 0xFF != 0 {
             return Err(EINVAL);
         }
-        let table_frame = Bounded::from_expr(table_addr.into_raw() >> 8);
+        let table_frame = Bounded::try_new(table_addr.into_raw() >> 8).ok_or(EINVAL)?;
         match aperture {
             AperturePde::VideoMemory => Ok(Self::zeroed()
                 .with_is_pte(false)
@@ -389,13 +393,6 @@ pub(in crate::mm) struct DualPde {
 // SAFETY: Both `DualPdeBig` and `Pde` fields are `Zeroable` (bitfield types are Zeroable).
 unsafe impl Zeroable for DualPde {}
 
-impl DualPde {
-    /// Check if the big page table pointer is valid.
-    fn has_big(&self) -> bool {
-        self.big.is_valid()
-    }
-}
-
 impl DualPdeOps for DualPde {
     fn from_raw(big: u64, small: u64) -> Self {
         Self {
@@ -411,12 +408,34 @@ impl DualPdeOps for DualPde {
         }
     }
 
+    fn with_small(self, table_pfn: Pfn) -> Self {
+        Self {
+            small: PdeOps::new(AperturePde::VideoMemory, table_pfn),
+            ..self
+        }
+    }
+
+    fn with_big(self, table: VramAddress) -> Result<Self> {
+        Ok(Self {
+            big: DualPdeBig::new(AperturePde::VideoMemory, table)?,
+            ..self
+        })
+    }
+
     fn has_small(&self) -> bool {
         PdeOps::is_valid(&self.small)
     }
 
+    fn has_big(&self) -> bool {
+        self.big.is_valid()
+    }
+
     fn small_vram_address(&self) -> VramAddress {
         PdeOps::table_vram_address(&self.small)
+    }
+
+    fn big_vram_address(&self) -> VramAddress {
+        self.big.table_vram_address()
     }
 
     fn big_raw_u64(&self) -> u64 {

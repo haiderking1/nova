@@ -1022,6 +1022,7 @@ impl VaSpaceAllocParams {
         Self(bindings::NV_VASPACE_ALLOCATION_PARAMETERS {
             index: bindings::NV_VASPACE_ALLOCATION_INDEX_GPU_NEW,
             flags: VASPACE_FLAGS_IS_EXTERNALLY_OWNED,
+            bigPageSize: BIG_PAGE_SIZE_U32,
             ..Default::default()
         })
     }
@@ -1032,10 +1033,15 @@ impl VaSpaceAllocParams {
     pub(crate) fn split() -> Self {
         Self(bindings::NV_VASPACE_ALLOCATION_PARAMETERS {
             index: bindings::NV_VASPACE_ALLOCATION_INDEX_GPU_NEW,
+            bigPageSize: BIG_PAGE_SIZE_U32,
             ..Default::default()
         })
     }
 }
+
+/// The big page size of nova's address spaces, which their instance blocks are set up for and
+/// their big page tables map with (`bigPageSize`).
+const BIG_PAGE_SIZE_U32: u32 = num::usize_into_u32::<{ crate::mm::BIG_PAGE_SIZE }>();
 
 /// The part of a split address space GSP-RM maps its own buffers in: where it expects it
 /// (`SPLIT_VAS_SERVER_RM_MANAGED_VA_START` and `_SIZE` in RM's `gpu_vaspace.h`).
