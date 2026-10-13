@@ -90,6 +90,17 @@ pub(super) struct Pramin<'gpu> {
     window_range: Range<VramAddress>,
     /// VRAM accessed through BAR1.
     wc: Option<WcRegion<'gpu>>,
+    /// Posted writes, through BAR1 and through the window, no read has ordered yet.
+    pending: Pending,
+}
+
+/// Writes made without an ordering point after them: see [`Pramin::write_u64s_posted()`].
+#[derive(Default)]
+struct Pending {
+    /// Through BAR1: buffered in the CPU, write-combined, until flushed out.
+    wc: bool,
+    /// Through the PRAMIN window.
+    window: bool,
 }
 
 /// Typed view of VRAM through the PRAMIN window.
@@ -153,12 +164,18 @@ impl<'gpu> Pramin<'gpu> {
             vram_range,
             window_range,
             wc: None,
+            pending: Pending::default(),
         })
     }
 
     /// Has the VRAM of `wc` accessed through BAR1 from now on, or, with `None`, none, returning
     /// the region accessed so before.
     pub(super) fn set_wc_region(&mut self, wc: Option<WcRegion<'gpu>>) -> Option<WcRegion<'gpu>> {
+        // Writes through the region given back are ordered while it is still accessed, which
+        // can't fail: its BAR1 mapping holds its own start.
+        if self.order().is_err() {
+            kernel::pr_warn_once!("PRAMIN: ordering the writes through BAR1 failed\n");
+        }
         core::mem::replace(&mut self.wc, wc)
     }
 
@@ -210,18 +227,22 @@ impl<'gpu> Pramin<'gpu> {
     /// with a single ordering point after the last: reading back through the window is uncached,
     /// and costs far more than the writes.
     pub(super) fn write_u64s(&mut self, vram_addr: VramAddress, values: &[u64]) -> Result {
+        self.write_u64s_posted(vram_addr, values)?;
+        self.order()
+    }
+
+    /// Writes `values` as [`Pramin::write_u64s()`] does, without an ordering point: they may still
+    /// be on their way to VRAM until [`Pramin::order()`], or a read through this manager.
+    pub(super) fn write_u64s_posted(&mut self, vram_addr: VramAddress, values: &[u64]) -> Result {
+        if values.is_empty() {
+            return Ok(());
+        }
         let bytes = AsBytes::as_bytes(values);
         if let (Some(offset), Some(wc)) = (self.wc_offset(vram_addr, bytes.len()), &self.wc) {
-            if bytes.is_empty() {
-                return Ok(());
-            }
             let end = offset.checked_add(bytes.len()).ok_or(EINVAL)?;
             let bar1 = wc.bar1.as_view().as_bytes();
             io_project!(bar1, [try: offset..end]).copy_from_slice(bytes);
-            // Flush the writes out of the CPU, then the ordering point.
-            mb(Write);
-            let view: Mmio<'_, u8> = io_project!(wc.bar1.as_view(), try: OffsetLoc::new(offset));
-            view.read_val();
+            self.pending.wc = true;
             return Ok(());
         }
 
@@ -234,15 +255,58 @@ impl<'gpu> Pramin<'gpu> {
                 .checked_add(size_of::<u64>().into_safe_cast())
                 .ok_or(EINVAL)?;
         }
-
-        if !values.is_empty() {
-            // The ordering point, as `PraminAccess` inserts on drop.
-            let offset = self.window_offset(vram_addr, size_of::<u8>())?;
-            let view: Mmio<'_, u8> = io_project!(self.window, try: OffsetLoc::new(offset));
-            view.read_val();
-        }
-
+        self.pending.window = true;
         Ok(())
+    }
+
+    /// Makes the writes made since the last ordering point reach VRAM before what follows, such
+    /// as a TLB invalidation: write-combined ones are flushed out of the CPU, then a read through
+    /// each path they took waits for them (PCIe reads don't pass the writes before them).
+    pub(super) fn order(&mut self) -> Result {
+        self.order_wc()?;
+        self.order_window();
+        Ok(())
+    }
+
+    /// The write-combined part of [`Pramin::order()`].
+    fn order_wc(&mut self) -> Result {
+        if core::mem::take(&mut self.pending.wc) {
+            if let Some(wc) = &self.wc {
+                mb(Write);
+                let view: Mmio<'_, u8> =
+                    io_project!(wc.bar1.as_view(), try: OffsetLoc::new(wc.bar1_offset));
+                view.read_val();
+            }
+        }
+        Ok(())
+    }
+
+    /// The PRAMIN window part of [`Pramin::order()`].
+    fn order_window(&mut self) {
+        if core::mem::take(&mut self.pending.window) {
+            self.window.cast::<u8>().read_val();
+        }
+    }
+
+    /// Reads the 64-bit word of VRAM at `vram_addr`, 8-byte aligned, after the writes made before
+    /// it: without an ordering point of its own, which reads don't need.
+    pub(super) fn read_u64(&mut self, vram_addr: VramAddress) -> Result<u64> {
+        // The read orders the writes before it through its own path; those through the other
+        // one, which may have written the word, need their ordering point.
+        if let Some(offset) = self.wc_offset(vram_addr, size_of::<u64>()) {
+            self.order_window();
+            if core::mem::take(&mut self.pending.wc) {
+                mb(Write);
+            }
+            let wc = self.wc.as_ref().ok_or(EINVAL)?;
+            let view: Mmio<'_, u64> = io_project!(wc.bar1.as_view(), try: OffsetLoc::new(offset));
+            return Ok(view.read_val());
+        }
+        self.order_wc()?;
+        self.pending.window = false;
+        let offset = self.window_offset(vram_addr, size_of::<u64>())?;
+        let view: Mmio<'_, u64> = io_project!(self.window, try: OffsetLoc::new(offset));
+        Ok(view.read_val())
     }
 
     /// Return a typed MMIO view of a `T` at `vram_addr`.

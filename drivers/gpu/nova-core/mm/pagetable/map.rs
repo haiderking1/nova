@@ -69,9 +69,8 @@ pub(in crate::mm) struct PreparedPtPage {
     pub(in crate::mm) level: PageTableLevel,
 }
 
-/// Returns the VRAM address of the page table page `alloc`.
-/// Entries to write, gathered so that those following each other are written at once, with a
-/// single ordering point: see [`pramin::Pramin::write_u64s()`].
+/// Entries to write, gathered so that those following each other are written at once, posted:
+/// see [`pramin::Pramin::write_u64s_posted()`].
 struct EntryRun {
     start: VramAddress,
     values: KVec<u64>,
@@ -101,13 +100,14 @@ impl EntryRun {
     /// Writes the entries gathered.
     fn write(&mut self, pramin: &mut pramin::Pramin<'_>) -> Result {
         if !self.values.is_empty() {
-            pramin.write_u64s(self.start, &self.values)?;
+            pramin.write_u64s_posted(self.start, &self.values)?;
             self.values.clear();
         }
         Ok(())
     }
 }
 
+/// Returns the VRAM address of the page table page `alloc`.
 fn table_address(alloc: &Pin<KBox<AllocatedBlocks>>) -> Result<VramAddress> {
     Ok(VramAddress::from_raw(
         alloc.iter().next().ok_or(ENOMEM)?.offset(),
@@ -416,7 +416,7 @@ impl<M: MmuConfig> PtMapInner<M> {
                             i += 1;
                         }
                     }
-                    pramin.write_u64s(pte_addr, &ptes)?;
+                    pramin.write_u64s_posted(pte_addr, &ptes)?;
 
                     if let Some(big_table) = big_table {
                         // Big PTEs the small PTEs just written would be hidden under are
@@ -440,7 +440,8 @@ impl<M: MmuConfig> PtMapInner<M> {
             )?;
         }
 
-        // Flush TLB.
+        // The entries reach VRAM before the TLBs are flushed.
+        mm.pramin_mut().order()?;
         mm.tlb().flush(
             self.pdb_addr,
             Flush {
@@ -576,7 +577,7 @@ impl<M: MmuConfig> PtMapInner<M> {
 
                     ptes.clear();
                     ptes.extend_with(run.len(), invalid_pte, GFP_KERNEL)?;
-                    pramin.write_u64s(pte_addr, &ptes)?;
+                    pramin.write_u64s_posted(pte_addr, &ptes)?;
 
                     // Big pages in the range are unmapped, those it shares with other mappings are
                     // split to keep their pages outside it mapped.
@@ -590,6 +591,7 @@ impl<M: MmuConfig> PtMapInner<M> {
             )?;
         }
 
+        mm.pramin_mut().order()?;
         mm.tlb().flush(
             self.pdb_addr,
             Flush {

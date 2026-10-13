@@ -244,17 +244,12 @@ pub(super) trait PteOps: Copy + core::fmt::Debug + Into<u64> {
 
     /// Read a `PTE` from VRAM.
     fn read(pramin: &mut pramin::Pramin<'_>, addr: VramAddress) -> Result<Self> {
-        let val = pramin.window_at::<u64>(addr)?.view().read_val();
-        Ok(Self::from_raw(val))
+        Ok(Self::from_raw(pramin.read_u64(addr)?))
     }
 
-    /// Write this `PTE` to VRAM.
+    /// Write this `PTE` to VRAM, posted: see [`pramin::Pramin::write_u64s_posted()`].
     fn write(&self, pramin: &mut pramin::Pramin<'_>, addr: VramAddress) -> Result {
-        pramin
-            .window_at::<u64>(addr)?
-            .view()
-            .write_val((*self).into());
-        Ok(())
+        pramin.write_u64s_posted(addr, &[(*self).into()])
     }
 }
 
@@ -280,17 +275,12 @@ pub(super) trait PdeOps: Copy + core::fmt::Debug + Into<u64> {
 
     /// Read a `PDE` from VRAM.
     fn read(pramin: &mut pramin::Pramin<'_>, addr: VramAddress) -> Result<Self> {
-        let val = pramin.window_at::<u64>(addr)?.view().read_val();
-        Ok(Self::from_raw(val))
+        Ok(Self::from_raw(pramin.read_u64(addr)?))
     }
 
-    /// Write this `PDE` to VRAM.
+    /// Write this `PDE` to VRAM, posted: see [`pramin::Pramin::write_u64s_posted()`].
     fn write(&self, pramin: &mut pramin::Pramin<'_>, addr: VramAddress) -> Result {
-        pramin
-            .window_at::<u64>(addr)?
-            .view()
-            .write_val((*self).into());
-        Ok(())
+        pramin.write_u64s_posted(addr, &[(*self).into()])
     }
 
     /// Check if this `PDE` is valid and points to video memory.
@@ -337,22 +327,15 @@ pub(super) trait DualPdeOps: Copy + core::fmt::Debug {
 
     /// Read a dual PDE (128-bit) from VRAM.
     fn read(pramin: &mut pramin::Pramin<'_>, addr: VramAddress) -> Result<Self> {
-        let lo = pramin.window_at::<u64>(addr)?.view().read_val();
-        let hi = pramin.window_at::<u64>(addr + 8)?.view().read_val();
+        let lo = pramin.read_u64(addr)?;
+        let hi = pramin.read_u64(addr + 8)?;
         Ok(Self::from_raw(lo, hi))
     }
 
-    /// Write this dual PDE (128-bit) to VRAM.
+    /// Write this dual PDE (128-bit) to VRAM, posted: see
+    /// [`pramin::Pramin::write_u64s_posted()`].
     fn write(&self, pramin: &mut pramin::Pramin<'_>, addr: VramAddress) -> Result {
-        pramin
-            .window_at::<u64>(addr)?
-            .view()
-            .write_val(self.big_raw_u64());
-        pramin
-            .window_at::<u64>(addr + 8)?
-            .view()
-            .write_val(self.small_raw_u64());
-        Ok(())
+        pramin.write_u64s_posted(addr, &[self.big_raw_u64(), self.small_raw_u64()])
     }
 }
 
