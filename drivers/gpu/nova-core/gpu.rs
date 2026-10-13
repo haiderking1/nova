@@ -37,7 +37,11 @@ use kernel::{
         Mutex,
         SetOnce, //
     },
-    time::hrtimer::PinHrTimerHandle,
+    time::{
+        hrtimer::PinHrTimerHandle,
+        Instant,
+        Monotonic, //
+    },
     uapi, //
 };
 
@@ -1057,17 +1061,30 @@ impl<'gpu> Gpu<'gpu> {
         let mut mm = this.mm.lock();
 
         let vram = mm.alloc_contiguous(PAGE_TABLE_POOL_SIZE, Alignment::new::<SZ_64K>())?;
+        let start = vram.range().start;
         let mapped = this.bar_user.map_vram(&mut mm, vram.range())?;
-        let bar1_offset = usize::try_from(mapped.start().into_raw());
-        match bar1_offset {
-            Ok(bar1_offset) => {
-                mm.set_page_table_pool(vram, mapped, this.bar_user.bar1(), bar1_offset)
-            }
+        let bar1_offset = match usize::try_from(mapped.start().into_raw()) {
+            Ok(bar1_offset) => bar1_offset,
             Err(err) => {
                 let _ = this.bar_user.unmap(&mut mm, mapped);
-                Err(err.into())
+                return Err(err.into());
             }
-        }
+        };
+        mm.set_page_table_pool(vram, mapped, this.bar_user.bar1(), bar1_offset)?;
+
+        // How fast the CPU writes through the pool, which depends on BAR1 being write-combined
+        // (a hypervisor may map it uncached): 1 MiB of the pool, which no page table uses yet.
+        // About 2.5 ms on GA104, the read ordering every 512 bytes taking most of it; uncached,
+        // tens of milliseconds.
+        let timed = Instant::<Monotonic>::now();
+        mm.clear_vram(start..start + num::usize_as_u64(SZ_1M))?;
+        dev_info!(
+            this.gsp_resources.device,
+            "page table pool: 1 MiB written in {} us\n",
+            (Instant::<Monotonic>::now() - timed).as_micros_ceil()
+        );
+
+        Ok(())
     }
 
     /// Sets up the kernel's channel on a copy engine, which clears new VRAM buffers.
