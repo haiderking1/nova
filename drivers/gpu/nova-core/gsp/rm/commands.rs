@@ -1237,6 +1237,46 @@ rm_control!(
     |p| p.vectors()?
 );
 
+/// RM control command raising the GPU's clocks to their highest for a while, sent to GSP-RM's
+/// internal subdevice, see [`PerfBoostParams`].
+pub(crate) struct PerfBoost(PerfBoostParams);
+
+impl PerfBoost {
+    /// Creates the command boosting the clocks for `duration` seconds.
+    pub(crate) fn new(duration: u32) -> Self {
+        Self(PerfBoostParams::new(duration))
+    }
+}
+
+rm_control!(
+    PerfBoost,
+    Subdevice,
+    InternalPerfBoostSet2x,
+    PerfBoostParams,
+    (),
+    |_p| ()
+);
+
+/// RM control command querying the current performance state (P-state) of the GPU, sent to
+/// GSP-RM's internal subdevice. The reply is the number of the P-state, if GSP-RM reported one.
+pub(crate) struct PerfGetCurrentPstate(PstateParams);
+
+impl PerfGetCurrentPstate {
+    /// Creates the command.
+    pub(crate) fn new() -> Self {
+        Self(PstateParams::new())
+    }
+}
+
+rm_control!(
+    PerfGetCurrentPstate,
+    Subdevice,
+    PerfGetCurrentPstate,
+    PstateParams,
+    Option<u32>,
+    |p| p.pstate()
+);
+
 /// RM control command querying the mask of the enabled GPCs, sent to GSP-RM's internal subdevice.
 pub(crate) struct GpuGetGpcMask(GpcInfoParams);
 

@@ -86,6 +86,10 @@ pub(crate) enum RmControlMsgFunction {
     InternalStaticKgrGetInfo = bindings::NV2080_CTRL_CMD_INTERNAL_STATIC_KGR_GET_INFO,
     /// Get the falcon engines GSP-RM constructed, and the sizes of their channels' contexts.
     GpuGetConstructedFalconInfo = bindings::NV2080_CTRL_CMD_GPU_GET_CONSTRUCTED_FALCON_INFO,
+    /// Raise the GPU's clocks to their highest for a while.
+    InternalPerfBoostSet2x = bindings::NV2080_CTRL_CMD_INTERNAL_PERF_BOOST_SET_2X,
+    /// Get the current performance state (P-state) of the GPU.
+    PerfGetCurrentPstate = bindings::NV2080_CTRL_CMD_PERF_GET_CURRENT_PSTATE,
 }
 
 // TODO[FPRI]: This is a temporary solution to be replaced with the corresponding derive macros
@@ -149,6 +153,10 @@ impl TryFrom<u32> for RmControlMsgFunction {
             bindings::NV2080_CTRL_CMD_GPU_GET_CONSTRUCTED_FALCON_INFO => {
                 Ok(Self::GpuGetConstructedFalconInfo)
             }
+            bindings::NV2080_CTRL_CMD_INTERNAL_PERF_BOOST_SET_2X => {
+                Ok(Self::InternalPerfBoostSet2x)
+            }
+            bindings::NV2080_CTRL_CMD_PERF_GET_CURRENT_PSTATE => Ok(Self::PerfGetCurrentPstate),
             _ => Err(EINVAL),
         }
     }
@@ -1431,6 +1439,56 @@ unsafe impl FromBytes for GpcInfoParams {}
 
 // SAFETY: This struct only contains integer types, without padding.
 unsafe impl AsBytes for GpcInfoParams {}
+
+/// Parameters of `NV2080_CTRL_CMD_INTERNAL_PERF_BOOST_SET_2X`: the GPU's clocks raised to their
+/// highest for `duration` seconds, as kernel RM has GSP-RM do for `NV2080_CTRL_CMD_PERF_BOOST`
+/// (`kperfBoostSet_IMPL()`), which CUDA asks for while it runs work.
+#[repr(transparent)]
+pub(crate) struct PerfBoostParams(bindings::NV2080_CTRL_INTERNAL_PERF_BOOST_SET_PARAMS_2X);
+
+impl PerfBoostParams {
+    /// Creates the parameters boosting the clocks to their highest for `duration` seconds.
+    pub(crate) fn new(duration: u32) -> Self {
+        Self(bindings::NV2080_CTRL_INTERNAL_PERF_BOOST_SET_PARAMS_2X {
+            // An `NvBool`, which kernel RM fills with the low byte of the client's
+            // `NV2080_CTRL_PERF_BOOST_FLAGS_*`, whose command is in bits 1:0.
+            // CAST: the command fits in the byte.
+            flags: bindings::NV2080_CTRL_PERF_BOOST_FLAGS_CMD_BOOST_TO_MAX as u8,
+            duration,
+            ..Default::default()
+        })
+    }
+}
+
+// SAFETY: This struct only contains integer types for which all bit patterns are valid.
+unsafe impl FromBytes for PerfBoostParams {}
+
+// SAFETY: Padding is explicit and will not contain uninitialized data.
+unsafe impl AsBytes for PerfBoostParams {}
+
+/// Parameters of `NV2080_CTRL_CMD_PERF_GET_CURRENT_PSTATE`: the current performance state.
+#[repr(transparent)]
+pub(crate) struct PstateParams(bindings::NV2080_CTRL_PERF_GET_CURRENT_PSTATE_PARAMS);
+
+impl PstateParams {
+    /// Creates the parameters, all filled in by GSP-RM.
+    pub(crate) fn new() -> Self {
+        Self(Default::default())
+    }
+
+    /// Returns the number of the current P-state, P0 being the fastest, if GSP-RM reported one:
+    /// `NV2080_CTRL_PERF_PSTATES_P<n>` is bit `n`.
+    pub(crate) fn pstate(&self) -> Option<u32> {
+        let mask = self.0.currPstate;
+        (mask.count_ones() == 1).then(|| mask.trailing_zeros())
+    }
+}
+
+// SAFETY: This struct only contains integer types for which all bit patterns are valid.
+unsafe impl FromBytes for PstateParams {}
+
+// SAFETY: This struct only contains integer types, without padding.
+unsafe impl AsBytes for PstateParams {}
 
 /// Parameters of `NV2080_CTRL_CMD_GPU_GET_FERMI_TPC_INFO`: the mask of the enabled TPCs of a GPC.
 #[repr(transparent)]

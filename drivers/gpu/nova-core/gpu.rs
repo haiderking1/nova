@@ -39,6 +39,7 @@ use kernel::{
     },
     time::{
         hrtimer::PinHrTimerHandle,
+        Delta,
         Instant,
         Monotonic, //
     },
@@ -113,6 +114,8 @@ use crate::{
         rm::{
             commands::{
                 IntrGetKernelTable,
+                PerfBoost,
+                PerfGetCurrentPstate,
                 RmControl, //
             },
             device::{
@@ -527,6 +530,21 @@ pub enum FenceWait {
     Cpu,
 }
 
+/// How long the GPU's clocks are boosted for at a time while video decoders get work, in seconds,
+/// see [`Gpu::boost_for_video`].
+const VIDEO_BOOST_SECS: u32 = 2;
+
+/// The boost of the GPU's clocks for video decoding, see [`Gpu::boost_for_video`].
+#[derive(Default)]
+struct VideoBoost {
+    /// When the boost was last asked for.
+    last: Option<Instant<Monotonic>>,
+    /// How many times the P-state was logged: before the first boost, then while boosted.
+    logged: u8,
+    /// Whether GSP-RM refused a boost, which isn't asked for again.
+    failed: bool,
+}
+
 /// The semaphore of a client channel's timeline, mapped read-only into the address space of
 /// another client, whose channels wait for its fences on the GPU, see [`Gpu::channel_wait`].
 struct PeerSemaphore<'a> {
@@ -605,6 +623,9 @@ pub(crate) struct Gpu<'gpu> {
     /// Locked before `mm`.
     #[pin]
     peer_semaphores: Mutex<KVec<PeerSemaphore<'gpu>>>,
+    /// The boost of the GPU's clocks while video decoders get work.
+    #[pin]
+    video_boost: Mutex<VideoBoost>,
     /// GPU memory manager owning memory management resources.
     ///
     /// Must be kept declared *before* `gsp_resources`, so that its components are dropped while
@@ -967,6 +988,8 @@ impl<'gpu> Gpu<'gpu> {
             ),
 
             peer_semaphores <- new_mutex!(KVec::new(), "nova_peer_semaphores"),
+
+            video_boost <- new_mutex!(VideoBoost::default(), "nova_video_boost"),
 
             // Create GPU memory manager owning memory management resources.
             mm <- new_mutex!({
@@ -2273,6 +2296,9 @@ impl<'gpu> Gpu<'gpu> {
         pushes: &[PushBuffer],
     ) -> Result<ARef<Fence>> {
         let channel = self.client_channel(chid)?;
+        if Option::as_ref(&*channel.lock()).is_some_and(|c| c.is_video_decoder()) {
+            self.boost_for_video();
+        }
 
         let mut channel = channel.lock();
         let channel = Option::as_mut(&mut *channel).ok_or(ENOENT)?;
@@ -2280,6 +2306,59 @@ impl<'gpu> Gpu<'gpu> {
         channel.wait_for_room(pushes.len(), waits.len())?;
 
         channel.submit(self.gsp_resources.bar, &mut &self.mm, waits, pushes)
+    }
+
+    /// Keeps the GPU's clocks at their highest while video decoders get work, as CUDA, which
+    /// NVIDIA's VA-API driver decodes with, has kernel RM keep them while it runs work
+    /// (`NV2080_CTRL_CMD_PERF_BOOST`).
+    ///
+    /// The decoders run at the clocks of the GPU's performance state, which GSP-RM doesn't raise
+    /// for their work alone: a 4K AV1 frame then takes about 12 ms to decode, 30 for the heavier
+    /// ones, and players decoding a frame at a time, waiting for each, drop frames. The boost
+    /// lasts [`VIDEO_BOOST_SECS`], and is asked for again once less than a second of it is left.
+    fn boost_for_video(&self) {
+        let now = Instant::now();
+        let mut boost = self.video_boost.lock();
+        if boost.failed
+            || boost
+                .last
+                .is_some_and(|last| now - last < Delta::from_secs(1))
+        {
+            return;
+        }
+
+        let dev = self.gsp_resources.device.as_ref();
+        let cmdq = &self.gsp_resources.gsp.cmdq;
+        let info = &self.gsp_static_info;
+        if boost.logged < 2 {
+            let pstate =
+                RmControl::new(info.client(), info.subdevice(), PerfGetCurrentPstate::new())
+                    .send(dev, cmdq);
+            let when = if boost.logged == 0 {
+                "before the clock boost"
+            } else {
+                "while boosted"
+            };
+            dev_dbg!(dev, "video decode: P-state {:?} {}\n", pstate, when);
+            boost.logged += 1;
+        }
+        match RmControl::new(
+            info.client(),
+            info.subdevice(),
+            PerfBoost::new(VIDEO_BOOST_SECS),
+        )
+        .send(dev, cmdq)
+        {
+            Ok(()) => boost.last = Some(now),
+            Err(err) => {
+                dev_warn!(
+                    dev,
+                    "video decode: GSP-RM refused a clock boost: {:?}\n",
+                    err
+                );
+                boost.failed = true;
+            }
+        }
     }
 
     /// Returns the channel `chid` of a client.

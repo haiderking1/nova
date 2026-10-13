@@ -484,6 +484,11 @@ impl<'a> ClientChannel<'a> {
         self.timeline.fail(err);
     }
 
+    /// Returns whether the channel runs on a video decoder engine.
+    pub(crate) fn is_video_decoder(&self) -> bool {
+        matches!(self.engine, ChannelEngine::VideoDecoder)
+    }
+
     /// Returns the fences of the channel's submissions.
     pub(crate) fn timeline(&self) -> &Arc<Timeline<'a>> {
         &self.timeline

@@ -68,6 +68,9 @@ pub const NV2080_CTRL_CMD_INTERNAL_STATIC_KGR_GET_CONTEXT_BUFFERS_INFO: u32 = 54
 pub const NV2080_CTRL_CMD_INTERNAL_DISPLAY_WRITE_INST_MEM: u32 = 545262153;
 pub const NV2080_CTRL_CMD_INTERNAL_DISPLAY_CHANNEL_PUSHBUFFER: u32 = 545262168;
 pub const NV2080_CTRL_CMD_INTERNAL_INTR_GET_KERNEL_TABLE: u32 = 545262172;
+pub const NV2080_CTRL_CMD_INTERNAL_PERF_BOOST_SET_2X: u32 = 545262234;
+pub const NV2080_CTRL_CMD_PERF_GET_CURRENT_PSTATE: u32 = 545267816;
+pub const NV2080_CTRL_PERF_BOOST_FLAGS_CMD_BOOST_TO_MAX: u32 = 2;
 pub const NV2080_CTRL_INTERNAL_INTR_MAX_TABLE_SIZE: u32 = 128;
 pub const NV2080_NOCAT_JOURNAL_REC_TYPE_ASSERT: u32 = 5;
 pub const NV2080_ENGINE_TYPE_GRAPHICS: u32 = 1;
@@ -808,6 +811,18 @@ pub struct NV2080_CTRL_GPU_EVICT_CTX_PARAMS {
     pub ChID: u32_,
     pub hChanClient: u32_,
     pub hObject: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV2080_CTRL_INTERNAL_PERF_BOOST_SET_PARAMS_2X {
+    pub flags: u8_,
+    pub __bindgen_padding_0: [u8; 3usize],
+    pub duration: u32_,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
+pub struct NV2080_CTRL_PERF_GET_CURRENT_PSTATE_PARAMS {
+    pub currPstate: u32_,
 }
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone, MaybeZeroable)]
