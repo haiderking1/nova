@@ -34,6 +34,7 @@ use crate::{
     mm::{
         vmm::MappedRange,
         Pfn,
+        PfnRuns,
         VramAddress,
         PAGE_SIZE, //
     },
@@ -110,20 +111,20 @@ impl VramBuffer {
         (end >= needed).then(|| VramAddress::from_raw(start))
     }
 
-    /// Returns the frame numbers of the VRAM pages of the buffer, in order.
-    pub(crate) fn pfns(&self) -> Result<KVVec<Pfn>> {
+    /// Returns the VRAM pages of the buffer, in order, as the runs of its blocks.
+    pub(crate) fn runs(&self) -> Result<PfnRuns> {
         let page_size: u64 = PAGE_SIZE.into_safe_cast();
-        let mut pfns = KVVec::with_capacity(self.size / PAGE_SIZE, GFP_KERNEL)?;
+        let mut runs = PfnRuns::with_capacity(self.blocks.iter().count())?;
         for block in self.blocks.iter() {
-            let start = block.offset() / page_size;
-            for pfn in start..start + block.size() / page_size {
-                pfns.push(Pfn::new(pfn), GFP_KERNEL)?;
-            }
+            runs.push(
+                Pfn::new(block.offset() / page_size),
+                usize::try_from(block.size() / page_size)?,
+            )?;
         }
         // Blocks may be larger than asked for: only the buffer's pages are its.
-        pfns.truncate(self.size / PAGE_SIZE);
+        runs.truncate(self.size / PAGE_SIZE);
 
-        Ok(pfns)
+        Ok(runs)
     }
 
     /// Gives the buffer the window `mapped` in BAR1, at physical address `phys`.
@@ -211,22 +212,22 @@ impl SystemBuffer {
         self.vaddr
     }
 
-    /// Returns the frame numbers of the pages of the buffer, as the GPU addresses them through
-    /// DMA, in order.
-    pub(crate) fn dma_pfns(&self) -> Result<KVVec<Pfn>> {
+    /// Returns the pages of the buffer, as the GPU addresses them through DMA, in order, as the
+    /// runs of its scatter-gather table.
+    pub(crate) fn dma_runs(&self) -> Result<PfnRuns> {
         let page_size: u64 = PAGE_SIZE.into_safe_cast();
-        let mut pfns = KVVec::with_capacity(self.size / PAGE_SIZE, GFP_KERNEL)?;
+        let mut runs = PfnRuns::with_capacity(self.sgt.iter().count())?;
         for entry in self.sgt.iter() {
-            let start = entry.dma_address() / page_size;
-            for pfn in start..start + u64::from(entry.dma_len()) / page_size {
-                pfns.push(Pfn::new(pfn), GFP_KERNEL)?;
-            }
+            runs.push(
+                Pfn::new(entry.dma_address() / page_size),
+                usize::try_from(entry.dma_len() / page_size)?,
+            )?;
         }
-        if pfns.len() != self.size / PAGE_SIZE {
+        if runs.len() != self.size / PAGE_SIZE {
             return Err(EINVAL);
         }
 
-        Ok(pfns)
+        Ok(runs)
     }
 
     /// Maps the buffer into `vma`, which spans at most its size, cached like the kernel's

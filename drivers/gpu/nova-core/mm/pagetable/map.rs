@@ -43,6 +43,7 @@ use crate::{
         tlb::Flush,
         vmm::VmmKind,
         GpuMm,
+        Pages,
         Pfn,
         Vfn,
         VirtualAddress,
@@ -221,19 +222,17 @@ impl<M: MmuConfig> PtMapInner<M> {
         Ok(Some(walked))
     }
 
-    /// Returns whether the pages `pfns` of `aperture` can be mapped with a big page.
-    fn is_big_page(aperture: AperturePte, pfns: &[Pfn]) -> bool {
-        let Some(first) = pfns.first() else {
-            return false;
-        };
+    /// Returns the frame of the big page that the pages of `pages` of `aperture` from page `i`
+    /// make up, if they make up one: contiguous VRAM, from a big-page aligned frame.
+    fn big_page(aperture: AperturePte, pages: Pages<'_>, i: usize) -> Option<Pfn> {
         let pages_per_big: u64 = PAGES_PER_BIG_PAGE.into_safe_cast();
-        aperture == AperturePte::VideoMemory
-            && pfns.len() == PAGES_PER_BIG_PAGE
-            && first.raw() % pages_per_big == 0
-            && pfns
-                .iter()
-                .zip(first.raw()..)
-                .all(|(pfn, want)| pfn.raw() == want)
+        if aperture != AperturePte::VideoMemory {
+            return None;
+        }
+
+        pages
+            .contiguous_from(i, PAGES_PER_BIG_PAGE)
+            .filter(|first| first.raw() % pages_per_big == 0)
     }
 
     /// Returns whether the `num_pages` pages from `vfn` cover a whole big page in the PTE-level
@@ -423,7 +422,7 @@ impl<M: MmuConfig> PtMapInner<M> {
         page_table_allocs: &mut KVec<Pin<KBox<AllocatedBlocks>>>,
         tables: &mut TableCache,
         vfn_start: Vfn,
-        pfns: &[Pfn],
+        pages: Pages<'_>,
         access: Access,
         aperture: AperturePte,
     ) -> Result {
@@ -471,7 +470,7 @@ impl<M: MmuConfig> PtMapInner<M> {
                 pramin,
                 tables,
                 vfn_start,
-                pfns.len(),
+                pages.len(),
                 |pramin, run, vfn, tables| {
                     let Some((pte_addr, big_table)) = tables else {
                         kernel::pr_warn_once!("VMM: page table missing for VFN {vfn:?}\n");
@@ -489,24 +488,26 @@ impl<M: MmuConfig> PtMapInner<M> {
                     while i < run.end {
                         let i_u64: u64 = i.into_safe_cast();
                         let page = Vfn::new(vfn_start.raw() + i_u64);
-                        let big_pfns = pfns.get(i..i + PAGES_PER_BIG_PAGE).unwrap_or(&[]);
-                        if let Some(big_table) = big_table.filter(|_| {
-                            self.big_pages
-                                && page.raw() % pages_per_big == 0
-                                && i + PAGES_PER_BIG_PAGE <= run.end
-                                && Self::is_big_page(aperture, big_pfns)
-                        }) {
+                        let big = big_table
+                            .filter(|_| {
+                                self.big_pages
+                                    && page.raw() % pages_per_big == 0
+                                    && i + PAGES_PER_BIG_PAGE <= run.end
+                            })
+                            .and_then(|table| Some((table, Self::big_page(aperture, pages, i)?)));
+                        if let Some((big_table, first)) = big {
                             ptes.extend_with(PAGES_PER_BIG_PAGE, invalid_pte, GFP_KERNEL)?;
                             big_ptes.push(
                                 (
                                     PtWalkInner::<M>::big_pte_addr(big_table, page),
-                                    M::Pte::new(aperture, big_pfns[0], access),
+                                    M::Pte::new(aperture, first, access),
                                 ),
                                 GFP_KERNEL,
                             )?;
                             i += PAGES_PER_BIG_PAGE;
                         } else {
-                            ptes.push(M::Pte::new(aperture, pfns[i], access).into(), GFP_KERNEL)?;
+                            let pfn = pages.get(i).ok_or(EINVAL)?;
+                            ptes.push(M::Pte::new(aperture, pfn, access).into(), GFP_KERNEL)?;
                             i += 1;
                         }
                     }
@@ -763,7 +764,7 @@ impl PtMap {
         page_table_allocs: &mut KVec<Pin<KBox<AllocatedBlocks>>>,
         tables: &mut TableCache,
         vfn_start: Vfn,
-        pfns: &[Pfn],
+        pages: Pages<'_>,
         access: Access,
         aperture: AperturePte,
     ) -> Result {
@@ -775,7 +776,7 @@ impl PtMap {
                 page_table_allocs,
                 tables,
                 vfn_start,
-                pfns,
+                pages,
                 access,
                 aperture
             )

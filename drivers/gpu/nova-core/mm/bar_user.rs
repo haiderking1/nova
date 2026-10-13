@@ -34,6 +34,7 @@ use crate::{
             VmmKind, //
         },
         GpuMm,
+        Pages,
         Pfn,
         Vfn,
         VirtualAddress,
@@ -98,14 +99,14 @@ impl<'a> BarUser<'a> {
     pub(crate) fn map(
         &self,
         mm: &mut GpuMm<'_>,
-        pfns: &[Pfn],
+        pages: Pages<'_>,
         access: Access,
     ) -> Result<BarUserAccess<'_>> {
-        if pfns.is_empty() {
+        if pages.is_empty() {
             return Err(EINVAL);
         }
         let mut vmm = self.vmm.lock();
-        let mapped = vmm.map_pages(mm, pfns, None, access)?;
+        let mapped = vmm.map_pages(mm, pages, None, access)?;
 
         Ok(BarUserAccess {
             bar_user: self,
@@ -123,27 +124,22 @@ impl<'a> BarUser<'a> {
         mm: &mut GpuMm<'_>,
         vram: Range<VramAddress>,
     ) -> Result<MappedRange> {
-        let (start, end) = (vram.start.into_raw(), vram.end.into_raw());
-        let page_size: u64 = PAGE_SIZE.into_safe_cast();
-        if start % page_size != 0 || end % page_size != 0 || start >= end {
-            return Err(EINVAL);
-        }
-
-        let mut pfns = KVec::new();
-        for pfn in (start / page_size)..(end / page_size) {
-            pfns.push(Pfn::new(pfn), GFP_KERNEL)?;
-        }
+        let pages = Pages::of_range(vram.start.into_raw()..vram.end.into_raw())?;
 
         self.vmm
             .lock()
-            .map_pages(mm, &pfns, None, Access::READ_WRITE)
+            .map_pages(mm, pages, None, Access::READ_WRITE)
     }
 
-    /// Like [`BarUser::map_vram()`], for the VRAM pages `pfns`, mapped in order.
-    pub(crate) fn map_vram_pages(&self, mm: &mut GpuMm<'_>, pfns: &[Pfn]) -> Result<MappedRange> {
+    /// Like [`BarUser::map_vram()`], for the VRAM pages `pages`, mapped in order.
+    pub(crate) fn map_vram_pages(
+        &self,
+        mm: &mut GpuMm<'_>,
+        pages: Pages<'_>,
+    ) -> Result<MappedRange> {
         self.vmm
             .lock()
-            .map_pages(mm, pfns, None, Access::READ_WRITE)
+            .map_pages(mm, pages, None, Access::READ_WRITE)
     }
 
     /// Tear down a mapping made by [`BarUser::map_vram()`] or [`BarUser::map_vram_pages()`].
@@ -321,8 +317,13 @@ pub(crate) fn run_self_test(
     bar1_pdb: u64,
     chipset: Chipset,
 ) -> Result {
+    use crate::mm::{
+        pagetable::BIG_PAGE_SIZE,
+        PfnRuns, //
+    };
     use kernel::{
         gpu::buddy::{
+            GpuBuddyAllocFlag,
             GpuBuddyAllocFlags,
             GpuBuddyAllocMode, //
         },
@@ -370,7 +371,7 @@ pub(crate) fn run_self_test(
     let mut vmm = bar_user.vmm.lock();
 
     // Create a test mapping.
-    let mapped = vmm.map_pages(mm, &[test_pfn], None, Access::READ_WRITE)?;
+    let mapped = vmm.map_pages(mm, Pages::Each(&[test_pfn]), None, Access::READ_WRITE)?;
     let test_vfn = mapped.vfn_start;
 
     // Pre-compute test addresses for the PRAMIN to BAR1 read test.
@@ -405,7 +406,7 @@ pub(crate) fn run_self_test(
 
     // Test 2: Two-phase prepare/execute API.
     let prepared = vmm.prepare_map(mm, 1, None)?;
-    let mapped2 = vmm.execute_map(mm, prepared, &[test_pfn], Access::READ_WRITE)?;
+    let mapped2 = vmm.execute_map(mm, prepared, Pages::Each(&[test_pfn]), Access::READ_WRITE)?;
     let readback = vmm.read_mapping(mm, mapped2.vfn_start)?;
     let test2_passed = if readback == Some(test_pfn) {
         true
@@ -473,7 +474,7 @@ pub(crate) fn run_self_test(
             )?;
         }
 
-        let mapped = vmm.map_pages(mm, &pfns, None, Access::READ_WRITE)?;
+        let mapped = vmm.map_pages(mm, Pages::Each(&pfns), None, Access::READ_WRITE)?;
         let bar1_base_vfn: usize = mapped.vfn_start.raw().into_safe_cast();
         let bar1_base = bar1_base_vfn.checked_mul(PAGE_SIZE).ok_or(EOVERFLOW)?;
 
@@ -521,11 +522,55 @@ pub(crate) fn run_self_test(
         test3_passed = false;
     }
 
+    // Test 3b: pages given as runs map the frames they list. The split blocks of Test 3 are
+    // mapped at once, whole and from their second page, then a big-page aligned contiguous
+    // block, which maps with big pages.
+    let big_block = KBox::pin_init(
+        mm.buddy().alloc_blocks(
+            GpuBuddyAllocMode::Simple,
+            (2 * BIG_PAGE_SIZE).into_safe_cast(),
+            Alignment::new::<BIG_PAGE_SIZE>(),
+            GpuBuddyAllocFlag::Contiguous,
+        ),
+        GFP_KERNEL,
+    )?;
+    let mut test3b_passed = true;
+    for (blocks, skip) in [(&blocks, 0), (&blocks, 1), (&big_block, 0)] {
+        let page_size: u64 = PAGE_SIZE.into_safe_cast();
+        let mut runs = PfnRuns::with_capacity(0)?;
+        let mut each = KVec::new();
+        for block in blocks.iter() {
+            let first = block.offset() / page_size;
+            runs.push(Pfn::new(first), (block.size() / page_size).into_safe_cast())?;
+            for pfn in first..first + block.size() / page_size {
+                each.push(Pfn::new(pfn), GFP_KERNEL)?;
+            }
+        }
+        let pages = runs.pages().sub(skip..runs.len()).ok_or(EINVAL)?;
+        let mapped = vmm.map_pages(mm, pages, None, Access::READ_WRITE)?;
+        for (i, want) in each.iter().skip(skip).enumerate() {
+            let i_u64: u64 = i.into_safe_cast();
+            let got = vmm.read_mapping(mm, Vfn::new(mapped.vfn_start.raw() + i_u64))?;
+            if got != Some(*want) {
+                dev_err!(
+                    dev,
+                    "MM: Test 3b FAILED page {} from {}: mapped {:?}, not {:?}\n",
+                    i,
+                    skip,
+                    got,
+                    want
+                );
+                test3b_passed = false;
+            }
+        }
+        vmm.unmap_pages(mm, mapped)?;
+    }
+
     // Unlock the VMM before Test 4 maps through the BarUser.
     drop(vmm);
 
     // Test 4: Exercise `BarUser::map()` end-to-end.
-    let access = bar_user.map(mm, &[test_pfn], Access::READ_WRITE)?;
+    let access = bar_user.map(mm, Pages::Each(&[test_pfn]), Access::READ_WRITE)?;
 
     // Write pattern via PRAMIN, read via BarUserAccess.
     mm.pramin_mut()
@@ -547,7 +592,7 @@ pub(crate) fn run_self_test(
     };
     access.release(mm)?;
 
-    if test1_passed && test2_passed && test3_passed && test4_passed {
+    if test1_passed && test2_passed && test3_passed && test3b_passed && test4_passed {
         dev_info!(dev, "MM: All self-tests PASSED\n");
         Ok(())
     } else {

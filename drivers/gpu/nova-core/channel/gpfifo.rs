@@ -74,7 +74,9 @@ use crate::{
         ContiguousVram,
         GpuMm,
         MmAccess,
+        Pages,
         Pfn,
+        PfnRuns,
         VramAddress, //
     },
     num, //
@@ -305,18 +307,18 @@ impl<'a> Channel<'a> {
         // The memory manager is only taken for the memory: GSP-RM's work goes on without it.
         let mut set_up = |channel: &mut Self, client_space: Option<&mut AddressSpace>| -> Result {
             // The GPU's 4 KiB frames of the chunks, in order.
-            let mut control = KVec::with_capacity(CONTROL_SIZE / SZ_4K, GFP_KERNEL)?;
+            let mut control = PfnRuns::with_capacity(channel.control.len())?;
             for chunk in &channel.control {
-                for offset in (0..CONTROL_CHUNK_SIZE).step_by(SZ_4K) {
-                    let dma = chunk.dma_address() + num::usize_as_u64(offset);
-                    control.push(Pfn::new(dma >> 12), GFP_KERNEL)?;
-                }
+                control.push(
+                    Pfn::new(chunk.dma_address() >> 12),
+                    CONTROL_CHUNK_SIZE / SZ_4K,
+                )?;
             }
             let space = channel.space_mut(client_space)?;
             let control_mapped = mm.with(|mm| {
                 space.map_sysmem_pages_aligned(
                     mm,
-                    &control,
+                    control.pages(),
                     num::usize_as_u64(SZ_4K),
                     Access::READ_WRITE,
                 )
@@ -512,15 +514,15 @@ impl<'a> Channel<'a> {
         self.own_space()?.map_vram(mm, range, access)
     }
 
-    /// Like [`Channel::map_vram`], for the pages `pfns` of `memory`, in order.
+    /// Like [`Channel::map_vram`], for the pages `pages` of `memory`, in order.
     pub(crate) fn map_pages(
         &mut self,
         mm: &mut GpuMm<'_>,
-        pfns: &[Pfn],
+        pages: Pages<'_>,
         memory: Memory,
         access: Access,
     ) -> Result<MappedRange> {
-        self.own_space()?.map_pages(mm, pfns, memory, access)
+        self.own_space()?.map_pages(mm, pages, memory, access)
     }
 
     /// Like [`Channel::map_vram`], but at a virtual address aligned to `alignment`, a power of

@@ -52,7 +52,7 @@ use crate::{
         ContiguousVram,
         GpuMm,
         MmAccess,
-        Pfn,
+        Pages,
         VirtualAddress,
         VramAddress,
         PAGE_SIZE, //
@@ -263,17 +263,17 @@ impl AddressSpace {
         self.handle
     }
 
-    /// Maps the pages `pfns` of `memory`, in order, with `access` at a free virtual address,
+    /// Maps the pages `pages` of `memory`, in order, with `access` at a free virtual address,
     /// returned by [`MappedRange::start`]. The mapping must be given back to
     /// [`AddressSpace::unmap`].
     pub(crate) fn map_pages(
         &mut self,
         mm: &mut GpuMm<'_>,
-        pfns: &[Pfn],
+        pages: Pages<'_>,
         memory: Memory,
         access: Access,
     ) -> Result<MappedRange> {
-        self.vmm.map_memory(mm, pfns, None, access, memory)
+        self.vmm.map_memory(mm, pages, None, access, memory)
     }
 
     /// Maps the page-aligned VRAM `range` with `access` at a free virtual address, returned by
@@ -286,7 +286,7 @@ impl AddressSpace {
     ) -> Result<MappedRange> {
         self.vmm.map_pages(
             mm,
-            &Self::pfns(range.start.into_raw()..range.end.into_raw())?,
+            Pages::of_range(range.start.into_raw()..range.end.into_raw())?,
             None,
             access,
         )
@@ -324,15 +324,15 @@ impl AddressSpace {
     }
 
     /// Like [`AddressSpace::map_sysmem_aligned`], for the pages of coherent system memory of
-    /// frames `pfns`, in order, which needn't be contiguous.
+    /// frames `pages`, in order, which needn't be contiguous.
     pub(crate) fn map_sysmem_pages_aligned(
         &mut self,
         mm: &mut GpuMm<'_>,
-        pfns: &[Pfn],
+        pages: Pages<'_>,
         alignment: u64,
         access: Access,
     ) -> Result<MappedRange> {
-        self.map_pfns_aligned(mm, pfns, alignment, access, Memory::SystemCoherent)
+        self.map_pages_aligned(mm, pages, alignment, access, Memory::SystemCoherent)
     }
 
     /// Maps the page-aligned `range` of addresses of `memory` at the lowest free virtual address
@@ -346,23 +346,22 @@ impl AddressSpace {
         access: Access,
         memory: Memory,
     ) -> Result<MappedRange> {
-        let pfns = Self::pfns(range)?;
-        self.map_pfns_aligned(mm, &pfns, alignment, access, memory)
+        self.map_pages_aligned(mm, Pages::of_range(range)?, alignment, access, memory)
     }
 
-    /// Like [`AddressSpace::map_aligned`], for the pages of frames `pfns` of `memory`, in order.
-    fn map_pfns_aligned(
+    /// Like [`AddressSpace::map_aligned`], for the pages `pages` of `memory`, in order.
+    fn map_pages_aligned(
         &mut self,
         mm: &mut GpuMm<'_>,
-        pfns: &[Pfn],
+        pages: Pages<'_>,
         alignment: u64,
         access: Access,
         memory: Memory,
     ) -> Result<MappedRange> {
-        if !alignment.is_power_of_two() || pfns.is_empty() {
+        if !alignment.is_power_of_two() || pages.is_empty() {
             return Err(EINVAL);
         }
-        let size = u64::try_from(pfns.len())?
+        let size = u64::try_from(pages.len())?
             .checked_mul(num::usize_as_u64(PAGE_SIZE))
             .ok_or(EINVAL)?;
         let mut start = self
@@ -376,7 +375,7 @@ impl AddressSpace {
                 .ok_or(ENOSPC)?;
             match self
                 .vmm
-                .map_memory(mm, pfns, Some(start..end), access, memory)
+                .map_memory(mm, pages, Some(start..end), access, memory)
             {
                 // Mapped there already: the next aligned address.
                 Err(err) if err == EEXIST => start = start.checked_add(alignment).ok_or(ENOSPC)?,
@@ -385,28 +384,12 @@ impl AddressSpace {
         }
     }
 
-    /// Returns the frames of the page-aligned address `range`.
-    fn pfns(range: Range<u64>) -> Result<KVec<Pfn>> {
-        let (start, end) = (range.start, range.end);
-        let page_size = u64::try_from(PAGE_SIZE)?;
-        if start % page_size != 0 || end % page_size != 0 || start >= end {
-            return Err(EINVAL);
-        }
-
-        let mut pfns = KVec::new();
-        for pfn in (start / page_size)..(end / page_size) {
-            pfns.push(Pfn::new(pfn), GFP_KERNEL)?;
-        }
-
-        Ok(pfns)
-    }
-
     /// Tears down a mapping made by [`AddressSpace::map_vram`].
     pub(crate) fn unmap(&mut self, mm: &mut GpuMm<'_>, mapped: MappedRange) -> Result {
         self.vmm.unmap_pages(mm, mapped)
     }
 
-    /// Maps the pages `pfns` of `memory`, in order, with `access` at the page-aligned virtual
+    /// Maps the pages `pages` of `memory`, in order, with `access` at the page-aligned virtual
     /// address `start`, replacing what the client mapped there.
     ///
     /// Fails with `EINVAL` unless the address space is a client's, and the pages are outside its
@@ -415,14 +398,14 @@ impl AddressSpace {
         &mut self,
         mm: &mut GpuMm<'_>,
         start: u64,
-        pfns: &[Pfn],
+        pages: Pages<'_>,
         memory: Memory,
         access: Access,
     ) -> Result {
-        self.check_client_range(start, pfns.len())?;
+        self.check_client_range(start, pages.len())?;
 
         self.vmm
-            .map_at(mm, VirtualAddress::from_raw(start), pfns, access, memory)
+            .map_at(mm, VirtualAddress::from_raw(start), pages, access, memory)
     }
 
     /// Tears down the `num_pages` pages the client mapped from the page-aligned virtual address

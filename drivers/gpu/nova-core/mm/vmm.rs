@@ -34,6 +34,7 @@ use crate::{
             MmuVersion, //
         },
         GpuMm,
+        Pages,
         Pfn,
         Vfn,
         VirtualAddress,
@@ -259,7 +260,7 @@ impl Vmm {
         Ok(self.virt_alloc.insert_range(start..end, (), GFP_KERNEL)?)
     }
 
-    /// Maps the pages `pfns` of `memory`, in order, with `access` at the page-aligned virtual
+    /// Maps the pages `pages` of `memory`, in order, with `access` at the page-aligned virtual
     /// address `start`, replacing what was mapped there.
     ///
     /// For ranges [`Vmm::reserve`]d from the allocator, whose owner places mappings itself: the
@@ -268,11 +269,11 @@ impl Vmm {
         &mut self,
         mm: &mut GpuMm<'_>,
         start: VirtualAddress,
-        pfns: &[Pfn],
+        pages: Pages<'_>,
         access: Access,
         memory: Memory,
     ) -> Result {
-        if pfns.is_empty() || start.offset() != 0 {
+        if pages.is_empty() || start.offset() != 0 {
             return Err(EINVAL);
         }
         let vfn_start = Vfn::from(start);
@@ -280,7 +281,7 @@ impl Vmm {
         self.pt_map.prepare_map(
             mm,
             vfn_start,
-            pfns.len(),
+            pages.len(),
             &mut self.page_table_allocs,
             &mut self.pt_pages,
             &self.tables,
@@ -291,7 +292,7 @@ impl Vmm {
             &mut self.page_table_allocs,
             &mut self.tables,
             vfn_start,
-            pfns,
+            pages,
             access,
             memory.aperture(),
         )
@@ -392,10 +393,10 @@ impl Vmm {
         &mut self,
         mm: &mut GpuMm<'_>,
         prepared: PreparedMapping,
-        pfns: &[Pfn],
+        pages: Pages<'_>,
         access: Access,
     ) -> Result<MappedRange> {
-        self.execute_map_memory(mm, prepared, pfns, access, Memory::Vram)
+        self.execute_map_memory(mm, prepared, pages, access, Memory::Vram)
     }
 
     /// Like [`Vmm::execute_map()`], for pages of `memory`.
@@ -403,11 +404,11 @@ impl Vmm {
         &mut self,
         mm: &mut GpuMm<'_>,
         prepared: PreparedMapping,
-        pfns: &[Pfn],
+        pages: Pages<'_>,
         access: Access,
         memory: Memory,
     ) -> Result<MappedRange> {
-        if pfns.len() != prepared.num_pages {
+        if pages.len() != prepared.num_pages {
             self.free_vfn(prepared.vfn_start);
             return Err(EINVAL);
         }
@@ -425,7 +426,7 @@ impl Vmm {
             &mut self.page_table_allocs,
             &mut self.tables,
             vfn_start,
-            pfns,
+            pages,
             access,
             memory.aperture(),
         ) {
@@ -448,29 +449,29 @@ impl Vmm {
     pub(crate) fn map_pages(
         &mut self,
         mm: &mut GpuMm<'_>,
-        pfns: &[Pfn],
+        pages: Pages<'_>,
         va_range: Option<Range<u64>>,
         access: Access,
     ) -> Result<MappedRange> {
-        self.map_memory(mm, pfns, va_range, access, Memory::Vram)
+        self.map_memory(mm, pages, va_range, access, Memory::Vram)
     }
 
     /// Like [`Vmm::map_pages()`], for pages of `memory`.
     pub(crate) fn map_memory(
         &mut self,
         mm: &mut GpuMm<'_>,
-        pfns: &[Pfn],
+        pages: Pages<'_>,
         va_range: Option<Range<u64>>,
         access: Access,
         memory: Memory,
     ) -> Result<MappedRange> {
-        if pfns.is_empty() {
+        if pages.is_empty() {
             return Err(EINVAL);
         }
 
         // Check if provided VA range is sufficient (if provided).
         if let Some(ref range) = va_range {
-            let required: u64 = pfns
+            let required: u64 = pages
                 .len()
                 .checked_mul(PAGE_SIZE)
                 .ok_or(EOVERFLOW)?
@@ -481,8 +482,8 @@ impl Vmm {
             }
         }
 
-        let prepared = self.prepare_map(mm, pfns.len(), va_range)?;
-        self.execute_map_memory(mm, prepared, pfns, access, memory)
+        let prepared = self.prepare_map(mm, pages.len(), va_range)?;
+        self.execute_map_memory(mm, prepared, pages, access, memory)
     }
 
     /// Unmap all pages in a [`MappedRange`] with a single TLB flush.

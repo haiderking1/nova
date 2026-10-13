@@ -158,7 +158,7 @@ use crate::{
             Memory, //
         },
         GpuMm,
-        Pfn,
+        Pages,
         VramAddress,
         PAGE_SIZE, //
     },
@@ -1415,14 +1415,8 @@ impl<'gpu> Gpu<'gpu> {
     /// Copies the frame `shown`, of the size of `dst`, into `dst` with the copy engine, and
     /// returns once the copy is done.
     fn copy_vram_frame(&self, shown: &ShownFrame, dst: &VramPixels) -> Result {
-        let page_size: u64 = PAGE_SIZE.into_safe_cast();
         let (start, end) = (shown.buffer.start.into_raw(), shown.buffer.end.into_raw());
-        let mut pfns = KVVec::new();
-        for pfn in start / page_size..end / page_size {
-            pfns.push(Pfn::new(pfn), GFP_KERNEL)?;
-        }
-        let size = end - start;
-        let source = self.map_for_copy(&pfns, Memory::Vram, size)?;
+        let source = self.map_for_copy(Pages::of_range(start..end)?, Memory::Vram, end - start)?;
 
         let whole = DisplayCopy {
             src_x: 0,
@@ -1453,27 +1447,27 @@ impl<'gpu> Gpu<'gpu> {
     /// The mapping must be given back to [`Gpu::unmap_display_source()`] before `buffer` is
     /// freed. Fails with `ENODEV` if the kernel's copy channel isn't set up.
     pub(crate) fn map_display_source(&self, buffer: BufferRef<'_>) -> Result<DisplaySource> {
-        let (pfns, memory, size) = match buffer {
-            BufferRef::Vram(buffer) => (buffer.pfns()?, Memory::Vram, buffer.size()),
+        let (runs, memory, size) = match buffer {
+            BufferRef::Vram(buffer) => (buffer.runs()?, Memory::Vram, buffer.size()),
             BufferRef::System(buffer) => {
-                (buffer.dma_pfns()?, Memory::SystemCoherent, buffer.size())
+                (buffer.dma_runs()?, Memory::SystemCoherent, buffer.size())
             }
         };
 
-        self.map_for_copy(&pfns, memory, num::usize_as_u64(size))
+        self.map_for_copy(runs.pages(), memory, num::usize_as_u64(size))
     }
 
-    /// Maps the `size` bytes of `memory` of pages `pfns` for the copy engine.
+    /// Maps the `size` bytes of `memory` of pages `pages` for the copy engine.
     ///
     /// Fails with `ENODEV` if the kernel's copy channel isn't set up.
-    fn map_for_copy(&self, pfns: &[Pfn], memory: Memory, size: u64) -> Result<DisplaySource> {
+    fn map_for_copy(&self, pages: Pages<'_>, memory: Memory, size: u64) -> Result<DisplaySource> {
         // `copy` is locked before `mm`.
         let mut copy = self.copy.lock();
         let copy = Option::as_mut(&mut *copy).ok_or(ENODEV)?;
         let mut mm = self.mm.lock();
 
         Ok(DisplaySource {
-            mapped: copy.map_pages(&mut mm, pfns, memory)?,
+            mapped: copy.map_pages(&mut mm, pages, memory)?,
             size,
         })
     }
@@ -1932,19 +1926,19 @@ impl<'gpu> Gpu<'gpu> {
         let blocks = alloc(GpuBuddyAllocFlag::Contiguous.into())
             .or_else(|_| alloc(GpuBuddyAllocFlags::default()))?;
         let mut buffer = VramBuffer::new(blocks, size);
-        let pfns = buffer.pfns()?;
+        let runs = buffer.runs()?;
 
         Self::fill_pages(
             copy,
             &mut mm,
             self.gsp_resources.bar,
-            &pfns,
+            runs.pages(),
             Memory::Vram,
             0,
         )?;
 
         if cpu_visible {
-            let mapped = self.bar_user.map_vram_pages(&mut mm, &pfns)?;
+            let mapped = self.bar_user.map_vram_pages(&mut mm, runs.pages())?;
             let bar1 = pdev.resource_start(crate::driver::bar1_resource_index(pdev)?)?;
             match bar1.checked_add(mapped.start().into_raw()) {
                 Some(phys) => buffer.set_window(mapped, phys),
@@ -1999,8 +1993,8 @@ impl<'gpu> Gpu<'gpu> {
                 let mut copy = self.copy.lock();
                 let copy = Option::as_mut(&mut *copy).ok_or(ENODEV)?;
                 let mut mm = self.mm.lock();
-                let pfns = vram.pfns()?;
-                Self::fill_pages(copy, &mut mm, bar, &pfns, Memory::Vram, VRAM_VALUE)?;
+                let runs = vram.runs()?;
+                Self::fill_pages(copy, &mut mm, bar, runs.pages(), Memory::Vram, VRAM_VALUE)?;
             }
             check("a VRAM buffer filled by the copy engine", VRAM_VALUE, &read)
         })();
@@ -2012,12 +2006,12 @@ impl<'gpu> Gpu<'gpu> {
             let mut copy = self.copy.lock();
             let copy = Option::as_mut(&mut *copy).ok_or(ENODEV)?;
             let mut mm = self.mm.lock();
-            let pfns = system.dma_pfns()?;
+            let runs = system.dma_runs()?;
             Self::fill_pages(
                 copy,
                 &mut mm,
                 bar,
-                &pfns,
+                runs.pages(),
                 Memory::SystemCoherent,
                 SYSTEM_VALUE,
             )?;
@@ -2047,24 +2041,24 @@ impl<'gpu> Gpu<'gpu> {
         Ok(())
     }
 
-    /// Fills the pages `pfns` of `memory` with the 32-bit `value`, with the kernel's copy channel
+    /// Fills the pages `pages` of `memory` with the 32-bit `value`, with the kernel's copy channel
     /// `copy`. Their size must be a multiple of [`VRAM_BUFFER_ALIGN`].
     fn fill_pages(
         copy: &mut CopyChannel<'_>,
         mm: &mut GpuMm<'_>,
         bar: Bar0<'_>,
-        pfns: &[Pfn],
+        pages: Pages<'_>,
         memory: Memory,
         value: u32,
     ) -> Result {
         // Filled in lines of `LINE` bytes.
         const LINE: usize = VRAM_BUFFER_ALIGN;
-        let size = pfns.len().checked_mul(PAGE_SIZE).ok_or(EOVERFLOW)?;
+        let size = pages.len().checked_mul(PAGE_SIZE).ok_or(EOVERFLOW)?;
         if size % LINE != 0 {
             return Err(EINVAL);
         }
 
-        let mapped = copy.map_pages(mm, pfns, memory)?;
+        let mapped = copy.map_pages(mm, pages, memory)?;
         let filled = copy.fill(
             bar,
             mm,

@@ -21,7 +21,7 @@ use crate::{
         },
         GpuMm,
         MmAccess,
-        Pfn,
+        Pages,
         VirtualAddress,
         VramAddress, //
     },
@@ -97,14 +97,15 @@ impl<'a> CopyChannel<'a> {
         self.channel.map_vram(mm, range, Access::READ_WRITE)
     }
 
-    /// Like [`CopyChannel::map_vram`], for the pages `pfns` of `memory`, in order.
+    /// Like [`CopyChannel::map_vram`], for the pages `pages` of `memory`, in order.
     pub(crate) fn map_pages(
         &mut self,
         mm: &mut GpuMm<'_>,
-        pfns: &[Pfn],
+        pages: Pages<'_>,
         memory: Memory,
     ) -> Result<MappedRange> {
-        self.channel.map_pages(mm, pfns, memory, Access::READ_WRITE)
+        self.channel
+            .map_pages(mm, pages, memory, Access::READ_WRITE)
     }
 
     /// Tears down a mapping made by [`CopyChannel::map_vram`] or [`CopyChannel::map_pages`].

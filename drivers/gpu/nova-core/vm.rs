@@ -150,9 +150,9 @@ impl ClientVm {
             return Err(EINVAL);
         }
 
-        let (pfns, memory) = match buffer {
-            BufferRef::Vram(buffer) => (buffer.pfns()?, Memory::Vram),
-            BufferRef::System(buffer) => (buffer.dma_pfns()?, Memory::SystemCoherent),
+        let (runs, memory) = match buffer {
+            BufferRef::Vram(buffer) => (buffer.runs()?, Memory::Vram),
+            BufferRef::System(buffer) => (buffer.dma_runs()?, Memory::SystemCoherent),
         };
         let pages = usize::try_from(offset / page_size)?..usize::try_from(end / page_size)?;
         let access = Access {
@@ -161,8 +161,13 @@ impl ClientVm {
             kind,
         };
 
-        self.space
-            .map_at(mm, addr, pfns.get(pages).ok_or(EINVAL)?, memory, access)
+        self.space.map_at(
+            mm,
+            addr,
+            runs.pages().sub(pages).ok_or(EINVAL)?,
+            memory,
+            access,
+        )
     }
 
     /// Tears down the `size` bytes mapped from the virtual address `addr`, which must be page

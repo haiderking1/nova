@@ -509,6 +509,199 @@ impl From<Pfn> for u64 {
 
 impl_pfn_bounded!(52);
 
+/// A run of physically contiguous pages, in [`PfnRuns`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PfnRun {
+    /// The frame of the first page.
+    first: Pfn,
+    /// How many pages the run has.
+    len: usize,
+    /// How many pages the runs before this one have.
+    offset: usize,
+}
+
+/// The pages of a buffer, in order, as runs of contiguous ones: the blocks of a VRAM buffer, or
+/// the entries of a scatter-gather table. Mapping them takes [`PfnRuns::pages`], which spares
+/// listing them page by page.
+pub(crate) struct PfnRuns {
+    runs: KVVec<PfnRun>,
+    len: usize,
+}
+
+impl PfnRuns {
+    /// Creates an empty list, with room for `runs` runs.
+    pub(crate) fn with_capacity(runs: usize) -> Result<Self> {
+        Ok(Self {
+            runs: KVVec::with_capacity(runs, GFP_KERNEL)?,
+            len: 0,
+        })
+    }
+
+    /// Appends the `len` pages from frame `first`, which extend the last run if they follow it.
+    pub(crate) fn push(&mut self, first: Pfn, len: usize) -> Result {
+        if len == 0 {
+            return Ok(());
+        }
+        let total = self.len.checked_add(len).ok_or(EOVERFLOW)?;
+        let follows = self.runs.last().is_some_and(|last| {
+            u64::try_from(last.len)
+                .is_ok_and(|n| last.first.raw().checked_add(n) == Some(first.raw()))
+        });
+        match self.runs.last_mut() {
+            Some(last) if follows => last.len += len,
+            _ => self.runs.push(
+                PfnRun {
+                    first,
+                    len,
+                    offset: self.len,
+                },
+                GFP_KERNEL,
+            )?,
+        }
+        self.len = total;
+
+        Ok(())
+    }
+
+    /// Drops the pages after the first `len`.
+    pub(crate) fn truncate(&mut self, len: usize) {
+        if len >= self.len {
+            return;
+        }
+        let kept = self.runs.partition_point(|run| run.offset < len);
+        self.runs.truncate(kept);
+        if let Some(last) = self.runs.last_mut() {
+            last.len = len - last.offset;
+        }
+        self.len = len;
+    }
+
+    /// Returns how many pages there are.
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns the pages, for mapping.
+    pub(crate) fn pages(&self) -> Pages<'_> {
+        Pages::Runs {
+            runs: &self.runs,
+            skip: 0,
+            len: self.len,
+        }
+    }
+}
+
+/// The physical pages of a mapping, in order.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Pages<'a> {
+    /// Frames listed one by one.
+    Each(&'a [Pfn]),
+    /// `len` contiguous frames from `first`.
+    Contiguous { first: Pfn, len: usize },
+    /// The pages of `runs` from page `skip`, `len` pages in all.
+    Runs {
+        runs: &'a [PfnRun],
+        skip: usize,
+        len: usize,
+    },
+}
+
+impl<'a> Pages<'a> {
+    /// The page-aligned address `range`, as contiguous pages.
+    pub(crate) fn of_range(range: Range<u64>) -> Result<Self> {
+        let page_size: u64 = PAGE_SIZE.into_safe_cast();
+        if range.start % page_size != 0 || range.end % page_size != 0 || range.start >= range.end {
+            return Err(EINVAL);
+        }
+
+        Ok(Self::Contiguous {
+            first: Pfn::new(range.start / page_size),
+            len: usize::try_from((range.end - range.start) / page_size)?,
+        })
+    }
+
+    /// Returns how many pages there are.
+    pub(crate) fn len(&self) -> usize {
+        match *self {
+            Self::Each(pfns) => pfns.len(),
+            Self::Contiguous { len, .. } | Self::Runs { len, .. } => len,
+        }
+    }
+
+    /// Returns whether there are no pages.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns the run that page `page` of `runs` is in.
+    fn run_of(runs: &[PfnRun], page: usize) -> Option<&PfnRun> {
+        runs.get(runs.partition_point(|run| run.offset + run.len <= page))
+    }
+
+    /// Returns the frame of page `i`, if there are more pages than `i`.
+    pub(crate) fn get(&self, i: usize) -> Option<Pfn> {
+        if i >= self.len() {
+            return None;
+        }
+        match *self {
+            Self::Each(pfns) => pfns.get(i).copied(),
+            Self::Contiguous { first, .. } => Some(Pfn::new(first.raw() + u64::try_from(i).ok()?)),
+            Self::Runs { runs, skip, .. } => {
+                let page = skip + i;
+                let run = Self::run_of(runs, page)?;
+                Some(Pfn::new(
+                    run.first.raw() + u64::try_from(page - run.offset).ok()?,
+                ))
+            }
+        }
+    }
+
+    /// Returns the frame of page `i` if the `n` pages from it are physically contiguous.
+    pub(crate) fn contiguous_from(&self, i: usize, n: usize) -> Option<Pfn> {
+        let end = i.checked_add(n).filter(|&end| n > 0 && end <= self.len())?;
+        let first = self.get(i)?;
+        let contiguous = match *self {
+            Self::Each(pfns) => pfns[i..end]
+                .iter()
+                .zip(first.raw()..)
+                .all(|(pfn, want)| pfn.raw() == want),
+            Self::Contiguous { .. } => true,
+            Self::Runs { runs, skip, .. } => {
+                let run = Self::run_of(runs, skip + i)?;
+                skip + end <= run.offset + run.len
+            }
+        };
+
+        contiguous.then_some(first)
+    }
+
+    /// Returns the pages in `range`, if there are that many.
+    pub(crate) fn sub(&self, range: Range<usize>) -> Option<Self> {
+        if range.start > range.end || range.end > self.len() {
+            return None;
+        }
+        let len = range.end - range.start;
+        Some(match *self {
+            Self::Each(pfns) => Self::Each(pfns.get(range)?),
+            Self::Contiguous { first, .. } => Self::Contiguous {
+                first: Pfn::new(first.raw() + u64::try_from(range.start).ok()?),
+                len,
+            },
+            Self::Runs { runs, skip, .. } => Self::Runs {
+                runs,
+                skip: skip + range.start,
+                len,
+            },
+        })
+    }
+}
+
+impl<'a> From<&'a [Pfn]> for Pages<'a> {
+    fn from(pfns: &'a [Pfn]) -> Self {
+        Self::Each(pfns)
+    }
+}
+
 /// Virtual Frame Number.
 ///
 /// Represents a virtual page in GPU address space.
