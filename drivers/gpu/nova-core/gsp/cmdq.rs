@@ -759,6 +759,11 @@ struct CmdqInner<'a> {
 }
 
 impl CmdqInner<'_> {
+    /// How often the message queue is polled for a reply at first, see [`Self::wait_for_msg`].
+    const FINE_POLL: Delta = Delta::from_micros(20);
+    /// How long the message queue is polled every [`Self::FINE_POLL`].
+    const FINE_POLL_TIMEOUT: Delta = Delta::from_millis(2);
+
     /// Timeout for waiting for space on the command queue.
     const ALLOCATE_TIMEOUT: Delta = Delta::from_secs(1);
 
@@ -888,14 +893,27 @@ impl CmdqInner<'_> {
     ///
     /// Error codes returned by the message constructor are propagated as-is.
     fn wait_for_msg(&self, timeout: Delta) -> Result<GspMessage<'_>> {
-        // Wait for a message to arrive from the GSP.
-        let (slice_1, slice_2) = read_poll_timeout(
-            || Ok(self.gsp_mem.driver_read_area()),
-            |driver_area| !driver_area.0.is_empty(),
-            Delta::from_millis(1),
-            timeout,
-        )
-        .map(|(slice_1, slice_2)| (slice_1.as_flattened(), slice_2.as_flattened()))?;
+        // Wait for a message to arrive from the GSP. GSP-RM answers most commands within a few
+        // hundred microseconds, without raising its event interrupt: the queue is polled finely
+        // at first, and then coarsely for the few commands that take milliseconds.
+        let read_area = || Ok(self.gsp_mem.driver_read_area());
+        let posted = |driver_area: &(&[_], &[_])| !driver_area.0.is_empty();
+        let fine_timeout = if timeout < Self::FINE_POLL_TIMEOUT {
+            timeout
+        } else {
+            Self::FINE_POLL_TIMEOUT
+        };
+        let (slice_1, slice_2) =
+            match read_poll_timeout(read_area, posted, Self::FINE_POLL, fine_timeout) {
+                Err(e) if e == ETIMEDOUT && timeout > fine_timeout => read_poll_timeout(
+                    read_area,
+                    posted,
+                    Delta::from_millis(1),
+                    timeout - fine_timeout,
+                ),
+                polled => polled,
+            }
+            .map(|(slice_1, slice_2)| (slice_1.as_flattened(), slice_2.as_flattened()))?;
 
         // Extract the `GspMsgElement`.
         let (header, slice_1) = GspMsgElement::from_bytes_prefix(slice_1).ok_or(EIO)?;
