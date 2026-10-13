@@ -434,6 +434,10 @@ impl DualPdeOps for DualPde {
         PdeOps::table_vram_address(&self.small)
     }
 
+    fn big_aperture(&self) -> AperturePde {
+        self.big.aperture()
+    }
+
     fn big_vram_address(&self) -> VramAddress {
         self.big.table_vram_address()
     }

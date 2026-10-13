@@ -29,7 +29,8 @@ use crate::{
         pagetable::Access,
         vmm::{
             MappedRange,
-            Vmm, //
+            Vmm,
+            VmmKind, //
         },
         GpuMm,
         Pfn,
@@ -69,7 +70,7 @@ impl<'a> BarUser<'a> {
     ) -> impl PinInit<Self, Error> + 'a {
         try_pin_init!(Self {
             vmm <- new_mutex!(
-                Vmm::new(pdb_addr, chipset.mmu_version(), va_size, false)?,
+                Vmm::new(pdb_addr, chipset.mmu_version(), va_size, VmmKind::Bar1)?,
                 "bar_user_vmm",
             ),
             bar1,

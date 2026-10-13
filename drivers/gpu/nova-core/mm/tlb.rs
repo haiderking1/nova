@@ -9,13 +9,13 @@
 //! # Examples
 //!
 //! ```ignore
-//! use crate::mm::tlb::Tlb;
+//! use crate::mm::tlb::{Flush, Tlb};
 //!
 //! fn page_table_update(tlb: &Tlb, pdb_addr: VramAddress) -> Result<()> {
-//!     // ... modify page tables ...
+//!     // ... invalidate PTEs ...
 //!
 //!     // Flush TLB to make changes visible (polls for completion).
-//!     tlb.flush(pdb_addr)?;
+//!     tlb.flush(pdb_addr, Flush { bar: false, downgrade: true })?;
 //!
 //!     Ok(())
 //! }
@@ -62,6 +62,18 @@ bounded_enum! {
     }
 }
 
+/// What a TLB flush follows, which decides how it is done, as GSP-RM does it.
+#[derive(Debug, Copy, Clone)]
+pub(crate) struct Flush {
+    /// The address space is BAR1's, which only the HUB MMU translates: the per-GPC TLBs are left
+    /// alone.
+    pub(crate) bar: bool,
+    /// Entries no longer map what they mapped, which may be reused once the flush returns: the
+    /// flush then waits for the accesses made through them to reach memory, and for every TLB to
+    /// acknowledge it.
+    pub(crate) downgrade: bool,
+}
+
 /// TLB manager for GPU translation buffer operations.
 #[pin_data]
 pub(crate) struct Tlb<'gpu> {
@@ -87,8 +99,8 @@ impl<'gpu> Tlb<'gpu> {
     ///
     /// This invalidates all TLB entries associated with the given PDB address.
     /// Must be called after modifying page table entries to ensure the GPU sees
-    /// the updated mappings.
-    pub(super) fn flush(&self, pdb_addr: VramAddress) -> Result {
+    /// the updated mappings; `kind` says what the modification was.
+    pub(super) fn flush(&self, pdb_addr: VramAddress, kind: Flush) -> Result {
         let _guard = self.lock.lock();
 
         // Write PDB address.
@@ -100,10 +112,17 @@ impl<'gpu> Tlb<'gpu> {
         ));
 
         // Trigger flush.
+        let ack = if kind.downgrade {
+            TlbAckMode::Globally
+        } else {
+            TlbAckMode::None
+        };
         self.bar.write_reg(
             regs::NV_TLB_FLUSH_CTRL::zeroed()
                 .with_all_va(true)
-                .with_ack(TlbAckMode::None)
+                .with_hubtlb_only(kind.bar)
+                .with_sys_membar(kind.downgrade)
+                .with_ack(ack)
                 .with_trigger(true),
         );
 

@@ -293,6 +293,10 @@ impl DualPdeOps for DualPde {
         PdeOps::table_vram_address(&self.small)
     }
 
+    fn big_aperture(&self) -> AperturePde {
+        PdeOps::aperture(&self.big)
+    }
+
     fn big_vram_address(&self) -> VramAddress {
         // See `with_big()`: big page tables are 4 KiB aligned.
         PdeOps::table_vram_address(&self.big)

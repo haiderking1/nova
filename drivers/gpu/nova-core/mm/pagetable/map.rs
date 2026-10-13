@@ -40,6 +40,8 @@ use super::{
 use crate::{
     mm::{
         pramin,
+        tlb::Flush,
+        vmm::VmmKind,
         GpuMm,
         Pfn,
         Vfn,
@@ -119,16 +121,19 @@ pub(in crate::mm) struct PtMapInner<M: MmuConfig> {
     /// Whether the address space is set up for [`super::BIG_PAGE_SIZE`] big pages, which VRAM is
     /// then mapped with where it can be.
     big_pages: bool,
+    /// Whether the address space is BAR1's, which only the HUB MMU translates.
+    bar: bool,
     _phantom: PhantomData<M>,
 }
 
 impl<M: MmuConfig> PtMapInner<M> {
-    /// Create a new [`PtMapInner`].
-    pub(super) fn new(pdb_addr: VramAddress, big_pages: bool) -> Self {
+    /// Create a new [`PtMapInner`] for an address space of the kind `space`.
+    pub(super) fn new(pdb_addr: VramAddress, space: VmmKind) -> Self {
         Self {
             walker: PtWalkInner::<M>::new(pdb_addr),
             pdb_addr,
-            big_pages: big_pages && M::BIG_PAGES,
+            big_pages: space == VmmKind::Channel && M::BIG_PAGES,
+            bar: space == VmmKind::Bar1,
             _phantom: PhantomData,
         }
     }
@@ -377,11 +382,10 @@ impl<M: MmuConfig> PtMapInner<M> {
                         kernel::pr_warn_once!("VMM: page table missing for VFN {vfn:?}\n");
                         return Err(EIO);
                     };
-                    let big_table = if self.big_pages {
-                        self.walker.big_table(pramin, vfn)?
-                    } else {
-                        None
-                    };
+                    // Big PTEs, which hide the small ones under them unless unmapped, are
+                    // looked at even where this address space maps no big pages: GSP-RM sets
+                    // up BAR1 with some.
+                    let big_table = self.walker.big_table(pramin, vfn)?;
 
                     // Big PTEs for the whole big pages of physically contiguous VRAM, small
                     // ones (invalid under the big ones) for the rest.
@@ -393,7 +397,8 @@ impl<M: MmuConfig> PtMapInner<M> {
                         let page = Vfn::new(vfn_start.raw() + i_u64);
                         let big_pfns = pfns.get(i..i + PAGES_PER_BIG_PAGE).unwrap_or(&[]);
                         if let Some(big_table) = big_table.filter(|_| {
-                            page.raw() % pages_per_big == 0
+                            self.big_pages
+                                && page.raw() % pages_per_big == 0
                                 && i + PAGES_PER_BIG_PAGE <= run.end
                                 && Self::is_big_page(aperture, big_pfns)
                         }) {
@@ -414,8 +419,8 @@ impl<M: MmuConfig> PtMapInner<M> {
                     pramin.write_u64s(pte_addr, &ptes)?;
 
                     if let Some(big_table) = big_table {
-                        // Big pages mapped before, which the small PTEs just written would be
-                        // hidden under, keep their other pages, with small PTEs.
+                        // Big PTEs the small PTEs just written would be hidden under are
+                        // unmapped, their other pages keeping what they mapped, with small PTEs.
                         let first = vfn;
                         let len: u64 = run.len().into_safe_cast();
                         let mapped_big = |chunk: Vfn| {
@@ -436,14 +441,23 @@ impl<M: MmuConfig> PtMapInner<M> {
         }
 
         // Flush TLB.
-        mm.tlb().flush(self.pdb_addr)
+        mm.tlb().flush(
+            self.pdb_addr,
+            Flush {
+                bar: self.bar,
+                downgrade: false,
+            },
+        )
     }
 
-    /// Splits the valid big pages of `big_table` overlapping the `len` pages from `first`, whose
-    /// small PTEs, from `first_pte` in their PTE-level table, are being rewritten: a small PTE
-    /// is hidden under a valid big PTE. The pages of each outside the range get small PTEs
-    /// mapping what it mapped, and its big PTE is invalidated. The big pages `skip` returns true
-    /// for are left as they are: they are being rewritten too.
+    /// Unmaps the big PTEs of `big_table` overlapping the `len` pages from `first`, whose small
+    /// PTEs, from `first_pte` in their PTE-level table, are being rewritten: the MMU only looks at
+    /// the small PTEs under a big PTE that is unmapped (all zeroes). A valid one maps its big page;
+    /// an invalid one is sparse (`VOL`: reads return zeroes, writes are dropped) or blocks the
+    /// small PTEs (`PRIV`): GSP-RM leaves some of both in BAR1. The pages of each outside the
+    /// range get small PTEs mapping what it mapped, or for an invalid one, its own value, which
+    /// means the same for small PTEs or is merely invalid, and the big PTE is unmapped. The big
+    /// pages `skip` returns true for are left as they are: they are being rewritten too.
     fn split_big_pages(
         pramin: &mut pramin::Pramin<'_>,
         big_table: VramAddress,
@@ -473,17 +487,23 @@ impl<M: MmuConfig> PtMapInner<M> {
                 invalidated.push(pramin, big_pte_addr, invalid_pte)?;
             } else {
                 let big_pte = M::Pte::read(pramin, big_pte_addr)?;
-                if big_pte.is_valid() {
+                let raw: u64 = big_pte.into();
+                if raw != invalid_pte {
                     let mut kept = EntryRun::new();
                     for page in big_page..big_page + pages_per_big {
                         if (first.raw()..end).contains(&page) {
                             continue;
                         }
-                        let pfn = Pfn::new(big_pte.frame_number().raw() + (page - big_page));
+                        let value = if big_pte.is_valid() {
+                            let pfn = Pfn::new(big_pte.frame_number().raw() + (page - big_page));
+                            big_pte.with_pfn(pfn).into()
+                        } else {
+                            raw
+                        };
                         kept.push(
                             pramin,
                             PtWalkInner::<M>::pte_addr(pte_table, Vfn::new(page)),
-                            big_pte.with_pfn(pfn).into(),
+                            value,
                         )?;
                     }
                     kept.write(pramin)?;
@@ -560,11 +580,7 @@ impl<M: MmuConfig> PtMapInner<M> {
 
                     // Big pages in the range are unmapped, those it shares with other mappings are
                     // split to keep their pages outside it mapped.
-                    let big_table = if self.big_pages {
-                        self.walker.big_table(pramin, vfn)?
-                    } else {
-                        None
-                    };
+                    let big_table = self.walker.big_table(pramin, vfn)?;
                     if let Some(big_table) = big_table {
                         let len: u64 = run.len().into_safe_cast();
                         Self::split_big_pages(pramin, big_table, pte_addr, vfn, len, |_| false)?;
@@ -574,7 +590,13 @@ impl<M: MmuConfig> PtMapInner<M> {
             )?;
         }
 
-        mm.tlb().flush(self.pdb_addr)
+        mm.tlb().flush(
+            self.pdb_addr,
+            Flush {
+                bar: self.bar,
+                downgrade: true,
+            },
+        )
     }
 }
 
@@ -596,13 +618,12 @@ pub(in crate::mm) enum PtMap {
 }
 
 impl PtMap {
-    /// Create a new page table mapper for the given MMU version, mapping VRAM with big pages
-    /// where it can if `big_pages`: if the address space is set up for
-    /// [`super::BIG_PAGE_SIZE`] big pages.
-    pub(in crate::mm) fn new(pdb_addr: VramAddress, version: MmuVersion, big_pages: bool) -> Self {
+    /// Create a new page table mapper for the given MMU version, for an address space of the
+    /// kind `space`.
+    pub(in crate::mm) fn new(pdb_addr: VramAddress, version: MmuVersion, space: VmmKind) -> Self {
         match version {
-            MmuVersion::V2 => Self::V2(PtMapInner::<MmuV2>::new(pdb_addr, big_pages)),
-            MmuVersion::V3 => Self::V3(PtMapInner::<MmuV3>::new(pdb_addr, big_pages)),
+            MmuVersion::V2 => Self::V2(PtMapInner::<MmuV2>::new(pdb_addr, space)),
+            MmuVersion::V3 => Self::V3(PtMapInner::<MmuV3>::new(pdb_addr, space)),
         }
     }
 

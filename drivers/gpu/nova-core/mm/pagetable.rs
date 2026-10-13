@@ -323,6 +323,9 @@ pub(super) trait DualPdeOps: Copy + core::fmt::Debug {
     /// Get the small page table VRAM address.
     fn small_vram_address(&self) -> VramAddress;
 
+    /// Get the aperture of the big page table, if [`DualPdeOps::has_big()`].
+    fn big_aperture(&self) -> AperturePde;
+
     /// Get the big page table VRAM address.
     fn big_vram_address(&self) -> VramAddress;
 

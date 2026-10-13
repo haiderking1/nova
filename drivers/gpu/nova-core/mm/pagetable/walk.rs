@@ -39,6 +39,7 @@ use core::marker::PhantomData;
 use kernel::prelude::*;
 
 use super::{
+    AperturePde,
     DualPdeOps,
     MmuConfig,
     MmuV2,
@@ -160,7 +161,8 @@ impl<M: MmuConfig> PtWalkInner<M> {
         Ok(None)
     }
 
-    /// Returns the big page table `vfn` is in, if one is installed.
+    /// Returns the big page table `vfn` is in, if one is installed. Fails if it isn't in VRAM,
+    /// as one GSP-RM set up may not be: its entries can't be seen to then.
     pub(super) fn big_table(
         &self,
         pramin: &mut pramin::Pramin<'_>,
@@ -173,7 +175,17 @@ impl<M: MmuConfig> PtWalkInner<M> {
             return Ok(None);
         };
         let dpde = M::DualPde::read(pramin, addr)?;
-        Ok(dpde.has_big().then(|| dpde.big_vram_address()))
+        if !dpde.has_big() {
+            return Ok(None);
+        }
+        if dpde.big_aperture() != AperturePde::VideoMemory {
+            kernel::pr_warn_once!(
+                "VMM: big page table of VFN {vfn:?} in {:?}, not VRAM\n",
+                dpde.big_aperture()
+            );
+            return Err(ENOTSUPP);
+        }
+        Ok(Some(dpde.big_vram_address()))
     }
 
     /// Returns the address of the PTE of the big page `vfn` is in, in `big_table`, the big page

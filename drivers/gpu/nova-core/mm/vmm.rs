@@ -44,6 +44,17 @@ use crate::{
     },
 };
 
+/// The kinds of address spaces a [`Vmm`] manages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VmmKind {
+    /// BAR1's, through which the CPU reaches VRAM: GSP-RM sets its page directory up, and only
+    /// the HUB MMU translates it. Mapped with small pages.
+    Bar1,
+    /// A channel's, which engines translate: set up for [`super::BIG_PAGE_SIZE`] big pages, and
+    /// VRAM is mapped with them where it can be, virtually and physically aligned and contiguous.
+    Channel,
+}
+
 /// Memory pages are mapped from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Memory {
@@ -183,14 +194,12 @@ pub(crate) struct Vmm {
 impl Vmm {
     /// Create a new [`Vmm`] for the given Page Directory Base address.
     ///
-    /// The [`Vmm`] will manage a virtual address space of `va_size` bytes. If `big_pages`, the
-    /// address space is set up for [`super::BIG_PAGE_SIZE`] big pages, and VRAM is mapped with
-    /// them where it can be: virtually and physically aligned and contiguous.
+    /// The [`Vmm`] will manage a virtual address space of `va_size` bytes, of the kind `space`.
     pub(crate) fn new(
         pdb_addr: VramAddress,
         mmu_version: MmuVersion,
         va_size: u64,
-        big_pages: bool,
+        space: VmmKind,
     ) -> Result<Self> {
         let page_size: u64 = PAGE_SIZE.into_safe_cast();
         let va_pages: usize = (va_size / page_size).into_safe_cast();
@@ -199,7 +208,7 @@ impl Vmm {
         Ok(Self {
             pdb_addr,
             pt_walk: PtWalk::new(pdb_addr, mmu_version),
-            pt_map: PtMap::new(pdb_addr, mmu_version, big_pages),
+            pt_map: PtMap::new(pdb_addr, mmu_version, space),
             page_table_allocs: KVec::new(),
             virt_alloc,
             va_pages,

@@ -610,6 +610,10 @@ register! {
         /// GPC's L2 TLB would be wasted work. Must be false when flushing
         /// mappings that may be cached by compute/graphics engines.
         2:2     hubtlb_only => bool;
+        /// Wait for the memory accesses made through the entries being invalidated to reach
+        /// memory before completing: needed when they no longer map what they mapped, which may
+        /// then be reused.
+        6:6     sys_membar => bool;
         /// Invalidation acknowledgment scope. See [`TlbAckMode`] for details.
         8:7     ack ?=> TlbAckMode;
         /// Write 1 to kick off the flush. Hardware clears this bit when the
