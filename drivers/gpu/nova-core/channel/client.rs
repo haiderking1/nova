@@ -20,11 +20,13 @@ use kernel::{
     device,
     dma_buf::Fence,
     io::poll::read_poll_timeout,
+    new_spinlock,
     page::PAGE_SIZE,
     prelude::*,
     sync::{
         aref::ARef,
-        Arc, //
+        Arc,
+        SpinLock, //
     },
     time::Delta, //
 };
@@ -118,22 +120,105 @@ pub const WAITS_MAX: usize = 8;
 
 /// A fence of another channel's work, which a channel waits for on the GPU, before running the
 /// push buffers of a submission: its semaphore, mapped in the channel's address space.
-#[derive(Clone, Copy, Debug)]
-pub struct GpuWait(pub(crate) Acquire);
+///
+/// The semaphore stays mapped while the wait lives, and then until the submission that waits is
+/// done, see [`PeerWaits`].
+pub struct GpuWait {
+    pub(crate) acquire: Acquire,
+    waits: Arc<PeerWaits>,
+}
 
 impl GpuWait {
     /// Folds `other` into `self` if both are waits for the same channel's work: the wait for
     /// the later of the two waits for both. Returns whether it did.
     pub fn merge(&mut self, other: &GpuWait) -> bool {
-        if self.0.addr != other.0.addr {
+        if self.acquire.addr != other.acquire.addr {
             return false;
         }
         // Sequence numbers wrap: `other` is later when at most 2^31 after.
-        if other.0.payload.wrapping_sub(self.0.payload) < 1 << 31 {
-            self.0.payload = other.0.payload;
+        if other.acquire.payload.wrapping_sub(self.acquire.payload) < 1 << 31 {
+            self.acquire.payload = other.acquire.payload;
         }
 
         true
+    }
+}
+
+impl Drop for GpuWait {
+    fn drop(&mut self) {
+        let mut inner = self.waits.inner.lock();
+        inner.pending -= 1;
+    }
+}
+
+/// The waits on the GPU for the semaphore of a channel that is mapped into the address space of
+/// another client: until they are done, the semaphore must stay mapped, even once its channel
+/// runs no more work, or the channels waiting fault on it.
+#[pin_data]
+pub(crate) struct PeerWaits {
+    #[pin]
+    inner: SpinLock<PeerWaitsInner>,
+}
+
+struct PeerWaitsInner {
+    /// The [`GpuWait`]s alive, which may yet be submitted.
+    pending: usize,
+    /// The last submission of each channel that waited, by channel ID.
+    submitted: KVec<(u32, ARef<Fence>)>,
+    /// Whether a submission that waited went untracked, for lack of memory: the semaphore then
+    /// stays mapped until the address space goes away.
+    untracked: bool,
+}
+
+impl PeerWaits {
+    /// Creates the waits of a newly mapped semaphore.
+    pub(crate) fn new() -> Result<Arc<Self>> {
+        Arc::pin_init(
+            pin_init!(Self {
+                inner <- new_spinlock!(
+                    PeerWaitsInner {
+                        pending: 0,
+                        submitted: KVec::new(),
+                        untracked: false,
+                    },
+                    "nova_peer_waits"
+                ),
+            }),
+            GFP_KERNEL,
+        )
+    }
+
+    /// Returns a wait for the semaphore at `addr` to reach `payload`.
+    pub(crate) fn wait(self: &Arc<Self>, addr: u64, payload: u32) -> GpuWait {
+        self.inner.lock().pending += 1;
+
+        GpuWait {
+            acquire: Acquire { addr, payload },
+            waits: self.clone(),
+        }
+    }
+
+    /// Records that the channel `chid` submitted work, whose fence is `fence`, that waits.
+    fn submitted(&self, chid: u32, fence: &ARef<Fence>) {
+        let mut inner = self.inner.lock();
+        if let Some(last) = inner.submitted.iter_mut().find(|(c, _)| *c == chid) {
+            last.1 = fence.clone();
+        } else if inner
+            .submitted
+            .push((chid, fence.clone()), GFP_ATOMIC)
+            .is_err()
+        {
+            inner.untracked = true;
+        }
+    }
+
+    /// Returns whether no channel waits for the semaphore anymore, nor will: it can be unmapped
+    /// once its channel runs no more work.
+    pub(crate) fn idle(&self) -> bool {
+        let mut inner = self.inner.lock();
+        inner.submitted.retain(|(_, fence)| !fence.is_signaled());
+
+        inner.pending == 0 && inner.submitted.is_empty() && !inner.untracked
     }
 }
 
@@ -431,8 +516,8 @@ impl<'a> ClientChannel<'a> {
         }
 
         let mut head = KVec::new();
-        for GpuWait(acquire) in waits {
-            hal.push_acquire(&mut head, *acquire)?;
+        for wait in waits {
+            hal.push_acquire(&mut head, wait.acquire)?;
         }
 
         let mut entries: KVec<GpEntry> = KVec::with_capacity(pushes.len(), GFP_KERNEL)?;
@@ -464,6 +549,10 @@ impl<'a> ClientChannel<'a> {
         {
             self.timeline.cancel(sequence, err);
             return Err(err);
+        }
+        // The semaphores waited for stay mapped until the submission is done.
+        for wait in waits {
+            wait.waits.submitted(self.channel.chid(), &fence);
         }
         self.sequence = sequence;
         self.in_flight

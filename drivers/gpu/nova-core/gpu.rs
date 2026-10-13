@@ -60,6 +60,7 @@ use crate::{
             ChannelEngine,
             ClientChannel,
             GpuWait,
+            PeerWaits,
             PushBuffer, //
         },
         copy::CopyChannel,
@@ -73,10 +74,7 @@ use crate::{
             GrContext,
             GraphicsInfo, //
         },
-        hal::{
-            Acquire,
-            PitchCopy, //
-        },
+        hal::PitchCopy,
         video::VideoDecoderInfo,
     },
     display::mode::HeadRaster,
@@ -553,6 +551,8 @@ struct PeerSemaphore<'a> {
     /// Kept for as long as its semaphore is mapped.
     timeline: Arc<Timeline<'a>>,
     mapped: MappedRange,
+    /// The waits for it, which keep it mapped.
+    waits: Arc<PeerWaits>,
 }
 
 /// Structure holding the resources required to operate the GPU.
@@ -2404,42 +2404,54 @@ impl<'gpu> Gpu<'gpu> {
             return Ok(FenceWait::Cpu);
         };
 
-        let addr = self.peer_semaphore(vm, &timeline)?;
-        Ok(FenceWait::Gpu(GpuWait(Acquire {
-            addr,
-            payload: point.sequence,
-        })))
+        self.peer_wait(vm, &timeline, point.sequence)
+            .map(FenceWait::Gpu)
     }
 
-    /// Returns the GPU virtual address of the semaphore of `timeline` in `vm`, mapping it
-    /// read-only the first time, see [`Gpu::channel_wait`].
-    fn peer_semaphore(&self, vm: &mut ClientVm, timeline: &Arc<Timeline<'gpu>>) -> Result<u64> {
+    /// Returns a wait for the semaphore of `timeline` to reach `payload`, which is mapped
+    /// read-only into `vm` the first time, see [`Gpu::channel_wait`].
+    fn peer_wait(
+        &self,
+        vm: &mut ClientVm,
+        timeline: &Arc<Timeline<'gpu>>,
+        payload: u32,
+    ) -> Result<GpuWait> {
         let id = vm.id();
         let mut peers = self.peer_semaphores.lock();
         if let Some(peer) = peers
             .iter()
             .find(|peer| peer.vm == id && Arc::ptr_eq(&peer.timeline, timeline))
         {
-            return Ok(peer.mapped.start().into_raw());
+            return Ok(peer.waits.wait(peer.mapped.start().into_raw(), payload));
         }
 
         // The semaphores of the channels that run no more work are no longer waited for: they
-        // got the value of their last submission, see `Timeline::fail`.
+        // got the value of their last submission, see `Timeline::fail`. They are unmapped once
+        // the work that waited for them is done, which would fault on them otherwise.
+        let dev = self.gsp_resources.device.as_ref();
         let mut mm = self.mm.lock();
         let mut i = 0;
         while i < peers.len() {
-            if peers[i].vm != id || !peers[i].timeline.failed() {
+            if peers[i].vm != id || !peers[i].timeline.failed() || !peers[i].waits.idle() {
                 i += 1;
             } else if let Ok(peer) = peers.remove(i) {
+                let addr = peer.mapped.start().into_raw();
                 vm.space_mut()
                     .unmap(&mut mm, peer.mapped)
                     .inspect_err(|e| pr_err!("can't unmap a channel's semaphore: {:?}\n", e))?;
+                dev_dbg!(
+                    dev,
+                    "address space {}: unmapped the semaphore at {:#x}\n",
+                    id,
+                    addr
+                );
             }
         }
 
         let semaphore = timeline.semaphore();
         let start = semaphore.dma_address();
         let end = start + num::usize_as_u64(semaphore.size());
+        let waits = PeerWaits::new()?;
         peers.reserve(1, GFP_KERNEL)?;
         let mapped = vm.space_mut().map_sysmem_aligned(
             &mut mm,
@@ -2448,15 +2460,24 @@ impl<'gpu> Gpu<'gpu> {
             Access::READ_ONLY,
         )?;
         let addr = mapped.start().into_raw();
+        dev_dbg!(
+            dev,
+            "address space {}: mapped the semaphore of channel timeline {} at {:#x}\n",
+            id,
+            timeline.instance(),
+            addr
+        );
+        let wait = waits.wait(addr, payload);
         peers
             .push_within_capacity(PeerSemaphore {
                 vm: id,
                 timeline: timeline.clone(),
                 mapped,
+                waits,
             })
             .map_err(|_| ENOMEM)?;
 
-        Ok(addr)
+        Ok(wait)
     }
 
     /// Returns the GPU's timer, a count of nanoseconds that work on the GPU timestamps with.
