@@ -13,6 +13,7 @@ use kernel::{
     },
     new_mutex,
     prelude::*,
+    sizes::SizeConstants,
     sync::{
         barrier::{
             mb,
@@ -61,6 +62,13 @@ pub(crate) struct BarUser<'a> {
 }
 
 impl<'a> BarUser<'a> {
+    /// The start of BAR1 that the PCIe peer-to-peer write mailboxes take: one window of 64 KiB for
+    /// each of the 8 peers. Accesses there go to the mailboxes, not through the page tables: CPU
+    /// writes are dropped and reads return zeroes. RM sets the area apart as the first thing in
+    /// BAR1 (kbusAllocP2PMailboxBar1_GM200(), below the static BAR1 mapping), and GSP-RM places
+    /// the mailboxes there, so nothing is mapped there.
+    const P2P_MAILBOX_SIZE: u64 = 8 * u64::SZ_64K;
+
     /// Create a pin-initializer for [`BarUser`].
     pub(crate) fn new(
         pdb_addr: VramAddress,
@@ -70,7 +78,11 @@ impl<'a> BarUser<'a> {
     ) -> impl PinInit<Self, Error> + 'a {
         try_pin_init!(Self {
             vmm <- new_mutex!(
-                Vmm::new(pdb_addr, chipset.mmu_version(), va_size, VmmKind::Bar1)?,
+                {
+                    let vmm = Vmm::new(pdb_addr, chipset.mmu_version(), va_size, VmmKind::Bar1)?;
+                    vmm.reserve(0..Self::P2P_MAILBOX_SIZE)?;
+                    vmm
+                },
                 "bar_user_vmm",
             ),
             bar1,
