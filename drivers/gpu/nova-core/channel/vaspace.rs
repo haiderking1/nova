@@ -322,6 +322,18 @@ impl AddressSpace {
         self.map_aligned(mm, dma, alignment, access, Memory::SystemCoherent)
     }
 
+    /// Like [`AddressSpace::map_sysmem_aligned`], for the pages of coherent system memory of
+    /// frames `pfns`, in order, which needn't be contiguous.
+    pub(crate) fn map_sysmem_pages_aligned(
+        &mut self,
+        mm: &mut GpuMm<'_>,
+        pfns: &[Pfn],
+        alignment: u64,
+        access: Access,
+    ) -> Result<MappedRange> {
+        self.map_pfns_aligned(mm, pfns, alignment, access, Memory::SystemCoherent)
+    }
+
     /// Maps the page-aligned `range` of addresses of `memory` at the lowest free virtual address
     /// aligned to `alignment`, so that the addresses of freed mappings are used again: a channel
     /// replacing another maps its buffers where the other had them.
@@ -333,22 +345,37 @@ impl AddressSpace {
         access: Access,
         memory: Memory,
     ) -> Result<MappedRange> {
-        if !alignment.is_power_of_two() {
+        let pfns = Self::pfns(range)?;
+        self.map_pfns_aligned(mm, &pfns, alignment, access, memory)
+    }
+
+    /// Like [`AddressSpace::map_aligned`], for the pages of frames `pfns` of `memory`, in order.
+    fn map_pfns_aligned(
+        &mut self,
+        mm: &mut GpuMm<'_>,
+        pfns: &[Pfn],
+        alignment: u64,
+        access: Access,
+        memory: Memory,
+    ) -> Result<MappedRange> {
+        if !alignment.is_power_of_two() || pfns.is_empty() {
             return Err(EINVAL);
         }
-        let pfns = Self::pfns(range.clone())?;
+        let size = u64::try_from(pfns.len())?
+            .checked_mul(num::usize_as_u64(PAGE_SIZE))
+            .ok_or(EINVAL)?;
         let mut start = self
             .aligned_start
             .checked_next_multiple_of(alignment)
             .ok_or(ENOSPC)?;
         loop {
             let end = start
-                .checked_add(range.end - range.start)
+                .checked_add(size)
                 .filter(|&end| end <= VA_SIZE)
                 .ok_or(ENOSPC)?;
             match self
                 .vmm
-                .map_memory(mm, &pfns, Some(start..end), access, memory)
+                .map_memory(mm, pfns, Some(start..end), access, memory)
             {
                 // Mapped there already: the next aligned address.
                 Err(err) if err == EEXIST => start = start.checked_add(alignment).ok_or(ENOSPC)?,

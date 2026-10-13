@@ -19,6 +19,7 @@ use kernel::{
         Io,
         IoBase, //
     },
+    page,
     prelude::*,
     ptr::Alignment,
     sizes::{
@@ -109,6 +110,14 @@ const CONTEXT_SHARE_HANDLE: u32 = 0x9067_0000;
 
 /// Size of the control memory.
 const CONTROL_SIZE: usize = SZ_64K;
+/// Size of the parts of the control memory allocated each: a page of the CPU, so that allocating
+/// the control memory needs no contiguous memory, or the whole of it if pages are larger.
+const CONTROL_CHUNK_SIZE: usize = if page::PAGE_SIZE < CONTROL_SIZE {
+    page::PAGE_SIZE
+} else {
+    CONTROL_SIZE
+};
+static_assert!(CONTROL_SIZE % CONTROL_CHUNK_SIZE == 0 && CONTROL_CHUNK_SIZE % SZ_4K == 0);
 /// Offset of the push buffer.
 const PUSH_BUFFER: usize = 0;
 /// Size of the push buffer.
@@ -173,8 +182,9 @@ pub(crate) struct Channel<'a> {
     /// The buffers the GPU saves pending methods into on faults: the channel group's, one per
     /// runqueue, or the channel's own. The channel runs on the first runqueue.
     method_buffers: KVec<Coherent<'a, [u8]>>,
-    /// The control memory, which the GPU accesses coherently with the CPU's caches.
-    control: Coherent<'a, [u8]>,
+    /// The control memory, in chunks of [`CONTROL_CHUNK_SIZE`], which the GPU accesses coherently
+    /// with the CPU's caches.
+    control: KVec<Coherent<'a, [u8]>>,
     /// GPU mapping of the control memory.
     control_mapped: Option<MappedRange>,
     /// Next GPFIFO entry to write.
@@ -226,7 +236,13 @@ impl<'a> Channel<'a> {
         };
         let instance = mm.with(|mm| alloc_cleared(mm, SZ_4K))?;
         let userd = mm.with(|mm| alloc_cleared(mm, SZ_4K))?;
-        let control = Coherent::<u8>::zeroed_slice(dev, CONTROL_SIZE, GFP_KERNEL)?;
+        let mut control = KVec::with_capacity(CONTROL_SIZE / CONTROL_CHUNK_SIZE, GFP_KERNEL)?;
+        for _ in 0..CONTROL_SIZE / CONTROL_CHUNK_SIZE {
+            control.push(
+                Coherent::<u8>::zeroed_slice(dev, CONTROL_CHUNK_SIZE, GFP_KERNEL)?,
+                GFP_KERNEL,
+            )?;
+        }
 
         // Kernel channels have address spaces of their own, and are privileged.
         let privileged = matches!(space, NewSpace::Own(_));
@@ -274,11 +290,22 @@ impl<'a> Channel<'a> {
 
         // The memory manager is only taken for the memory: GSP-RM's work goes on without it.
         let mut set_up = |channel: &mut Self, client_space: Option<&mut AddressSpace>| -> Result {
-            let start = channel.control.dma_address();
-            let control = start..start + num::usize_as_u64(channel.control.size());
+            // The GPU's 4 KiB frames of the chunks, in order.
+            let mut control = KVec::with_capacity(CONTROL_SIZE / SZ_4K, GFP_KERNEL)?;
+            for chunk in &channel.control {
+                for offset in (0..CONTROL_CHUNK_SIZE).step_by(SZ_4K) {
+                    let dma = chunk.dma_address() + num::usize_as_u64(offset);
+                    control.push(Pfn::new(dma >> 12), GFP_KERNEL)?;
+                }
+            }
             let space = channel.space_mut(client_space)?;
             let control_mapped = mm.with(|mm| {
-                space.map_sysmem_aligned(mm, control, num::usize_as_u64(SZ_4K), Access::READ_WRITE)
+                space.map_sysmem_pages_aligned(
+                    mm,
+                    &control,
+                    num::usize_as_u64(SZ_4K),
+                    Access::READ_WRITE,
+                )
             })?;
             let gpfifo = control_mapped.start().into_raw() + num::usize_as_u64(GPFIFO);
 
@@ -617,8 +644,20 @@ impl<'a> Channel<'a> {
     /// Writes `bytes` at `offset` of the control memory.
     fn write_control(&self, offset: usize, bytes: &[u8]) -> Result {
         let end = offset.checked_add(bytes.len()).ok_or(EINVAL)?;
-        let view = (&self.control).as_view();
-        io_project!(view, [try: offset..end]).copy_from_slice(bytes);
+        if end > CONTROL_SIZE {
+            return Err(EINVAL);
+        }
+
+        // Chunk by chunk.
+        let mut at = offset;
+        while at < end {
+            let within = at % CONTROL_CHUNK_SIZE;
+            let len = (CONTROL_CHUNK_SIZE - within).min(end - at);
+            let view = (&self.control[at / CONTROL_CHUNK_SIZE]).as_view();
+            io_project!(view, [try: within..within + len])
+                .copy_from_slice(&bytes[at - offset..at - offset + len]);
+            at += len;
+        }
 
         Ok(())
     }
@@ -626,12 +665,12 @@ impl<'a> Channel<'a> {
     /// Returns the value of the semaphore.
     fn semaphore(&self) -> u32 {
         // SAFETY: `SEMAPHORE` is in the control memory, which the GPU writes coherently with the
-        // CPU's caches, and 4-byte aligned.
+        // CPU's caches, 4-byte aligned, so within a chunk.
         unsafe {
-            self.control
+            self.control[SEMAPHORE / CONTROL_CHUNK_SIZE]
                 .as_ptr()
                 .cast::<u8>()
-                .add(SEMAPHORE)
+                .add(SEMAPHORE % CONTROL_CHUNK_SIZE)
                 .cast::<u32>()
                 .read_volatile()
         }
