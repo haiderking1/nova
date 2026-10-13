@@ -134,6 +134,31 @@ impl<'a, T: Send + Sync + FenceContextOps> FenceContext<T> {
         self.seqno.fetch_add(1, Relaxed)
     }
 
+    /// Returns the data of `fence` if this context created it, and `None` otherwise: such as for
+    /// a fence a driver gets to wait for, which may come from anywhere.
+    ///
+    /// Only for data that has no destructor, as that data stays valid as long as the memory of
+    /// its fence, which a [`Fence`] keeps, unlike the memory of a [`DriverFence`].
+    pub fn fence_data(&self, fence: &Fence) -> Option<T::FenceDataType>
+    where
+        T::FenceDataType: Copy,
+    {
+        if fence.context() != self.nr {
+            return None;
+        }
+
+        // CAST: `dma_fence_context_alloc()` gave the context number to this context alone, which
+        // only puts it on the fences it creates, each of them the first member of a
+        // `repr(C)` `DriverFenceData<T>`.
+        let fence_data_ptr: *const DriverFenceData<'_, T> = ptr::from_ref(fence).cast();
+
+        // SAFETY: `fence_data_ptr` points to the `DriverFenceData<T>` that `fence` is in, as
+        // explained above, whose memory stays allocated as long as the reference to the fence
+        // that `fence` holds. Its `data`, which has no destructor since it is `Copy`, stays
+        // initialized as long as that memory.
+        Some(unsafe { (*fence_data_ptr).data })
+    }
+
     /// Allocate the memory for a [`DriverFence`] and already store `data` inside.
     ///
     /// This is needed because many times, creation of a [`DriverFence`] must not
@@ -623,6 +648,48 @@ impl Fence {
     pub fn seqno(&self) -> u64 {
         // SAFETY: Valid because `self` is valid.
         unsafe { (*self.as_raw()).seqno }
+    }
+
+    /// Returns the number of the fence's context, which the fences of a timeline share.
+    #[inline]
+    pub fn context(&self) -> u64 {
+        // SAFETY: Valid because `self` is valid.
+        unsafe { (*self.as_raw()).context }
+    }
+
+    /// Calls `f` with each fence that `self` stands for, stopping at the first error `f` returns:
+    /// the fences in containers, deep into nested ones, or `self` itself if it isn't a container.
+    ///
+    /// The containers are fence chains, whose fences are those of a timeline point and the
+    /// points before it not signaled yet (such as [`SyncObj`]s hold), and fence arrays.
+    ///
+    /// [`SyncObj`]: crate::drm::syncobj::SyncObj
+    pub fn for_each_unwrapped(&self, mut f: impl FnMut(&Fence) -> Result) -> Result {
+        let mut cursor = bindings::dma_fence_unwrap {
+            chain: ptr::null_mut(),
+            array: ptr::null_mut(),
+            index: 0,
+        };
+
+        // SAFETY: `self.as_raw()` is a valid fence, of which the cursor takes a reference, then
+        // of the fences of the chain it walks, giving each back as it moves on.
+        let mut fence = unsafe { bindings::dma_fence_unwrap_first(self.as_raw(), &mut cursor) };
+        while !fence.is_null() {
+            // SAFETY: `fence` is a valid fence in the containers the cursor holds a reference to,
+            // which it keeps until the cursor moves on, after `f` returns.
+            if let Err(err) = f(unsafe { Fence::from_raw(fence) }) {
+                // SAFETY: The cursor still holds the reference it took, which the walk would have
+                // given back. `dma_fence_put()` takes NULL too.
+                unsafe { bindings::dma_fence_put(cursor.chain) };
+                return Err(err);
+            }
+
+            // SAFETY: `cursor` was set up by `dma_fence_unwrap_first()` above and is only moved
+            // on here, which gives its last reference back once it returns NULL.
+            fence = unsafe { bindings::dma_fence_unwrap_next(&mut cursor) };
+        }
+
+        Ok(())
     }
 
     pub(crate) fn as_raw(&self) -> *mut bindings::dma_fence {
