@@ -1668,3 +1668,37 @@ impl OsErrorLog {
 
 // SAFETY: This struct only contains integer types for which all bit patterns are valid.
 unsafe impl FromBytes for OsErrorLog {}
+
+/// Payload of the `RcTriggered` event: GSP-RM started robust-channel recovery of a channel
+/// (`rpc_rc_triggered_v17_02`), without the RC journal records that follow it.
+#[repr(transparent)]
+pub(crate) struct RcTriggered(bindings::rpc_rc_triggered_v17_02);
+
+impl RcTriggered {
+    /// Returns the type of the exception, one of RM's `ROBUST_CHANNEL_*` codes.
+    pub(crate) fn exception_type(&self) -> u32 {
+        self.0.exceptType
+    }
+
+    /// Returns the channel recovered.
+    pub(crate) fn channel(&self) -> u32 {
+        self.0.chid
+    }
+
+    /// Returns the `NV2080_ENGINE_TYPE` of the engine the channel runs on.
+    pub(crate) fn engine_type(&self) -> u32 {
+        self.0.nv2080EngineType
+    }
+
+    /// Returns the faulting GPU virtual address and the `NV_PFAULT_FAULT_TYPE` of the fault,
+    /// for a recovery after an MMU fault.
+    pub(crate) fn mmu_fault(&self) -> (u64, u32) {
+        (
+            u64::from(self.0.mmuFaultAddrHi) << 32 | u64::from(self.0.mmuFaultAddrLo),
+            self.0.mmuFaultType,
+        )
+    }
+}
+
+// SAFETY: This struct only contains integer types for which all bit patterns are valid.
+unsafe impl FromBytes for RcTriggered {}

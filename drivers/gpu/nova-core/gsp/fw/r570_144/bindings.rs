@@ -1887,6 +1887,23 @@ pub struct rpc_os_error_log_v17_00 {
     pub errString: [ffi::c_char; 256usize],
     pub preemptiveRemovalPreviousXid: u32_,
 }
+#[repr(C)]
+#[derive(Debug, Default, MaybeZeroable)]
+pub struct rpc_rc_triggered_v17_02 {
+    pub nv2080EngineType: u32_,
+    pub chid: u32_,
+    pub gfid: u32_,
+    pub exceptLevel: u32_,
+    pub exceptType: u32_,
+    pub scope: u32_,
+    pub partitionAttributionId: u16_,
+    pub mmuFaultAddrLo: u32_,
+    pub mmuFaultAddrHi: u32_,
+    pub mmuFaultType: u32_,
+    pub bCallbackNeeded: u8_,
+    pub rcJournalBufferSize: u32_,
+    pub rcJournalBuffer: __IncompleteArrayField<u8_>,
+}
 impl Default for rpc_os_error_log_v17_00 {
     fn default() -> Self {
         let mut s = ::core::mem::MaybeUninit::<Self>::uninit();

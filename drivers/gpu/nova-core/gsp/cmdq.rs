@@ -61,6 +61,7 @@ use crate::{
             MsgqTxHeader,
             NocatRecord,
             OsErrorLog,
+            RcTriggered,
             GSP_MSG_QUEUE_ELEMENT_SIZE_MAX, //
         },
         PteArray,
@@ -1135,13 +1136,26 @@ impl CmdqInner<'_> {
                 }
                 None => dev_dbg!(&self.dev, "GSP NOCAT record (seq {})\n", seq),
             },
-            Ok(MsgFunction::RcTriggered) => {
-                dev_err!(
+            Ok(MsgFunction::RcTriggered) => match Self::payload::<RcTriggered>(message) {
+                Some(rc) => {
+                    let (fault_addr, fault_type) = rc.mmu_fault();
+                    dev_err!(
+                        &self.dev,
+                        "GSP triggered robust-channel recovery (seq {}): exception {} on channel {}, engine type {:#x}, MMU fault at {:#x} of type {}\n",
+                        seq,
+                        rc.exception_type(),
+                        rc.channel(),
+                        rc.engine_type(),
+                        fault_addr,
+                        fault_type
+                    );
+                }
+                None => dev_err!(
                     &self.dev,
                     "GSP triggered robust-channel recovery (seq {})\n",
                     seq
-                );
-            }
+                ),
+            },
             // Nothing to do for the remaining known function codes.
             Ok(_) => {}
             Err(raw) => {
