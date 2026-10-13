@@ -91,6 +91,15 @@ impl From<GspRpcError> for Error {
     }
 }
 
+/// Bytes, displayed as hexadecimal digits without separators, two per byte.
+struct Hex<'a>(&'a [u8]);
+
+impl kernel::fmt::Display for Hex<'_> {
+    fn fmt(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        self.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+    }
+}
+
 /// Marker type representing the absence of a reply for a command. Commands using this as their
 /// reply type are sent using [`Cmdq::send_command_no_wait`].
 pub(crate) struct NoReply;
@@ -1085,7 +1094,7 @@ impl CmdqInner<'_> {
                     }
                     dev_dbg!(
                         &self.dev,
-                        "GSP NOCAT record (seq {}): {}, type {}, bugcheck {:#x}, subsystem {}, code {:#x}, engine {}, diagnostics {:02x?}\n",
+                        "GSP NOCAT record (seq {}): {}, type {}, bugcheck {:#x}, subsystem {}, code {:#x}, engine {}, {} bytes of diagnostics\n",
                         seq,
                         record.source(),
                         record.record_type(),
@@ -1093,8 +1102,18 @@ impl CmdqInner<'_> {
                         record.subsystem(),
                         record.error_code(),
                         record.faulting_engine(),
-                        record.diagnostics()
+                        record.diagnostics().len()
                     );
+                    // A line per 64 bytes, which a single line of the log can't hold all of.
+                    for (i, chunk) in record.diagnostics().chunks(64).enumerate() {
+                        dev_dbg!(
+                            &self.dev,
+                            "GSP NOCAT record (seq {}) diagnostics {:#06x}: {}\n",
+                            seq,
+                            i * 64,
+                            Hex(chunk)
+                        );
+                    }
                 }
                 None => dev_dbg!(&self.dev, "GSP NOCAT record (seq {})\n", seq),
             },
