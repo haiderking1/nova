@@ -114,6 +114,61 @@ fn table_address(alloc: &Pin<KBox<AllocatedBlocks>>) -> Result<VramAddress> {
     ))
 }
 
+/// Number of blocks of pages, of a PTE-level table each (2 MiB with 4 KiB pages), whose page
+/// tables a [`TableCache`] remembers.
+const TABLE_CACHE_SIZE: usize = 256;
+
+/// The page tables of a block of pages, as walked to.
+#[derive(Clone, Copy)]
+struct BlockTables {
+    /// The block: the VFN of its first page divided by the pages of a PTE-level table.
+    block: u64,
+    /// Its PTE-level (small page) table.
+    small: VramAddress,
+    /// Its big page table, if it has one.
+    big: Option<VramAddress>,
+}
+
+/// The page tables of the blocks of pages of an address space last walked to, each in the slot
+/// of its block number modulo [`TABLE_CACHE_SIZE`]: walks read page directories, uncached, which
+/// costs more than writing the PTEs of a mapping. Page tables stay as long as the address space,
+/// so these stay right until a dual PDE is written, which forgets them all.
+pub(in crate::mm) struct TableCache {
+    /// [`TABLE_CACHE_SIZE`] slots.
+    tables: KVec<Option<BlockTables>>,
+}
+
+impl TableCache {
+    /// Create an empty [`TableCache`].
+    pub(in crate::mm) fn new() -> Result<Self> {
+        Ok(Self {
+            tables: KVec::from_elem(None, TABLE_CACHE_SIZE, GFP_KERNEL)?,
+        })
+    }
+
+    /// Returns the slot of `block`.
+    fn slot(block: u64) -> usize {
+        let slots: u64 = TABLE_CACHE_SIZE.into_safe_cast();
+        // In range: the remainder of a division by the number of slots.
+        (block % slots).into_safe_cast()
+    }
+
+    /// Returns the page tables of `block`, if remembered.
+    fn get(&self, block: u64) -> Option<BlockTables> {
+        self.tables[Self::slot(block)].filter(|tables| tables.block == block)
+    }
+
+    /// Remembers `tables`.
+    fn set(&mut self, tables: BlockTables) {
+        self.tables[Self::slot(tables.block)] = Some(tables);
+    }
+
+    /// Forgets all page tables remembered: a dual PDE is being written.
+    fn forget(&mut self) {
+        self.tables.fill(None);
+    }
+}
+
 /// Page table mapper.
 pub(in crate::mm) struct PtMapInner<M: MmuConfig> {
     walker: PtWalkInner<M>,
@@ -136,6 +191,34 @@ impl<M: MmuConfig> PtMapInner<M> {
             bar: space == VmmKind::Bar1,
             _phantom: PhantomData,
         }
+    }
+
+    /// Returns the block of pages, of a PTE-level table, `vfn` is in.
+    fn block_of(vfn: Vfn) -> u64 {
+        let pages_per_table: u64 = M::entries_per_page(M::PTE_LEVEL).into_safe_cast();
+        vfn.raw() / pages_per_table
+    }
+
+    /// Returns the page tables of the block of pages `vfn` is in: as `tables` remembers them, or
+    /// walked to, then remembered. `None` if the page directories don't lead to a PTE-level
+    /// table.
+    fn block_tables(
+        &self,
+        pramin: &mut pramin::Pramin<'_>,
+        tables: &mut TableCache,
+        vfn: Vfn,
+    ) -> Result<Option<BlockTables>> {
+        let block = Self::block_of(vfn);
+        if let Some(remembered) = tables.get(block) {
+            return Ok(Some(remembered));
+        }
+        let Some(small) = self.walker.pte_table(pramin, vfn)? else {
+            return Ok(None);
+        };
+        let big = self.walker.big_table(pramin, vfn)?;
+        let walked = BlockTables { block, small, big };
+        tables.set(walked);
+        Ok(Some(walked))
     }
 
     /// Returns whether the pages `pfns` of `aperture` can be mapped with a big page.
@@ -298,6 +381,7 @@ impl<M: MmuConfig> PtMapInner<M> {
         num_pages: usize,
         page_table_allocs: &mut KVec<Pin<KBox<AllocatedBlocks>>>,
         pt_pages: &mut RBTree<VramAddress, PreparedPtPage>,
+        tables: &TableCache,
     ) -> Result {
         // Pre-reserve so install_mappings() can use push_within_capacity (no alloc
         // in fence signalling critical path).
@@ -311,8 +395,16 @@ impl<M: MmuConfig> PtMapInner<M> {
             let i_u64: u64 = i.into_safe_cast();
             let vfn = Vfn::new(vfn_start.raw() + i_u64);
             if i == 0 || PtWalkInner::<M>::starts_pte_table(vfn) {
+                let needs_big = self.big_pages && Self::covers_big_page(vfn, num_pages_u64 - i_u64);
+                // Remembered, so installed, with what it needs: nothing to prepare.
+                if tables
+                    .get(Self::block_of(vfn))
+                    .is_some_and(|remembered| !needs_big || remembered.big.is_some())
+                {
+                    continue;
+                }
                 self.ensure_single_pte_path(mm, vfn, pt_pages)?;
-                if self.big_pages && Self::covers_big_page(vfn, num_pages_u64 - i_u64) {
+                if needs_big {
                     self.ensure_big_table(mm, vfn, pt_pages)?;
                 }
             }
@@ -329,6 +421,7 @@ impl<M: MmuConfig> PtMapInner<M> {
         mm: &mut GpuMm<'_>,
         pt_pages: &mut RBTree<VramAddress, PreparedPtPage>,
         page_table_allocs: &mut KVec<Pin<KBox<AllocatedBlocks>>>,
+        tables: &mut TableCache,
         vfn_start: Vfn,
         pfns: &[Pfn],
         access: Access,
@@ -344,6 +437,7 @@ impl<M: MmuConfig> PtMapInner<M> {
                 let (install_addr, page) = node.to_key_value();
 
                 if page.level == M::DUAL_PDE_LEVEL {
+                    tables.forget();
                     let mut dpde = M::DualPde::read(pramin, install_addr)?;
                     if let Some(alloc) = &page.alloc {
                         dpde = dpde.with_small(Pfn::from(table_address(alloc)?));
@@ -375,17 +469,17 @@ impl<M: MmuConfig> PtMapInner<M> {
             let mut big_ptes = KVec::new();
             self.for_each_pte_run(
                 pramin,
+                tables,
                 vfn_start,
                 pfns.len(),
-                |pramin, run, vfn, pte_addr| {
-                    let Some(pte_addr) = pte_addr else {
+                |pramin, run, vfn, tables| {
+                    let Some((pte_addr, big_table)) = tables else {
                         kernel::pr_warn_once!("VMM: page table missing for VFN {vfn:?}\n");
                         return Err(EIO);
                     };
                     // Big PTEs, which hide the small ones under them unless unmapped, are
                     // looked at even where this address space maps no big pages: GSP-RM sets
                     // up BAR1 with some.
-                    let big_table = self.walker.big_table(pramin, vfn)?;
 
                     // Big PTEs for the whole big pages of physically contiguous VRAM, small
                     // ones (invalid under the big ones) for the rest.
@@ -517,17 +611,25 @@ impl<M: MmuConfig> PtMapInner<M> {
     }
 
     /// Splits the `num_pages` pages from `vfn_start` into runs whose PTEs follow each other in a
-    /// PTE-level table, and calls `f` with the indices of each run's pages, its first page, and
-    /// the address of its first PTE, if its page table is installed.
+    /// PTE-level table, and calls `f` with the indices of each run's pages, its first page, and,
+    /// if its page table is installed, the address of its first PTE and its big page table, if
+    /// any.
     ///
-    /// The page directories are walked once per run: walks read them through PRAMIN, uncached,
-    /// which costs far more than writing PTEs.
+    /// The page tables of each run are those [`Self::block_tables()`] remembers or walks to:
+    /// walks read page directories through PRAMIN, uncached, which costs far more than writing
+    /// PTEs.
     fn for_each_pte_run(
         &self,
         pramin: &mut pramin::Pramin<'_>,
+        tables: &mut TableCache,
         vfn_start: Vfn,
         num_pages: usize,
-        mut f: impl FnMut(&mut pramin::Pramin<'_>, Range<usize>, Vfn, Option<VramAddress>) -> Result,
+        mut f: impl FnMut(
+            &mut pramin::Pramin<'_>,
+            Range<usize>,
+            Vfn,
+            Option<(VramAddress, Option<VramAddress>)>,
+        ) -> Result,
     ) -> Result {
         let vfn = |i: usize| -> Vfn {
             let i_u64: u64 = i.into_safe_cast();
@@ -542,11 +644,10 @@ impl<M: MmuConfig> PtMapInner<M> {
             }
 
             let first = vfn(start);
-            let pte_addr = self
-                .walker
-                .pte_table(pramin, first)?
-                .map(|table| PtWalkInner::<M>::pte_addr(table, first));
-            f(pramin, start..end, first, pte_addr)?;
+            let run_tables = self
+                .block_tables(pramin, tables, first)?
+                .map(|walked| (PtWalkInner::<M>::pte_addr(walked.small, first), walked.big));
+            f(pramin, start..end, first, run_tables)?;
             start = end;
         }
 
@@ -557,6 +658,7 @@ impl<M: MmuConfig> PtMapInner<M> {
     pub(super) fn invalidate_ptes(
         &self,
         mm: &mut GpuMm<'_>,
+        tables: &mut TableCache,
         vfn_start: Vfn,
         num_pages: usize,
     ) -> Result {
@@ -567,11 +669,12 @@ impl<M: MmuConfig> PtMapInner<M> {
             let mut ptes = KVec::new();
             self.for_each_pte_run(
                 pramin,
+                tables,
                 vfn_start,
                 num_pages,
-                |pramin, run, vfn, pte_addr| {
+                |pramin, run, vfn, tables| {
                     // Nothing is mapped without a page table.
-                    let Some(pte_addr) = pte_addr else {
+                    let Some((pte_addr, big_table)) = tables else {
                         return Ok(());
                     };
 
@@ -581,7 +684,6 @@ impl<M: MmuConfig> PtMapInner<M> {
 
                     // Big pages in the range are unmapped, those it shares with other mappings are
                     // split to keep their pages outside it mapped.
-                    let big_table = self.walker.big_table(pramin, vfn)?;
                     if let Some(big_table) = big_table {
                         let len: u64 = run.len().into_safe_cast();
                         Self::split_big_pages(pramin, big_table, pte_addr, vfn, len, |_| false)?;
@@ -637,10 +739,18 @@ impl PtMap {
         num_pages: usize,
         page_table_allocs: &mut KVec<Pin<KBox<AllocatedBlocks>>>,
         pt_pages: &mut RBTree<VramAddress, PreparedPtPage>,
+        tables: &TableCache,
     ) -> Result {
         pt_map_dispatch!(
             self,
-            prepare_map(mm, vfn_start, num_pages, page_table_allocs, pt_pages)
+            prepare_map(
+                mm,
+                vfn_start,
+                num_pages,
+                page_table_allocs,
+                pt_pages,
+                tables
+            )
         )
     }
 
@@ -651,6 +761,7 @@ impl PtMap {
         mm: &mut GpuMm<'_>,
         pt_pages: &mut RBTree<VramAddress, PreparedPtPage>,
         page_table_allocs: &mut KVec<Pin<KBox<AllocatedBlocks>>>,
+        tables: &mut TableCache,
         vfn_start: Vfn,
         pfns: &[Pfn],
         access: Access,
@@ -662,6 +773,7 @@ impl PtMap {
                 mm,
                 pt_pages,
                 page_table_allocs,
+                tables,
                 vfn_start,
                 pfns,
                 access,
@@ -674,9 +786,10 @@ impl PtMap {
     pub(in crate::mm) fn invalidate_ptes(
         &self,
         mm: &mut GpuMm<'_>,
+        tables: &mut TableCache,
         vfn_start: Vfn,
         num_pages: usize,
     ) -> Result {
-        pt_map_dispatch!(self, invalidate_ptes(mm, vfn_start, num_pages))
+        pt_map_dispatch!(self, invalidate_ptes(mm, tables, vfn_start, num_pages))
     }
 }

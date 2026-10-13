@@ -22,7 +22,8 @@ use crate::{
     mm::{
         pagetable::{
             map::{
-                PtMap, //
+                PtMap,
+                TableCache, //
             },
             walk::{
                 PtWalk,
@@ -178,6 +179,8 @@ pub(crate) struct Vmm {
     pt_walk: PtWalk,
     /// Page table mapper for prepare/execute operations.
     pt_map: PtMap,
+    /// The page tables [`Vmm::pt_map`] last walked to.
+    tables: TableCache,
     /// Page table allocations required for mappings.
     page_table_allocs: KVec<Pin<KBox<AllocatedBlocks>>>,
     /// Maple tree allocator for virtual address range tracking.
@@ -209,6 +212,7 @@ impl Vmm {
             pdb_addr,
             pt_walk: PtWalk::new(pdb_addr, mmu_version),
             pt_map: PtMap::new(pdb_addr, mmu_version, space),
+            tables: TableCache::new()?,
             page_table_allocs: KVec::new(),
             virt_alloc,
             va_pages,
@@ -279,11 +283,13 @@ impl Vmm {
             pfns.len(),
             &mut self.page_table_allocs,
             &mut self.pt_pages,
+            &self.tables,
         )?;
         self.pt_map.install_mappings(
             mm,
             &mut self.pt_pages,
             &mut self.page_table_allocs,
+            &mut self.tables,
             vfn_start,
             pfns,
             access,
@@ -303,7 +309,8 @@ impl Vmm {
             return Err(EINVAL);
         }
 
-        self.pt_map.invalidate_ptes(mm, Vfn::from(start), num_pages)
+        self.pt_map
+            .invalidate_ptes(mm, &mut self.tables, Vfn::from(start), num_pages)
     }
 
     /// Free a virtual frame number range back to the maple tree.
@@ -365,6 +372,7 @@ impl Vmm {
             num_pages,
             &mut self.page_table_allocs,
             &mut self.pt_pages,
+            &self.tables,
         ) {
             self.free_vfn(vfn_start);
             return Err(e);
@@ -415,6 +423,7 @@ impl Vmm {
             mm,
             &mut self.pt_pages,
             &mut self.page_table_allocs,
+            &mut self.tables,
             vfn_start,
             pfns,
             access,
@@ -478,9 +487,9 @@ impl Vmm {
 
     /// Unmap all pages in a [`MappedRange`] with a single TLB flush.
     pub(crate) fn unmap_pages(&mut self, mm: &mut GpuMm<'_>, range: MappedRange) -> Result {
-        let result = self
-            .pt_map
-            .invalidate_ptes(mm, range.vfn_start, range.num_pages);
+        let result =
+            self.pt_map
+                .invalidate_ptes(mm, &mut self.tables, range.vfn_start, range.num_pages);
 
         // TODO: Internal page table pages (PDE, PTE pages) are still kept around.
         // This is by design as repeated maps/unmaps will be fast. As a future TODO,
